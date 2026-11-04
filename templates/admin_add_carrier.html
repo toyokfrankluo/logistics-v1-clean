@@ -1,0 +1,20 @@
+<!doctype html>
+<title>添加货代</title>
+<h2>添加/编辑货代</h2>
+<form method="post">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  名称: <input name="name"><br>
+  类型: <select name="type"><option value="api">API</option><option value="web">网页抓取</option></select><br>
+  登录网址 (web): <input name="login_url"><br>
+  抓取/API 地址 (包含 {order_id}): <input name="track_url"><br>
+  账号: <input name="api_user"><br>
+  密码: <input name="api_pass" type="password"><br>
+  API Key: <input name="api_key"><br>
+  <button type="submit">保存</button>
+</form>
+<p><a href="{{ url_for('admin_dashboard') }}">返回</a></p>
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% for cat, msg in messages %}
+    <p style="color: green;">{{ msg }}</p>
+  {% endfor %}
+{% endwith %}

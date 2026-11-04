@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="container mt-4">
+    <h2>银行账户管理</h2>
+
+    <!-- 新增银行账户表单 -->
+    <form method="POST" class="row g-3 mb-4">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <div class="col-md-2">
+            <label class="form-label">类型</label>
+            <select name="account_type" class="form-select">
+                <option value="private">私人</option>
+                <option value="public">公账</option>
+            </select>
+        </div>
+        <div class="col-md-3">
+            <label class="form-label">开户行</label>
+            <input type="text" name="bank_name" class="form-control" required>
+        </div>
+        <div class="col-md-2">
+            <label class="form-label">户名</label>
+            <input type="text" name="account_name" class="form-control" required>
+        </div>
+        <div class="col-md-3">
+            <label class="form-label">账号</label>
+            <input type="text" name="account_no" class="form-control" required>
+        </div>
+        <div class="col-md-2">
+            <label class="form-label">备注</label>
+            <input type="text" name="remark" class="form-control">
+        </div>
+        <div class="col-12">
+            <button class="btn btn-primary">保存</button>
+        </div>
+    </form>
+
+    <!-- 银行账户表格 -->
+    <table class="table table-striped">
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>类型</th>
+                <th>开户行</th>
+                <th>户名</th>
+                <th>账号</th>
+                <th>备注</th>
+                <th>创建时间</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for acc in accounts %}
+            <tr>
+                <td>{{ acc.id }}</td>
+                <td>{{ "私人" if acc.account_type == "private" else "公账" }}</td>
+                <td>{{ acc.bank_name }}</td>
+                <td>{{ acc.account_name }}</td>
+                <td>{{ acc.account_no }}</td>
+                <td>{{ acc.remark or "" }}</td>
+                <td>{{ acc.created_at.strftime("%Y-%m-%d %H:%M") }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}

@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="container mt-4">
+    <h2>编辑代理</h2>
+
+    <form method="POST">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <div class="form-group mb-2">
+            <label for="name">代理名称</label>
+            <input type="text" class="form-control" id="name" name="name" value="{{ agent.name }}" required>
+        </div>
+
+        <div class="form-group mb-2">
+            <label for="api_url">API 地址</label>
+            <input type="text" class="form-control" id="api_url" name="api_url" value="{{ agent.api_url }}">
+        </div>
+
+        <div class="form-group mb-2">
+            <label for="app_key">App Key</label>
+            <input type="text" class="form-control" id="app_key" name="app_key" value="" placeholder="留空保持原值" autocomplete="new-password">
+        </div>
+
+        <div class="form-group mb-2">
+            <label for="app_token">App Token</label>
+            <input type="text" class="form-control" id="app_token" name="app_token" value="" placeholder="留空保持原值" autocomplete="new-password">
+        </div>
+
+        <div class="form-group mb-2">
+            <label for="customer_code">客户代码</label>
+            <input type="text" class="form-control" id="customer_code" name="customer_code" value="{{ agent.customer_code }}">
+        </div>
+
+        <button type="submit" class="btn btn-success">保存修改</button>
+        <a href="{{ url_for('views.agents') }}" class="btn btn-secondary">返回</a>
+    </form>
+</div>
+{% endblock %}

@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html>
+<head><title>录入运单</title></head>
+<body>
+  <h1>➕ 手工录入运单</h1>
+  <form method="post">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    运单号: <input type="text" name="tracking_number"><br>
+    始发地: <input type="text" name="origin"><br>
+    目的地: <input type="text" name="destination"><br>
+    <button type="submit">保存</button>
+  </form>
+</body>
+</html>

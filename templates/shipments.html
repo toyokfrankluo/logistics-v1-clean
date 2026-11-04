@@ -1,0 +1,140 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="container mt-4">
+    <h2>运单管理</h2>
+
+    <!-- 搜索框 -->
+    <div class="mb-3">
+        <form method="get" action="{{ url_for('views.shipments') }}" class="form-inline">
+            <input type="text" name="customer" class="form-control mr-2" placeholder="按客户查询" value="{{ request.args.get('customer', '') }}">
+            <input type="text" name="agent" class="form-control mr-2" placeholder="按代理查询" value="{{ request.args.get('agent', '') }}">
+            <input type="text" name="tracking_number" class="form-control mr-2" placeholder="客户单号或代理单号" value="{{ request.args.get('tracking_number', '') }}">
+            <button type="submit" class="btn btn-secondary">搜索</button>
+            <a href="{{ url_for('views.shipments') }}" class="btn btn-light ml-2">重置</a>
+        </form>
+    </div>
+
+    {% if current_user.is_admin %}
+    <!-- 操作按钮区域 -->
+    <div class="mb-3">
+        <a href="{{ url_for('views.add_shipment') }}" class="btn btn-primary">新增运单</a>
+        <form method="post" action="{{ url_for('views.refresh_tracking') }}" style="display:inline" onsubmit="return confirm('确定要刷新所有运单的物流轨迹吗？这可能需要一些时间。')">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<button type="submit" class="btn btn-warning">
+            🔄 一键刷新所有物流轨迹
+        </button></form>
+        <form method="post" action="{{ url_for('views.auto_sync_all_safe') }}" style="display:inline" onsubmit="return confirm('确定要安全同步所有运单吗？这会安全地更新所有运单的完整轨迹。')">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<button type="submit" class="btn btn-success">
+            🛡️ 安全同步所有运单
+        </button></form>
+        <form method="post" action="{{ url_for('views.auto_sync_all') }}" style="display:inline" onsubmit="return confirm('确定要自动同步所有运单吗？这会更新所有运单的完整轨迹。')">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<button type="submit" class="btn btn-success">
+            🤖 自动同步所有运单
+        </button></form>
+        <form method="post" action="{{ url_for('views.auto_sync_recent') }}" style="display:inline" onsubmit="return confirm('确定要自动同步最近运单吗？这会更新最近7天的运单完整轨迹。')">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<button type="submit" class="btn btn-info">
+            ⚡ 自动同步最近运单
+        </button></form>
+    </div>
+
+    {% endif %}
+    <table class="table table-striped">
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>运单号</th>
+                <th>代理单号</th>
+                <th>17Track单号</th>
+                <th>客户</th>
+                <th>代理</th>
+                <th>渠道</th>
+                <th>重量</th>
+                <th>费用</th>
+                <th>状态</th>
+                <th>操作</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for shipment in shipments %}
+            <tr>
+                <td>{{ shipment.id }}</td>
+                <td>{{ shipment.tracking_number }}</td>
+                <td>{{ shipment.shipment_id if shipment.shipment_id else '' }}</td>
+                <td>{{ shipment.third_party_tracking_number if shipment.third_party_tracking_number else '' }}</td>
+                <td>{{ shipment.customer.name if shipment.customer else '' }}</td>
+                <td>{{ shipment.agent.name if shipment.agent else '' }}</td>
+                <td>{{ shipment.channel }}</td>
+                <td>{{ shipment.weight }}</td>
+                <td>{{ "%.2f"|format(shipment.fee) if shipment.fee else "0.00" }}</td>
+                <td>{{ shipment.status }}</td>
+                <td>
+                    {% if current_user.is_admin %}
+                    <!-- 同步单个运单按钮 -->
+                    <form method="post" action="{{ url_for('views.auto_sync_single', shipment_id=shipment.id) }}" style="display:inline" onsubmit="return confirm('确定要同步该运单的完整物流轨迹吗？')">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<button type="submit" class="btn btn-sm btn-success mb-1">
+                        🤖 同步运单
+                    </button></form>
+
+                    <!-- 强制刷新完整历史按钮 -->
+                    <form method="post" action="{{ url_for('views.refresh_full_history', shipment_id=shipment.id) }}" style="display:inline" onsubmit="return confirm('确定要强制刷新完整历史轨迹吗？这将获取并保存所有历史物流数据，包括之前缺失的轨迹。')">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<button type="submit" class="btn btn-sm btn-info mb-1">
+                        📜 刷新完整历史
+                    </button></form>
+
+                    <!-- 刷新轨迹按钮 -->
+                    <form method="post" action="{{ url_for('views.refresh_single_tracking', shipment_id=shipment.id) }}" style="display:inline" onsubmit="return confirm('确定要刷新该运单的物流轨迹吗？')">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<button type="submit" class="btn btn-sm btn-warning mb-1">
+                        🔄 刷新轨迹
+                    </button></form>
+
+                    <!-- 编辑 -->
+                    <a href="{{ url_for('views.edit_shipment', shipment_id=shipment.id) }}" 
+                       class="btn btn-sm btn-warning mb-1">编辑</a>
+
+                    <!-- 删除 -->
+                    <form method="POST" action="{{ url_for('views.delete_shipment', shipment_id=shipment.id) }}" 
+                          style="display:inline;">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <button type="submit" class="btn btn-sm btn-danger mb-1" 
+                                onclick="return confirm('确定删除该运单吗？')">删除</button>
+                    </form>
+
+                    {% endif %}
+                    <!-- 手工轨迹 -->
+                    <a href="{{ url_for('views.manual_tracks', shipment_id=shipment.id) }}" 
+                       class="btn btn-sm btn-secondary mb-1">手工轨迹</a>
+                </td>
+            </tr>
+            {% else %}
+            <tr>
+                <td colspan="11" class="text-center">暂无运单</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% if pagination is defined %}
+    <p>共 {{ pagination.total }} 票，第 {{ pagination.page }} / {{ pagination.pages or 1 }} 页</p>
+    {% if pagination.pages > 1 %}
+    <nav aria-label="运单分页">
+        {% if pagination.has_prev %}
+        <a rel="prev" href="{{ url_for('views.shipments', page=pagination.prev_num, **filters) }}">上一页</a>
+        {% endif %}
+        {% for number in pagination.iter_pages() %}
+            {% if number == pagination.page %}<strong aria-current="page">{{ number }}</strong>
+            {% elif number %}<a href="{{ url_for('views.shipments', page=number, **filters) }}">{{ number }}</a>
+            {% else %}<span>…</span>{% endif %}
+        {% endfor %}
+        {% if pagination.has_next %}
+        <a rel="next" href="{{ url_for('views.shipments', page=pagination.next_num, **filters) }}">下一页</a>
+        {% endif %}
+    </nav>
+    {% endif %}
+    {% endif %}
+</div>
+{% endblock %}

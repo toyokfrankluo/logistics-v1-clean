@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>客户管理</h2>
+{% if current_user.is_admin %}<form method="post" class="mb-3">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <div class="row g-3">
+    <div class="col-md-6">
+      <label>客户名称</label>
+      <input name="name" class="form-control" required>
+    </div>
+    <div class="col-md-6">
+      <label>银行信息（可选）</label>
+      <input name="bankinfo" class="form-control">
+    </div>
+  </div>
+  <div class="mt-3">
+    <button class="btn btn-primary">保存客户</button>
+  </div>
+</form>{% endif %}
+
+<hr>
+<h3>客户列表</h3>
+<ul>
+  {% for c in customers %}
+    <li>{{ c.name }}</li>
+  {% else %}
+    <li>暂无客户</li>
+  {% endfor %}
+</ul>
+{% endblock %}

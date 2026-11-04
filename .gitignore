@@ -1,0 +1,44 @@
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 虚拟环境
+.venv/
+env/
+venv/
+
+# VSCode 配置
+.vscode/
+
+# 数据库文件（避免上传测试数据）
+*.db
+*.sqlite3
+instance/
+
+# 环境变量文件（本地敏感信息）
+.env
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
+
+# PyInstaller
+*.spec
+dist/
+build/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+# Dedicated offline local acceptance environment
+.venv-local/
+
+# Private data excluded from delivery
+.env.*
+*.sqlite
+data.json
+logistics-starter

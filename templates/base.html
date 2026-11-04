@@ -1,0 +1,39 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>物流管理系统</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <h2>菜单</h2>
+      <ul>
+{% if current_user.is_admin %}        <li><a href="{{ url_for('views.add_shipment') }}">录入运单</a></li>{% endif %}
+        <li><a href="{{ url_for('views.shipments') }}">运单管理</a></li>
+        <li><a href="{{ url_for('views.customers') }}">客户管理</a></li>
+{% if current_user.is_admin %}        <li><a href="{{ url_for('views.agents') }}">代理管理</a></li>{% endif %}
+        <li><a href="{{ url_for('views.finance') }}">财务模块</a></li>
+{% if current_user.is_admin %}        <li><a href="{{ url_for('views.bank_accounts') }}">收款账户管理</a></li>{% endif %}
+        <li><a href="{{ url_for('views.track') }}">轨迹查询</a></li>
+        <li><form method="post" action="{{ url_for('views.logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button type="submit">登出</button></form></li>
+      </ul>
+    </aside>
+    <main class="main">
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+        <div class="flash">
+          {% for category, message in messages %}
+            <div class="alert alert-{{ category }}">{{ message }}</div>
+          {% endfor %}
+        </div>
+        {% endif %}
+      {% endwith %}
+      {% if config.get('ISOLATED_MODE') %}<p role="status">本地演示：数据仅保存在本次运行的临时数据库，重启后重新生成；外部物流与同步已禁网。</p>{% endif %}
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+</body>
+</html>

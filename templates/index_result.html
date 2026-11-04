@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <title>查询结果</title>
+  <style>
+    body { font-family: Arial, Helvetica, sans-serif; margin: 20px; }
+    h2 { margin-top: 0; }
+    textarea { width: 100%; }
+    table { border-collapse: collapse; width: 100%; margin-top: 12px; }
+    th, td { border: 1px solid #ddd; padding: 8px; vertical-align: top; text-align: left; }
+    th { background: #f6f6f6; }
+    pre { margin: 0; white-space: pre-wrap; word-wrap: break-word; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h2>查询结果</h2>
+
+  {# 如果后端传了 results（列表或字典），优先显示它（这是我们新版的结构） #}
+  {% if results %}
+    <table>
+      <tr><th>运单号</th><th>返回（原始）</th></tr>
+      {% for item in results %}
+        {# item 可能是 dict，也可能是 tuple/k,v。我们尽量兼容 #}
+        {% set num = item.number if item.number is defined else (item[0] if item[0] is defined else '未知') %}
+        <tr>
+          <td>{{ num }}</td>
+          <td>
+            {% set raw = item.raw if item.raw is defined else (item.get('raw') if item.get('raw') is defined else item) %}
+            {# raw 可能是字符串或 dict；先尝试字符串输出，否则用 tojson(indent=2) 输出结构化json #}
+            {% if raw is string %}
+              <pre>{{ raw | safe }}</pre>
+            {% else %}
+              <pre>{{ raw | tojson(indent=2) }}</pre>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+    </table>
+
+  {# 否则，回落到旧的单条展示逻辑：order_id/status/updated/carrier #}
+  {% else %}
+    <p>订单号: {{ order_id }}</p>
+    {% if status %}
+      <p>货代: {{ carrier }}</p>
+      <p>最新状态:</p>
+      <pre>{{ status }}</pre>
+      <p>更新时间: {{ updated }}</p>
+    {% else %}
+      <p>订单不存在或尚未抓取</p>
+    {% endif %}
+  {% endif %}
+
+  <p><a href="{{ url_for('index') }}">返回查询页</a></p>
+</body>
+</html>

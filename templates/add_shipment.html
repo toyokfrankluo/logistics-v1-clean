@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>{% if shipment %}编辑运单{% else %}录入运单{% endif %}</h2>
+<form method="post">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <div class="row g-3 mb-3">
+    <div class="col-md-4">
+      <label>运单号</label>
+      <input name="tracking_number" class="form-control" required value="{{ shipment.tracking_number if shipment else '' }}">
+    </div>
+    <div class="col-md-4">
+      <label>NextSLS Shipment ID</label>
+      <input name="shipment_id" class="form-control" value="{{ shipment.shipment_id if shipment else '' }}">
+    </div>
+    <div class="col-md-4">
+      <label>17Track单号</label>
+      <input name="third_party_tracking_number" class="form-control" value="{{ shipment.third_party_tracking_number if shipment else '' }}">
+    </div>
+  </div>
+
+  <div class="row g-3 mb-3">
+    <div class="col-md-4">
+      <label>客户</label>
+      <select name="customer_id" class="form-select">
+        <option value="">— 选择客户 —</option>
+        {% for c in customers %}
+          <option value="{{ c.id }}" {% if shipment and shipment.customer_id==c.id %}selected{% endif %}>{{ c.name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="col-md-4">
+      <label>代理</label>
+      <select name="agent_id" class="form-select">
+        <option value="">— 选择代理 —</option>
+        {% for a in agents %}
+          <option value="{{ a.id }}" {% if shipment and shipment.agent_id==a.id %}selected{% endif %}>{{ a.name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="col-md-4">
+      <label>目的地</label>
+      <select name="destination" class="form-select">
+        {% for d in destinations %}
+          <option value="{{ d }}" {% if shipment and shipment.destination==d %}selected{% endif %}>{{ d }}</option>
+        {% endfor %}
+      </select>
+    </div>
+  </div>
+
+  <div class="row g-3 mb-3">
+    <div class="col-md-2">
+      <label>渠道</label>
+      <select name="channel" class="form-select">
+        {% set channels = ["美西卡派","美中卡派","美东卡派","美国海运快递派","快递","空运","铁路","卡航"] %}
+        {% for ch in channels %}
+          <option value="{{ ch }}" {% if shipment and shipment.channel==ch %}selected{% endif %}>{{ ch }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="col-md-2">
+      <label>重量 (kg)</label>
+      <input id="weight" name="weight" type="number" step="0.01" class="form-control" value="{{ shipment.weight if shipment else 0 }}">
+    </div>
+    <div class="col-md-2">
+      <label>单价</label>
+      <input id="unit_price" name="unit_price" type="number" step="0.01" class="form-control" value="{{ shipment.unit_price if shipment else 0 }}">
+    </div>
+    <div class="col-md-1">
+      <label>件数</label>
+      <input name="pieces" class="form-control" value="{{ shipment.pieces if shipment else 1 }}">
+    </div>
+    <div class="col-md-2">
+      <label>费用（自动计算）</label>
+      <input id="fee" name="fee" class="form-control" readonly value="{{ shipment.fee if shipment else '' }}">
+    </div>
+  </div>
+
+  <div class="row g-3 mb-3">
+    <div class="col-md-3">
+      <label>附加费</label>
+      <input id="surcharge_extra" name="surcharge_extra" type="number" step="0.01" class="form-control" value="{{ shipment.surcharge_extra if shipment else 0 }}">
+    </div>
+    <div class="col-md-3">
+      <label>操作费</label>
+      <input id="operation_fee" name="operation_fee" type="number" step="0.01" class="form-control" value="{{ shipment.operation_fee if shipment else 0 }}">
+    </div>
+    <div class="col-md-3">
+      <label>超值费</label>
+      <input id="high_value_fee" name="high_value_fee" type="number" step="0.01" class="form-control" value="{{ shipment.high_value_fee if shipment else 0 }}">
+    </div>
+    <div class="col-md-3">
+      <label>产品类型</label>
+      <input name="product_type" class="form-control" value="{{ shipment.product_type if shipment else '' }}">
+    </div>
+  </div>
+
+  <div class="mb-3">
+    <label>备注</label>
+    <input name="note" class="form-control" value="{{ shipment.note if shipment else '' }}">
+  </div>
+
+  <button class="btn btn-primary">保存</button>
+  <a class="btn btn-secondary" href="{{ url_for('views.shipments') }}">返回</a>
+</form>
+
+<script>
+function updateFee() {
+    let weight = parseFloat(document.getElementById("weight").value) || 0;
+    let unit_price = parseFloat(document.getElementById("unit_price").value) || 0;
+    let surcharge = parseFloat(document.getElementById("surcharge_extra").value) || 0;
+    let operation = parseFloat(document.getElementById("operation_fee").value) || 0;
+    let high_value = parseFloat(document.getElementById("high_value_fee").value) || 0;
+
+    let fee = (weight * unit_price) + surcharge + operation + high_value;
+    document.getElementById("fee").value = fee.toFixed(2);
+}
+
+document.querySelectorAll("#weight, #unit_price, #surcharge_extra, #operation_fee, #high_value_fee")
+    .forEach(el => el.addEventListener("input", updateFee));
+</script>
+{% endblock %}

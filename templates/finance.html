@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>财务模块</h1>
+
+<form method="post" action="{{ url_for('views.finance') }}" class="row g-3 mb-3">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <div class="col-md-3">
+    <label>选择客户</label>
+    <select name="customer_id" class="form-select">
+      <option value="">-- 全部 --</option>
+      {% for c in customers %}
+        <option value="{{ c.id }}" {% if selected_customer_id and selected_customer_id|int == c.id %}selected{% endif %}>{{ c.name }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="col-md-3">
+    <label>开始日期</label>
+    <input type="date" name="date_from" value="{{ date_from or '' }}" class="form-control">
+  </div>
+  <div class="col-md-3">
+    <label>结束日期</label>
+    <input type="date" name="date_to" value="{{ date_to or '' }}" class="form-control">
+  </div>
+  <div class="col-md-3 align-self-end">
+    <button type="submit" class="btn btn-primary">筛选</button>
+    <button type="submit" name="export" value="1" class="btn btn-secondary">导出</button>
+  </div>
+</form>
+
+<p>总单数：{{ total_shipments }}， 总费用：{{ total_fees }}</p>
+
+{% if shipments %}
+<h2>筛选结果</h2>
+<table class="table">
+<thead><tr><th>日期</th><th>运单号</th><th>客户</th><th>渠道</th><th>件数</th><th>计费重</th><th>费用</th></tr></thead>
+<tbody>
+  {% for s in shipments %}
+  <tr>
+    <td>{{ s.created_at.strftime('%Y-%m-%d') if s.created_at else '' }}</td>
+    <td>{{ s.tracking_number }}</td>
+    <td>{{ s.customer.name if s.customer else '' }}</td>
+    <td>{{ s.channel }}</td>
+    <td>{{ s.pieces }}</td>
+    <td>{{ s.weight }}</td>
+    <td>{{ s.fee }}</td>
+  </tr>
+  {% endfor %}
+</tbody>
+</table>
+{% endif %}
+{% endblock %}

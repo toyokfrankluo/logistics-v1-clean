@@ -1,0 +1,30 @@
+<!doctype html>
+<title>Admin</title>
+<h1>管理后台</h1>
+<p><a href="{{ url_for('admin_add_carrier') }}">新增货代</a> |
+   <a href="{{ url_for('admin_add_order') }}">新增订单</a> |
+   <a href="{{ url_for('admin_logout') }}">登出</a></p>
+
+<h2>货代列表</h2>
+<ul>
+{% for c in carriers %}
+  <li>{{ c[0] }} - {{ c[1] }} ({{ c[2] }})
+    <form style="display:inline" method="post" action="{{ url_for('admin_delete_carrier', carrier_id=c[0]) }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button type="submit">删除</button>
+    </form>
+  </li>
+{% else %}
+  <li>暂无货代</li>
+{% endfor %}
+</ul>
+
+<h2>最近订单</h2>
+<table border="1">
+<tr><th>订单号</th><th>货代</th><th>最新状态</th><th>更新时间</th></tr>
+{% for o in orders %}
+  <tr><td>{{ o[0] }}</td><td>{{ o[1] }}</td><td>{{ o[2] }}</td><td>{{ o[3] }}</td></tr>
+{% else %}
+  <tr><td colspan="4">暂无订单</td></tr>
+{% endfor %}
+</table>

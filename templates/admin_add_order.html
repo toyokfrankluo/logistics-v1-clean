@@ -1,0 +1,20 @@
+<!doctype html>
+<title>添加订单</title>
+<h2>添加订单并抓取</h2>
+<form method="post">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  订单号: <input name="order_id"><br>
+  选择货代:
+  <select name="carrier_id">
+    {% for c in carriers %}
+      <option value="{{ c[0] }}">{{ c[1] }}</option>
+    {% endfor %}
+  </select><br>
+  <button type="submit">添加并抓取</button>
+</form>
+<p><a href="{{ url_for('admin_dashboard') }}">返回</a></p>
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% for cat, msg in messages %}
+    <p style="color: green;">{{ msg }}</p>
+  {% endfor %}
+{% endwith %}

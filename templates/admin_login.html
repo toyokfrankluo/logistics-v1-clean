@@ -1,0 +1,13 @@
+<!doctype html>
+<title>Admin Login</title>
+<h2>管理员登录</h2>
+<form method="post">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  密码: <input type="password" name="password">
+  <button type="submit">登录</button>
+</form>
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% for cat, msg in messages %}
+    <p style="color: red;">{{ msg }}</p>
+  {% endfor %}
+{% endwith %}

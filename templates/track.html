@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>轨迹查询</h2>
+
+<form method="post" class="mb-3">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <div class="row g-3">
+    {% if not public_mode %}
+    <div class="col-md-3">
+      <label>按数据库代理查询（管理员批量）</label>
+      <select name="agent_id" class="form-select">
+        <option value="">（不选）</option>
+        {% for a in agents %}
+          <option value="{{ a.id }}">{{ a.name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="col-md-3">
+      <label>按客户（管理员批量）</label>
+      <select name="customer_id" class="form-select">
+        <option value="">（不选）</option>
+        {% for c in customers %}
+          <option value="{{ c.id }}">{{ c.name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    {% endif %}
+    <div class="col-md-3">
+      <label>使用环境货代（备选）</label>
+      <select name="carrier_id" class="form-select">
+        <option value="">（不选）</option>
+        {% for k,v in carriers.items() %}
+          <option value="{{ k }}">{{ v.name }} ({{ k }})</option>
+        {% endfor %}
+      </select>
+    </div>
+  </div>
+
+  <div class="mt-3">
+    <label>运单号（每行一个，最多 200 条）</label>
+    <textarea name="numbers" rows="6" class="form-control">{{ default_text }}</textarea>
+  </div>
+
+  <div class="mt-3">
+    <button class="btn btn-primary">开始查询</button>
+  </div>
+</form>
+
+{% if message %}
+<div class="alert alert-info">{{ message }}</div>
+{% endif %}
+
+{% if results and results|length > 0 %}
+  <hr>
+  <h3>查询结果</h3>
+  {% for no, r in results.items() %}
+  <details open class="tracking-result">
+    <summary>{{ r.get('tracking_number', no) }}</summary>
+    {% if r.error %}<p role="alert">{{ r.error }}</p>{% endif %}
+    <div style="white-space:pre-wrap">{{ r.tracks or '暂无轨迹' }}</div>
+  </details>
+  {% endfor %}
+{% endif %}
+{% endblock %}

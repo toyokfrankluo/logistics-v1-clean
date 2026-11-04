@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="container mt-4">
+    <h2>轨迹管理 - {{ shipment.tracking_number }}</h2>
+
+    {% if current_user.is_admin %}<form method="POST" class="mb-4">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <div class="row g-3">
+            <div class="col-md-3">
+                <label class="form-label">位置</label>
+                <input type="text" name="location" class="form-control">
+            </div>
+            <div class="col-md-7">
+                <label class="form-label">轨迹描述</label>
+                <input type="text" name="description" class="form-control" required>
+            </div>
+            <div class="col-md-2 d-flex align-items-end">
+                <button type="submit" class="btn btn-primary w-100">添加</button>
+            </div>
+        </div>
+    </form>{% endif %}
+
+    <table class="table table-striped">
+        <thead>
+            <tr>
+                <th>时间</th>
+                <th>位置</th>
+                <th>描述</th>
+                <th>录入人</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for e in events %}
+            <tr>
+                <td>{{ e.happen_time.strftime("%Y-%m-%d %H:%M") }}</td>
+                <td>{{ e.location or "-" }}</td>
+                <td>{{ e.description }}</td>
+                <td>{{ e.author or "-" }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+
+    <a href="{{ url_for('views.shipments') }}" class="btn btn-secondary">返回</a>
+</div>
+{% endblock %}

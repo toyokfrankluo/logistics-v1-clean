@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>运单录入</h2>
+
+<form class="mb-3">
+    <div class="row">
+        <div class="col-md-3">
+            <label class="form-label">运单号</label>
+            <input type="text" class="form-control">
+        </div>
+        <div class="col-md-3">
+            <label class="form-label">客户</label>
+            <input type="text" class="form-control">
+        </div>
+        <div class="col-md-3">
+            <label class="form-label">目的地</label>
+            <input type="text" class="form-control">
+        </div>
+        <div class="col-md-3">
+            <label class="form-label">重量 (kg)</label>
+            <input type="number" class="form-control">
+        </div>
+    </div>
+    <button type="submit" class="btn btn-primary mt-3">保存</button>
+</form>
+
+<table class="table table-bordered">
+    <thead>
+        <tr>
+            <th>运单号</th>
+            <th>客户</th>
+            <th>目的地</th>
+            <th>重量</th>
+            <th>状态</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>WB123456</td>
+            <td>张三</td>
+            <td>香港</td>
+            <td>10</td>
+            <td>已录入</td>
+        </tr>
+    </tbody>
+</table>
+{% endblock %}

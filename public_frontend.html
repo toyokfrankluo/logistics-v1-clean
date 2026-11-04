@@ -1,0 +1,33 @@
+<!-- public_frontend.html -->
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>物流轨迹查询</title>
+</head>
+<body>
+  <h1>物流轨迹查询</h1>
+  <input type="text" id="trackingNumber" placeholder="输入单号">
+  <button onclick="fetchLogistics()">查询</button>
+
+  <pre id="result"></pre>
+
+  <script>
+    async function fetchLogistics() {
+      const trackingNumber = document.getElementById("trackingNumber").value;
+      if (!trackingNumber) return alert("请输入单号");
+
+      try {
+        const response = await fetch("/public_track", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({order_id: trackingNumber})});
+        if (!response.ok) throw new Error("请求失败，请检查单号或跨域问题");
+
+        const data = await response.json();
+        document.getElementById("result").textContent = JSON.stringify(data, null, 2);
+      } catch (err) {
+        document.getElementById("result").textContent = "Error: " + err.message;
+      }
+    }
+  </script>
+</body>
+</html>
