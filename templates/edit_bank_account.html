@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="container mt-4">
+  <h2>编辑银行账户</h2>
+  <form method="post" class="row g-3">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <div class="col-md-3"><label class="form-label">类型</label>
+      <select name="account_type" class="form-select" required>
+        <option value="private" {% if account.account_type == 'private' %}selected{% endif %}>私人</option>
+        <option value="public" {% if account.account_type == 'public' %}selected{% endif %}>公账</option>
+      </select>
+    </div>
+    <div class="col-md-3"><label class="form-label">开户行</label><input name="bank_name" class="form-control" value="{{ account.bank_name }}" required></div>
+    <div class="col-md-3"><label class="form-label">户名</label><input name="account_name" class="form-control" value="{{ account.account_name }}" required></div>
+    <div class="col-md-3"><label class="form-label">账号</label><input name="account_no" class="form-control" value="{{ account.account_no }}" required></div>
+    <div class="col-md-9"><label class="form-label">备注</label><input name="remark" class="form-control" value="{{ account.remark or '' }}"></div>
+    <div class="col-md-3 form-check align-self-end"><input type="checkbox" class="form-check-input" id="is_default" name="is_default" value="1" {% if account.is_default %}checked{% endif %}>
+      <label class="form-check-label" for="is_default">设为默认账户</label></div>
+    <div class="col-12"><button class="btn btn-primary">保存</button> <a class="btn btn-secondary" href="{{ url_for('views.bank_accounts') }}">返回</a></div>
+  </form>
+</div>
+{% endblock %}

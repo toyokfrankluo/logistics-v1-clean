@@ -19,7 +19,7 @@ import requests
 from openpyxl import load_workbook
 
 import app as backend
-from models import db, Customer, CarrierAgent, Shipment, ManualTrack
+from models import db, Customer, CarrierAgent, Shipment, ManualTrack, BankAccount
 from utils import export_invoice
 
 
@@ -256,11 +256,16 @@ class StabilityTests(unittest.TestCase):
 
     def test_finance_download(self):
         self.login()
+        account = BankAccount(account_type="private", bank_name="虚构银行", account_name="虚构户名",
+                              account_no="00001234", is_default=True)
+        db.session.add(account)
+        db.session.commit()
         response = self.post("/finance", data={"export": "1"})
         self.assertEqual(response.status_code, 200)
         wb = load_workbook(io.BytesIO(response.data))
         self.assertEqual(wb.active.cell(5, 4).value, "PROVIDER-FICTIONAL-001")
         self.assertEqual(wb.active.cell(5, 10).value, 32)
+        self.assertIn("账号：00001234", [cell.value for row in wb.active.iter_rows() for cell in row])
 
     def test_concurrent_exports_are_independent(self):
         def export(name):

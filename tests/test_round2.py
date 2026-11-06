@@ -222,6 +222,10 @@ class SafetyTests(unittest.TestCase):
 
     def test_member_read_queries_and_exports_still_work(self):
         self.login(admin=False)
+        account = BankAccount(account_type="public", bank_name="虚构成员导出银行", account_name="虚构户名",
+                              account_no="00005678", is_default=True)
+        db.session.add(account)
+        db.session.commit()
         for path in ("/shipments", "/track", "/finance", "/customers", "/shipments/1/tracks"):
             with self.subTest(path=path):
                 self.assertEqual(self.client.get(path).status_code, 200)

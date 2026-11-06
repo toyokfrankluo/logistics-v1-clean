@@ -7,6 +7,8 @@ csrf = CSRFProtect()
 
 ADMIN_ENDPOINTS = {
     "agents", "edit_agent", "delete_agent", "bank_accounts",
+    "edit_bank_account", "delete_bank_account", "set_default_bank_account",
+    "edit_customer", "delete_customer",
     "add_shipment", "edit_shipment", "delete_shipment", "import_shipments",
     "sync_to_supabase", "sync_tracking_details", "refresh_tracking",
     "refresh_single_tracking", "refresh_full_history", "auto_sync_single",

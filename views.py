@@ -5,6 +5,7 @@ from models import db, CarrierAgent, Shipment, Customer, BankAccount, ManualTrac
 from flask_login import login_required, logout_user, current_user
 from sqlalchemy.orm import joinedload, selectinload
 from datetime import datetime, timedelta
+from sqlalchemy import inspect as sqlalchemy_inspect, MetaData, Table, select, func
 from utils import export_invoice
 import requests
 import carrier_http
@@ -619,20 +620,121 @@ def delete_shipment(shipment_id):
 @login_required
 def bank_accounts():
     if request.method == "POST":
-        acc = BankAccount(
-            account_type=request.form.get("account_type", "private"),
-            bank_name=request.form.get("bank_name"),
-            account_name=request.form.get("account_name"),
-            account_no=request.form.get("account_no"),
-            remark=request.form.get("remark")
-        )
-        db.session.add(acc)
-        db.session.commit()
+        values, error = _validated_bank_account_form()
+        if error:
+            flash(error, "danger")
+            return redirect(url_for("views.bank_accounts"))
+        try:
+            acc = BankAccount(**values)
+            db.session.add(acc)
+            _apply_default_bank_account(acc, values.pop("is_default", False))
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            flash("银行账户保存失败，请检查填写内容", "danger")
+            return redirect(url_for("views.bank_accounts"))
         flash("银行账户已添加", "success")
         return redirect(url_for("views.bank_accounts"))
 
-    accounts = BankAccount.query.all()
+    accounts = BankAccount.query.order_by(BankAccount.id.asc()).all()
     return render_template("bank_accounts.html", accounts=accounts)
+
+
+def _validated_bank_account_form():
+    """Validate account fields without coercing account numbers to integers."""
+    values = {
+        "account_type": request.form.get("account_type", "private").strip(),
+        "bank_name": request.form.get("bank_name", "").strip(),
+        "account_name": request.form.get("account_name", "").strip(),
+        "account_no": request.form.get("account_no", "").strip(),
+        "remark": request.form.get("remark", "").strip() or None,
+    }
+    if values["account_type"] not in {"private", "public"}:
+        return None, "账户类型无效"
+    limits = {"bank_name": 200, "account_name": 200, "account_no": 200, "remark": 500}
+    if any(not values[field] for field in ("bank_name", "account_name", "account_no")):
+        return None, "开户行、户名和账号不能为空"
+    if any(values[field] and len(values[field]) > limit for field, limit in limits.items()):
+        return None, "填写内容超出长度限制"
+    values["is_default"] = request.form.get("is_default") in {"1", "true", "on"}
+    return values, None
+
+
+def _apply_default_bank_account(account, make_default):
+    if make_default:
+        BankAccount.query.filter(BankAccount.id != account.id).update(
+            {BankAccount.is_default: False}, synchronize_session=False)
+    account.is_default = bool(make_default)
+
+
+def _has_referencing_rows(target_table, target_id):
+    """Check actual FK references, including legacy tables not mapped as ORM models."""
+    inspector = sqlalchemy_inspect(db.engine)
+    metadata = MetaData()
+    for table_name in inspector.get_table_names():
+        if table_name == target_table:
+            continue
+        for foreign_key in inspector.get_foreign_keys(table_name):
+            if foreign_key.get("referred_table") != target_table:
+                continue
+            for local_column, remote_column in zip(
+                    foreign_key.get("constrained_columns") or (),
+                    foreign_key.get("referred_columns") or ()):
+                if remote_column != "id":
+                    continue
+                table = Table(table_name, metadata, autoload_with=db.engine)
+                count = db.session.execute(
+                    select(func.count()).select_from(table).where(table.c[local_column] == target_id)
+                ).scalar_one()
+                if count:
+                    return True
+    return False
+
+
+@views.route("/bank_accounts/<int:account_id>/edit", methods=["GET", "POST"])
+@login_required
+def edit_bank_account(account_id):
+    account = BankAccount.query.get_or_404(account_id)
+    if request.method == "POST":
+        values, error = _validated_bank_account_form()
+        if error:
+            return error, 400
+        make_default = values.pop("is_default")
+        for field, value in values.items():
+            setattr(account, field, value)
+        _apply_default_bank_account(account, make_default)
+        try:
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            flash("银行账户保存失败，请检查填写内容", "danger")
+            return redirect(url_for("views.edit_bank_account", account_id=account_id))
+        flash("银行账户已更新", "success")
+        return redirect(url_for("views.bank_accounts"))
+    return render_template("edit_bank_account.html", account=account)
+
+
+@views.route("/bank_accounts/<int:account_id>/delete", methods=["POST"])
+@login_required
+def delete_bank_account(account_id):
+    account = BankAccount.query.get_or_404(account_id)
+    if _has_referencing_rows("bank_account", account.id):
+        flash("该账户已被历史记录引用，不能删除", "danger")
+        return redirect(url_for("views.bank_accounts"))
+    db.session.delete(account)
+    db.session.commit()
+    flash("银行账户已删除", "success")
+    return redirect(url_for("views.bank_accounts"))
+
+
+@views.route("/bank_accounts/<int:account_id>/default", methods=["POST"])
+@login_required
+def set_default_bank_account(account_id):
+    account = BankAccount.query.get_or_404(account_id)
+    _apply_default_bank_account(account, True)
+    db.session.commit()
+    flash("默认收款账户已更新", "success")
+    return redirect(url_for("views.bank_accounts"))
 
 
 @views.route("/shipments/<int:shipment_id>/tracks", methods=["GET", "POST"])
@@ -707,21 +809,76 @@ def customers():
     if request.method == "POST":
         name = request.form.get("name", "").strip()
         bankinfo = request.form.get("bankinfo", "").strip()
+        email = request.form.get("email", "").strip() or None
+        phone = request.form.get("phone", "").strip() or None
         if not name:
             flash("客户名称不能为空", "danger")
             return redirect(url_for("views.customers"))
 
-        if Customer.query.filter_by(name=name).count():
+        if len(name) > 100 or (email and len(email) > 120) or (phone and len(phone) > 50):
+            flash("客户信息超出长度限制", "danger")
+            return redirect(url_for("views.customers"))
+        if Customer.query.filter_by(name=name).first():
             flash('客户名称已存在，请使用现有客户', 'danger')
             return redirect(url_for('views.customers'))
-        c = Customer(name=name, bank_info=bankinfo)
+        if email and Customer.query.filter_by(email=email).first():
+            flash("客户邮箱已被其他客户使用", "danger")
+            return redirect(url_for("views.customers"))
+        c = Customer(name=name, bank_info=bankinfo, email=email, phone=phone)
         db.session.add(c)
-        db.session.commit()
+        try:
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            flash("客户信息保存失败，请检查填写内容", "danger")
+            return redirect(url_for("views.customers"))
         flash("客户已添加", "success")
         return redirect(url_for("views.customers"))
 
     data = Customer.query.all()
     return render_template("customers.html", customers=data)
+
+
+@views.route("/customers/<int:customer_id>/edit", methods=["GET", "POST"])
+@login_required
+def edit_customer(customer_id):
+    customer = Customer.query.get_or_404(customer_id)
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+        email = request.form.get("email", "").strip() or None
+        phone = request.form.get("phone", "").strip() or None
+        bank_info = request.form.get("bankinfo", "").strip() or None
+        if not name:
+            return "客户名称不能为空", 400
+        duplicate = Customer.query.filter(Customer.name == name, Customer.id != customer.id).first()
+        if duplicate:
+            return "客户名称已存在", 400
+        if email and Customer.query.filter(Customer.email == email, Customer.id != customer.id).first():
+            return "客户邮箱已被其他客户使用", 400
+        if len(name) > 100 or (email and len(email) > 120) or (phone and len(phone) > 50):
+            return "填写内容超出长度限制", 400
+        customer.name, customer.email, customer.phone, customer.bank_info = name, email, phone, bank_info
+        try:
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            return "客户信息保存失败，请检查填写内容", 400
+        flash("客户信息已更新", "success")
+        return redirect(url_for("views.customers"))
+    return render_template("edit_customer.html", customer=customer)
+
+
+@views.route("/customers/<int:customer_id>/delete", methods=["POST"])
+@login_required
+def delete_customer(customer_id):
+    customer = Customer.query.get_or_404(customer_id)
+    if _has_referencing_rows("customer", customer.id):
+        flash("该客户已关联运单或历史业务记录，不能删除", "danger")
+        return redirect(url_for("views.customers"))
+    db.session.delete(customer)
+    db.session.commit()
+    flash("客户已删除", "success")
+    return redirect(url_for("views.customers"))
 
 
 # -------------------------------
@@ -731,9 +888,13 @@ def customers():
 @login_required
 def finance():
     customers = Customer.query.all()
-    accounts = BankAccount.query.all()
+    accounts = BankAccount.query.order_by(BankAccount.id.asc()).all()
 
     selected_customer_id = request.form.get("customer_id")
+    raw_account_id = request.form.get("bank_account_id")
+    default_accounts = [account for account in accounts if account.is_default]
+    selected_account_id = raw_account_id or (
+        str(default_accounts[0].id) if len(default_accounts) == 1 else "")
     date_from = request.form.get("date_from")
     date_to = request.form.get("date_to")
 
@@ -757,6 +918,13 @@ def finance():
     total_shipments = len(shipments)
 
     if request.form.get("export"):
+        if not selected_account_id:
+            return "请先选择收款银行账户", 400
+        if not selected_account_id.isdigit():
+            return "收款银行账户无效", 400
+        selected_account = BankAccount.query.get(int(selected_account_id))
+        if selected_account is None:
+            return "收款银行账户无效", 400
         customer_name = "全部客户"
         if selected_customer_id:
             customer = Customer.query.get(selected_customer_id)
@@ -777,14 +945,13 @@ def finance():
                 "summary": s.note or ""
             })
 
-        # 直接传 accounts 列表给 export_invoice（函数会识别 ORM 对象）
         company_info = {
             "公司名称": "物流公司",
             "地址": ""
         }
 
         # 传递 date_from/date_to 给导出函数
-        filename = export_invoice(company_info, customer_name, orders, accounts,
+        filename = export_invoice(company_info, customer_name, orders, [selected_account],
                                   date_from=date_from or None, date_to=date_to or None, filename=None)
         return send_file(filename, as_attachment=True, download_name="invoice.xlsx",
                          mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -796,6 +963,7 @@ def finance():
                            total_shipments=total_shipments,
                            total_fees=total_fees,
                            selected_customer_id=selected_customer_id,
+                           selected_account_id=selected_account_id,
                            date_from=date_from,
                            date_to=date_to)
 

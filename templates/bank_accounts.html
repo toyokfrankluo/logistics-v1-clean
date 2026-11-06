@@ -29,6 +29,10 @@
             <label class="form-label">备注</label>
             <input type="text" name="remark" class="form-control">
         </div>
+        <div class="col-md-2 form-check align-self-end">
+            <input type="checkbox" class="form-check-input" id="is_default" name="is_default" value="1">
+            <label class="form-check-label" for="is_default">设为默认账户</label>
+        </div>
         <div class="col-12">
             <button class="btn btn-primary">保存</button>
         </div>
@@ -43,8 +47,10 @@
                 <th>开户行</th>
                 <th>户名</th>
                 <th>账号</th>
+                <th>默认</th>
                 <th>备注</th>
                 <th>创建时间</th>
+                <th>操作</th>
             </tr>
         </thead>
         <tbody>
@@ -55,8 +61,20 @@
                 <td>{{ acc.bank_name }}</td>
                 <td>{{ acc.account_name }}</td>
                 <td>{{ acc.account_no }}</td>
+                <td>{% if acc.is_default %}<span class="badge bg-success">默认</span>{% else %}
+                    <form method="post" action="{{ url_for('views.set_default_bank_account', account_id=acc.id) }}" class="d-inline">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <button class="btn btn-sm btn-outline-secondary">设为默认</button>
+                    </form>{% endif %}</td>
                 <td>{{ acc.remark or "" }}</td>
                 <td>{{ acc.created_at.strftime("%Y-%m-%d %H:%M") }}</td>
+                <td class="text-nowrap">
+                    <a class="btn btn-sm btn-outline-primary" href="{{ url_for('views.edit_bank_account', account_id=acc.id) }}">编辑</a>
+                    <form method="post" action="{{ url_for('views.delete_bank_account', account_id=acc.id) }}" class="d-inline" onsubmit="return confirm('确定删除这个银行账户吗？');">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <button class="btn btn-sm btn-outline-danger">删除</button>
+                    </form>
+                </td>
             </tr>
             {% endfor %}
         </tbody>
