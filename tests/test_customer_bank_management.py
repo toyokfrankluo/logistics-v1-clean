@@ -51,10 +51,9 @@ class CustomerBankManagement(unittest.TestCase):
         account = BankAccount(bank_name="虚构银行", account_name="虚构户名", account_no="0000099")
         db.session.add(account)
         db.session.commit()
-        # Simulate a legacy financial table with a real FK, without changing the app schema.
+        # Simulate a legacy financial table with no FK constraint, as older schemas may have.
         db.session.execute(db.text(
-            "CREATE TABLE legacy_invoice_test (id INTEGER PRIMARY KEY, bank_account_id INTEGER "
-            "REFERENCES bank_account(id))"))
+            "CREATE TABLE legacy_invoice_test (id INTEGER PRIMARY KEY, bank_account_id INTEGER)"))
         db.session.execute(db.text("INSERT INTO legacy_invoice_test(bank_account_id) VALUES (:id)"), {"id": account.id})
         db.session.commit()
         try:

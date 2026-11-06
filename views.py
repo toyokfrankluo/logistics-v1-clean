@@ -668,21 +668,27 @@ def _apply_default_bank_account(account, make_default):
 
 
 def _has_referencing_rows(target_table, target_id):
-    """Check actual FK references, including legacy tables not mapped as ORM models."""
+    """Check FK and conventional ``<table>_id`` references, including legacy tables."""
     inspector = sqlalchemy_inspect(db.engine)
     metadata = MetaData()
     for table_name in inspector.get_table_names():
         if table_name == target_table:
             continue
+        local_columns = set()
         for foreign_key in inspector.get_foreign_keys(table_name):
             if foreign_key.get("referred_table") != target_table:
                 continue
             for local_column, remote_column in zip(
                     foreign_key.get("constrained_columns") or (),
                     foreign_key.get("referred_columns") or ()):
-                if remote_column != "id":
-                    continue
-                table = Table(table_name, metadata, autoload_with=db.engine)
+                if remote_column == "id":
+                    local_columns.add(local_column)
+        conventional_column = f"{target_table}_id"
+        if any(column["name"] == conventional_column for column in inspector.get_columns(table_name)):
+            local_columns.add(conventional_column)
+        if local_columns:
+            table = Table(table_name, metadata, autoload_with=db.engine)
+            for local_column in local_columns:
                 count = db.session.execute(
                     select(func.count()).select_from(table).where(table.c[local_column] == target_id)
                 ).scalar_one()
