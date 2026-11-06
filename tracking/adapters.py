@@ -14,7 +14,7 @@ def _matches(value, allowed):
     return any(type(value) is type(candidate) and value == candidate for candidate in allowed)
 
 
-def parse_response(provider, source_id, http_status, body, *, source_timezone=None, expected_number=None):
+def parse_response(provider, source_id, http_status, body, *, source_timezone=None, expected_number=None, allow_unverified_preview=False):
     """Providers: rtb56, txfba, nextsls, 17track, generic.
 
     Generic envelopes without explicit recognized success markers are unverified,
@@ -25,6 +25,7 @@ def parse_response(provider, source_id, http_status, body, *, source_timezone=No
         raise ValueError('Unsupported provider')
     if not isinstance(source_id, str) or not source_id:
         raise ValueError('source_id is required')
+    identity_unverified = False
     def result(status, events=(), error=None, message=None, pending=()):
         official_ok = expected_number is not None and status in (QueryStatus.SUCCESS, QueryStatus.EMPTY)
         shipment_status = 'in_transit' if official_ok and data['data'][0].get('track_status') == 'NT' else 'unknown'
@@ -43,7 +44,8 @@ def parse_response(provider, source_id, http_status, body, *, source_timezone=No
     if not isinstance(data, dict):
         return fail(ErrorType.SCHEMA, 'Expected object envelope')
     # Official RTB56 profile is opt-in to preserve offline legacy comparisons.
-    # expected_number must come from independently confirmed service-number mapping.
+    # expected_number is the caller's trusted comparison number. A mismatch can
+    # only yield UNVERIFIED events when explicitly requested for read-only preview.
     if expected_number is not None:
         if provider != 'rtb56' or not isinstance(expected_number, str) or not expected_number.strip():
             return fail(ErrorType.SCHEMA, 'Invalid expected service number')
@@ -61,7 +63,10 @@ def parse_response(provider, source_id, http_status, body, *, source_timezone=No
         if code is None or code == '':
             return fail(ErrorType.SCHEMA, 'rtb56:identity_missing')
         if code != expected_number:
-            return fail(ErrorType.SCHEMA, 'rtb56:identity_mismatch:' + type(code).__name__)
+            if allow_unverified_preview is True and isinstance(code, str) and code.strip():
+                identity_unverified = True
+            else:
+                return fail(ErrorType.SCHEMA, 'rtb56:identity_mismatch:' + type(code).__name__)
     markers = {
         'success': (1, '1'),
         'status': (1, '1', 200, '200', True) if provider == 'nextsls' else (200,),
@@ -127,6 +132,9 @@ def parse_response(provider, source_id, http_status, body, *, source_timezone=No
                 location or '', description))
     except (KeyError, TypeError, ValueError):
         return fail(ErrorType.SCHEMA, 'Malformed or unsupported event structure')
+    if identity_unverified:
+        return result(QueryStatus.UNVERIFIED, normalized, ErrorType.UNCONFIRMED_PROTOCOL,
+                      'rtb56:identity_unverified_preview', ('service_number_mapping_unconfirmed',))
     if not verified:
         return result(QueryStatus.UNVERIFIED, normalized, ErrorType.UNCONFIRMED_PROTOCOL,
                       'Generic success convention is unconfirmed', tuple(pending))

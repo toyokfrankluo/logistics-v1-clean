@@ -17,7 +17,7 @@ views = Blueprint("views", __name__)
 # -------------------------------
 # API 轨迹获取函数
 # -------------------------------
-def fetch_tracking_from_api(agent: CarrierAgent, tracking_number: str, *, selected_shipment=None, safe_errors=False):
+def fetch_tracking_from_api(agent: CarrierAgent, tracking_number: str, *, selected_shipment=None, safe_errors=False, read_only_preview=False):
     """
     根据不同的代理调用不同 API
     """
@@ -53,7 +53,15 @@ def fetch_tracking_from_api(agent: CarrierAgent, tracking_number: str, *, select
             response = carrier_http.post(agent, data=payload,
                 headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=15)
             result = parse_response("rtb56", str(agent.id), response.status_code,
-                                    response.text, expected_number=selected_shipment.tracking_number)
+                                    response.text, expected_number=selected_shipment.tracking_number,
+                                    allow_unverified_preview=(read_only_preview is True and not safe_errors))
+            if (result.status == QueryStatus.UNVERIFIED
+                    and result.message == "rtb56:identity_unverified_preview"
+                    and result.events and read_only_preview is True and not safe_errors):
+                current_app.logger.warning("rtb56 category=identity_unverified_preview")
+                return [{"time": event.time.raw or "", "location": event.location,
+                         "description": event.description} for event in result.events], (
+                    "服务商单号尚未验证归属。以下外部轨迹仅供只读预览，不用于同步或物流状态更新。")
             diagnostic = None
             if result.status == QueryStatus.EMPTY:
                 diagnostic = "empty_details"
@@ -844,7 +852,7 @@ def _tracking_result(s, no):
     # 2. API 轨迹（显示不带 [API] 标签）
     if s and s.agent:
         try:
-            api_tracks, api_err = fetch_tracking_from_api(s.agent, no, selected_shipment=s)
+            api_tracks, api_err = fetch_tracking_from_api(s.agent, no, selected_shipment=s, read_only_preview=True)
         except Exception:
             api_tracks, api_err = None, '该票物流查询失败，请稍后重试'
         if api_tracks:

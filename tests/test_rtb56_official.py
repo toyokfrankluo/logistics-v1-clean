@@ -144,3 +144,149 @@ class OfficialBoundary(unittest.TestCase):
             self.assertIn(category, error)
             self.assertNotIn('secret-', ''.join(logs.output) + error)
             self.assertNotIn(self.shipment.tracking_number, ''.join(logs.output))
+
+
+class ReadOnlyPreview(unittest.TestCase):
+    setUpClass = classmethod(base.StabilityTests.setUpClass.__func__)
+    tearDown = base.StabilityTests.tearDown
+    login = base.StabilityTests.login
+    post = base.StabilityTests.post
+    token = base.StabilityTests.token
+    manual = base.StabilityTests.manual
+
+    def setUp(self):
+        base.StabilityTests.setUp(self)
+        self.agent.supports_api = True
+        self.agent.api_url = 'https://fictional.rtb56.com/api'
+        self.agent.app_key, self.agent.app_token = 'fictional-key', 'fictional-token'
+        db.session.commit()
+        self.payload = {'success': 1, 'data': [{'server_hawbcode': 'FICTIONAL-SERVICE-OTHER',
+            'track_status': 'NT', 'details': [{'track_occur_date': '2026-01-02 12:00:00',
+                'track_location': '虚构节点', 'track_description': '虚构预览事件<script>unsafe</script>'}]}]}
+
+    def response(self):
+        from unittest.mock import Mock
+        return Mock(status_code=200, text=json.dumps(self.payload))
+
+    def parse(self, preview=True):
+        return parse_response('rtb56', 'fictional-source', 200, json.dumps(self.payload),
+                              expected_number=self.shipment.tracking_number,
+                              allow_unverified_preview=preview)
+
+    def test_mismatch_is_unverified_without_status_or_service_number(self):
+        result = self.parse()
+        self.assertEqual(result.status, QueryStatus.UNVERIFIED)
+        self.assertEqual(len(result.events), 1)
+        self.assertIsNone(result.service_number)
+        self.assertEqual(result.shipment_status, 'unknown')
+        self.assertEqual(result.events[0].status.value, 'unknown')
+        self.assertEqual(self.parse(False).status, QueryStatus.ERROR)
+        self.assertEqual(self.parse('true').status, QueryStatus.ERROR)
+
+    def test_matching_number_preserves_verified_behavior(self):
+        self.payload['data'][0]['server_hawbcode'] = self.shipment.tracking_number
+        self.assertEqual(self.parse().status, QueryStatus.SUCCESS)
+        self.login()
+        with patch('carrier_http.post', return_value=self.response()):
+            page = self.post('/track', data={'numbers': self.shipment.tracking_number})
+        self.assertIn('虚构预览事件', page.text)
+        self.assertNotIn('服务商单号尚未验证归属', page.text)
+
+    def test_invalid_payloads_never_become_preview(self):
+        import copy
+        original = copy.deepcopy(self.payload)
+        cases = [{'success': 0, 'data': original['data']},
+                 {'success': '1', 'data': original['data']},
+                 {'success': 1, 'data': original['data'] * 2},
+                 {'success': 1, 'data': []},
+                 {'success': 1, 'data': {}},
+                 {'success': 1, 'data': [{'details': original['data'][0]['details']}]},
+                 {'success': 1, 'data': [{'server_hawbcode': 123, 'details': []}]},
+                 {'success': 1, 'data': [{'server_hawbcode': 'OTHER', 'details': [None]}]},
+                 {'success': 1, 'data': [{'server_hawbcode': 'OTHER', 'details': [{'track_description': 123}]}]},
+                 {'success': 1, 'error': 'supplier failed', 'data': original['data']}]
+        for payload in cases:
+            self.payload = payload
+            result = self.parse()
+            self.assertFalse(result.events)
+            self.assertNotEqual(result.status, QueryStatus.SUCCESS)
+
+    def test_preview_page_has_warning_preserves_manual_history_and_performs_no_writes(self):
+        from sqlalchemy import event
+        self.manual()
+        self.login()
+        before_status = self.shipment.status
+        statements = []
+        def record(conn, cursor, statement, parameters, context, many):
+            statements.append(statement)
+        event.listen(db.engine, 'before_cursor_execute', record)
+        try:
+            with patch('carrier_http.post', return_value=self.response()) as remote, \
+                 patch('views.sync_tracking_to_supabase') as sync, \
+                 patch('views.simple_sync_tracking') as simple, \
+                 patch('views.complete_sync_tracking') as complete:
+                page = self.post('/track', data={'numbers': self.shipment.tracking_number})
+                remote.assert_called_once()
+                sync.assert_not_called()
+                simple.assert_not_called()
+                complete.assert_not_called()
+                sent = remote.call_args.kwargs['data']
+                self.assertEqual(sent['appKey'], 'fictional-key')
+                self.assertEqual(sent['appToken'], 'fictional-token')
+                self.assertEqual(json.loads(sent['paramsJson'])['tracking_number'], self.shipment.tracking_number)
+        finally:
+            event.remove(db.engine, 'before_cursor_execute', record)
+        self.assertEqual(page.status_code, 200)
+        self.assertIn('服务商单号尚未验证归属', page.text)
+        self.assertIn('只读预览', page.text)
+        self.assertIn('虚构仓库已接收', page.text)
+        self.assertIn('虚构预览事件&lt;script&gt;', page.text)
+        self.assertNotIn('<script>unsafe</script>', page.text)
+        self.assertFalse(any(s.lstrip().split()[0].upper() in
+                             {'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP'}
+                             for s in statements))
+        self.assertEqual(self.shipment.status, before_status)
+        self.assertEqual(ManualTrack.query.count(), 1)
+
+    def test_refresh_rejects_unverified_result_and_never_syncs(self):
+        import views
+        self.login()
+        with patch('carrier_http.post', return_value=self.response()), \
+             patch('views.simple_sync_tracking') as sync, \
+             patch('views.sync_tracking_to_supabase') as external:
+            tracks, error = views._refresh_query(self.shipment, self.agent)
+            self.assertIsNone(tracks)
+            self.assertIsNotNone(error)
+            self.post(f'/shipments/{self.shipment.id}/refresh')
+            sync.assert_not_called()
+            external.assert_not_called()
+
+    def test_preview_rejects_duplicate_or_inactive_agent_before_request(self):
+        import views
+        from models import Shipment
+        self.agent.is_active = False
+        db.session.commit()
+        with patch('carrier_http.post') as remote:
+            tracks, error = views.fetch_tracking_from_api(
+                self.agent, self.shipment.tracking_number, selected_shipment=self.shipment,
+                read_only_preview=True)
+        remote.assert_not_called()
+        self.assertIsNone(tracks)
+        self.agent.is_active = True
+        db.session.add(Shipment(agent_id=self.agent.id, tracking_number=self.shipment.tracking_number))
+        db.session.commit()
+        with patch('carrier_http.post') as remote:
+            tracks, error = views.fetch_tracking_from_api(
+                self.agent, self.shipment.tracking_number, selected_shipment=self.shipment,
+                read_only_preview=True)
+        remote.assert_not_called()
+        self.assertIsNone(tracks)
+
+    def test_cannot_enable_preview_for_safe_refresh_caller(self):
+        import views
+        with patch('carrier_http.post', return_value=self.response()):
+            tracks, error = views.fetch_tracking_from_api(
+                self.agent, self.shipment.tracking_number, selected_shipment=self.shipment,
+                read_only_preview=True, safe_errors=True)
+        self.assertIsNone(tracks)
+        self.assertIsNotNone(error)
