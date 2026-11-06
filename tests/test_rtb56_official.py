@@ -116,3 +116,31 @@ class OfficialBoundary(unittest.TestCase):
         remote.assert_not_called()
         self.assertIsNone(events)
         self.assertIn('重复查询单号', error)
+
+    def test_safe_diagnostics_distinguish_failures(self):
+        import views
+        from unittest.mock import Mock
+        self.agent.supports_api = True
+        self.agent.api_url = 'https://fictional.rtb56.com/api'
+        db.session.commit()
+        cases = [
+            (503, '{}', 'http_error'),
+            (200, 'not json secret-token', 'invalid_json'),
+            (200, json.dumps({'success': 0}), 'supplier_failure'),
+            (200, json.dumps({'success': '1'}), 'success_type:str'),
+            (200, json.dumps({'success': 1, 'data': {}}), 'data_structure:dict'),
+            (200, json.dumps({'success': 1, 'data': [{}]}), 'identity_missing'),
+            (200, json.dumps({'success': 1, 'data': [{'server_hawbcode': 'secret-other'}]}), 'identity_mismatch:str'),
+            (200, json.dumps({'success': 1, 'data': []}), 'empty_data_unverified'),
+            (200, json.dumps({'success': 1, 'data': [{'server_hawbcode': self.shipment.tracking_number,
+                                                     'details': 'secret-invalid'}]}), 'structure_or_event_error'),
+        ]
+        for status, body, category in cases:
+            with self.subTest(category=category), patch('carrier_http.post',
+                    return_value=Mock(status_code=status, text=body)), self.assertLogs(level='WARNING') as logs:
+                events, error = views.fetch_tracking_from_api(
+                    self.agent, self.shipment.tracking_number, selected_shipment=self.shipment)
+            self.assertIsNone(events)
+            self.assertIn(category, error)
+            self.assertNotIn('secret-', ''.join(logs.output) + error)
+            self.assertNotIn(self.shipment.tracking_number, ''.join(logs.output))

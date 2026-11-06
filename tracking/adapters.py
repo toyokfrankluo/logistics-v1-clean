@@ -48,17 +48,20 @@ def parse_response(provider, source_id, http_status, body, *, source_timezone=No
         if provider != 'rtb56' or not isinstance(expected_number, str) or not expected_number.strip():
             return fail(ErrorType.SCHEMA, 'Invalid expected service number')
         if type(data.get('success')) is not int or data['success'] not in (0, 1):
-            return fail(ErrorType.BUSINESS, 'RTB56 requires integer success')
+            return fail(ErrorType.BUSINESS, 'rtb56:success_type:' + type(data.get('success')).__name__)
         if data['success'] == 0:
-            return fail(ErrorType.BUSINESS, 'Supplier reported failure')
+            return fail(ErrorType.BUSINESS, 'rtb56:supplier_failure')
         batches = data.get('data')
         if batches == []:
             return result(QueryStatus.UNVERIFIED, error=ErrorType.UNCONFIRMED_PROTOCOL,
-                          message='Empty data identity and meaning unconfirmed')
-        if (not isinstance(batches, list) or len(batches) != 1
-                or not isinstance(batches[0], dict)
-                or batches[0].get('server_hawbcode') != expected_number):
-            return fail(ErrorType.SCHEMA, 'RTB56 response identity mismatch')
+                          message='rtb56:empty_data_unverified')
+        if not isinstance(batches, list) or len(batches) != 1 or not isinstance(batches[0], dict):
+            return fail(ErrorType.SCHEMA, 'rtb56:data_structure:' + type(batches).__name__)
+        code = batches[0].get('server_hawbcode')
+        if code is None or code == '':
+            return fail(ErrorType.SCHEMA, 'rtb56:identity_missing')
+        if code != expected_number:
+            return fail(ErrorType.SCHEMA, 'rtb56:identity_mismatch:' + type(code).__name__)
     markers = {
         'success': (1, '1'),
         'status': (1, '1', 200, '200', True) if provider == 'nextsls' else (200,),

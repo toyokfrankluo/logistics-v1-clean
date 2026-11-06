@@ -54,12 +54,33 @@ def fetch_tracking_from_api(agent: CarrierAgent, tracking_number: str, *, select
                 headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=15)
             result = parse_response("rtb56", str(agent.id), response.status_code,
                                     response.text, expected_number=selected_shipment.tracking_number)
+            diagnostic = None
+            if result.status == QueryStatus.EMPTY:
+                diagnostic = "empty_details"
+            elif result.status != QueryStatus.SUCCESS:
+                if result.error and result.error.value == "http":
+                    diagnostic = "http_error"
+                elif result.message and result.message.startswith("rtb56:"):
+                    diagnostic = result.message[len("rtb56:"):]
+                else:
+                    diagnostic = {"invalid_json": "invalid_json", "schema": "structure_or_event_error",
+                                  "business": "supplier_failure"}.get(
+                                      result.error.value if result.error else "", "parse_error")
+            if diagnostic:
+                status_code = response.status_code if type(response.status_code) is int else "invalid_type"
+                current_app.logger.warning("rtb56 category=%s http_status=%s", diagnostic, status_code)
             if result.status not in (QueryStatus.SUCCESS, QueryStatus.EMPTY):
-                return None, "RTB56 响应失败或单号身份未通过验证"
+                return None, "RTB56 查询失败 [" + diagnostic + "]；单号身份未通过验证或响应无法确认"
             return [{"time": event.time.raw or "", "location": event.location,
                      "description": event.description} for event in result.events], None
-        except Exception:
-            return None, "tracking:request_failed" if safe_errors else "API请求失败，请检查代理配置或稍后重试"
+        except Exception as error:
+            # The transport exposes only this fixed non-200 category, not the numeric status.
+            category = ("http_error_status_unavailable"
+                        if type(error) is carrier_http.CarrierRequestError
+                        and str(error) == "代理 API 返回非成功状态" else "transport_or_processing_error")
+            current_app.logger.warning("rtb56 category=%s", category)
+            return None, ("tracking:request_failed" if safe_errors else
+                          "API请求失败 [" + category + "]，请检查代理配置或稍后重试")
 
     try:
         # ========================
