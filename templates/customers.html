@@ -23,10 +23,10 @@
 <hr>
 <h3>客户列表</h3>
 <table class="table table-striped">
-  <thead><tr><th>客户名称</th><th>邮箱</th><th>电话</th><th>银行信息</th>{% if current_user.is_admin %}<th>操作</th>{% endif %}</tr></thead>
+  <thead><tr><th>客户名称</th>{% if current_user.is_admin %}<th>邮箱</th><th>电话</th><th>银行信息</th><th>操作</th>{% endif %}</tr></thead>
   <tbody>{% for c in customers %}
-    <tr><td>{{ c.name }}</td><td>{{ c.email or '' }}</td><td>{{ c.phone or '' }}</td><td>{{ c.bank_info or '' }}</td>
-      {% if current_user.is_admin %}<td class="text-nowrap">
+    <tr><td>{{ c.name }}</td>
+      {% if current_user.is_admin %}<td>{{ c.email or '' }}</td><td>{{ c.phone or '' }}</td><td>{{ c.bank_info or '' }}</td><td class="text-nowrap">
         <a class="btn btn-sm btn-outline-primary" href="{{ url_for('views.edit_customer', customer_id=c.id) }}">编辑</a>
         <form method="post" action="{{ url_for('views.delete_customer', customer_id=c.id) }}" class="d-inline" onsubmit="return confirm('确定删除该客户吗？');">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">

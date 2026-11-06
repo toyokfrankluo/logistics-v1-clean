@@ -142,6 +142,18 @@ class CustomerBankManagement(unittest.TestCase):
         self.login()
         self.assertEqual(self.client.post(f"/customers/{self.customer.id}/delete").status_code, 400)
 
+    def test_customer_sensitive_fields_remain_admin_only(self):
+        self.customer.email = "fictional-private@example.invalid"
+        self.customer.phone = "000-PRIVATE"
+        self.customer.bank_info = "虚构私密银行资料"
+        db.session.commit()
+        self.login(admin=False)
+        page = self.client.get("/customers").get_data(as_text=True)
+        self.assertIn(self.customer.name, page)
+        self.assertNotIn("fictional-private@example.invalid", page)
+        self.assertNotIn("000-PRIVATE", page)
+        self.assertNotIn("虚构私密银行资料", page)
+
 
 if __name__ == "__main__":
     unittest.main()
