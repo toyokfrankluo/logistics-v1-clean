@@ -36,7 +36,7 @@ class RefreshSafety(unittest.TestCase):
             db.session.delete(row);db.session.commit()
     def test_unique_nextsls_keeps_selected_number(self):
         r=Mock(status_code=200);r.json.return_value={'status':1,'data':{'shipment':{'traces':[]}}}
-        with patch('views.requests.post',return_value=r) as remote:
+        with patch('carrier_http.post',return_value=r) as remote:
             tracks,error=views._refresh_query(self.shipment,self.agent)
         self.assertEqual((tracks,error),([],None))
         self.assertEqual(remote.call_count,1)
@@ -49,7 +49,7 @@ class RefreshSafety(unittest.TestCase):
         fetch.assert_not_called();remote.assert_not_called()
     def test_failure_no_write_and_redaction(self):
         out=io.StringIO()
-        with contextlib.redirect_stdout(out),patch('views.requests.post',side_effect=RuntimeError('SECRET_TOKEN /private/secret')) as remote,patch('views.simple_sync_tracking') as write:
+        with contextlib.redirect_stdout(out),patch('carrier_http.post',side_effect=RuntimeError('SECRET_TOKEN /private/secret')) as remote,patch('views.simple_sync_tracking') as write:
             self.post(f'/shipments/{self.shipment.id}/refresh')
         write.assert_not_called();self.assertEqual(remote.call_count,1)
         with self.client.session_transaction() as session:text=str(session.get('_flashes'))

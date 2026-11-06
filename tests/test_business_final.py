@@ -18,7 +18,7 @@ class BusinessFinal(unittest.TestCase):
             self.assertEqual(Shipment.query.count(),1)
     def test_add_offline_no_remote_and_fee(self):
         self.login()
-        with patch('views.requests.post') as remote:
+        with patch('carrier_http.post') as remote:
             r=self.post('/shipments/add',data={'tracking_number':'NEW','weight':'2','unit_price':'10','operation_fee':'3'})
         self.assertEqual(r.status_code,302);remote.assert_not_called()
         self.assertEqual(Shipment.query.filter_by(tracking_number='NEW').one().fee,23)

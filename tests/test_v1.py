@@ -166,7 +166,7 @@ class StabilityTests(unittest.TestCase):
         self.agent.supports_api = True
         self.agent.api_url = "https://fictional.nextsls.com/api"
         db.session.commit()
-        with patch("app.requests.post") as post:
+        with patch("carrier_http.post") as post:
             post.return_value.json.return_value = {"status": 1}
             backend.call_gettrack(None, self.shipment.tracking_number, agent_id=self.agent.id)
             self.assertEqual(post.call_args.kwargs["json"]["shipment"]["shipment_id"], self.shipment.shipment_id)

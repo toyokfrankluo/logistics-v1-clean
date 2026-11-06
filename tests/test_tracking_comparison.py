@@ -79,14 +79,14 @@ assert not any(m in sys.modules for m in ('app','views','flask','sqlalchemy','re
         self.assertEqual(public['status'], 'error')
         self.assertEqual(backend['requests'][0]['json']['shipment']['shipment_id'], 'FAKE-CUSTOMER')
 
-    def test_disabled_agent_differs(self):
+    def test_disabled_agent_blocked_in_both_entries(self):
         case = CASES['rtb56-success']
         public = run_legacy('public', case['provider'], 200, case['body'], active=False)
         backend = run_legacy('backend', case['provider'], 200, case['body'], active=False)
         self.assertEqual(public['status'], 'error')
         self.assertEqual(public['requests'], [])
-        self.assertEqual(backend['status'], 'no_explicit_error')
-        self.assertEqual(len(backend['requests']), 1)
+        self.assertEqual(backend['status'], 'error')
+        self.assertEqual(backend['requests'], [])
 
     def test_generic_credentials_drive_different_request_shapes(self):
         case = CASES['generic-unverified']

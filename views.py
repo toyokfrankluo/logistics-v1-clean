@@ -1,3 +1,5 @@
+from urllib.parse import urlsplit
+from tracking import parse_response, QueryStatus
 from flask import Blueprint, request, render_template, redirect, url_for, flash, send_file, current_app, abort
 from models import db, CarrierAgent, Shipment, Customer, BankAccount, ManualTrack
 from flask_login import login_required, logout_user, current_user
@@ -5,6 +7,7 @@ from sqlalchemy.orm import joinedload, selectinload
 from datetime import datetime, timedelta
 from utils import export_invoice
 import requests
+import carrier_http
 import json
 import os
 import time
@@ -23,11 +26,40 @@ def fetch_tracking_from_api(agent: CarrierAgent, tracking_number: str, *, select
         or not agent or selected_shipment.agent_id != agent.id
     ):
         return None, "运单身份与代理不一致"
-    if not agent or not agent.api_url or not agent.supports_api:
+    if not agent or not agent.api_url or not agent.supports_api or not agent.is_active:
         return None, "代理不支持 API 抓取"
 
-    if selected_shipment is not None and 'rtb56.com' in (agent.api_url or ''):
-        return None, 'RTB56 服务商单号映射未确认，查询已阻断'
+    try:
+        host = (urlsplit(agent.api_url).hostname or "").rstrip(".").lower()
+    except ValueError:
+        return None, "代理 API 地址无效"
+    is_rtb56 = host == "rtb56.com" or host.endswith(".rtb56.com")
+    if selected_shipment is not None and is_rtb56:
+        if not selected_shipment.tracking_number or not selected_shipment.tracking_number.strip():
+            return None, "RTB56 查询单号缺失"
+        # The supplier sees the agent account and number, not our local primary key.
+        if Shipment.query.filter_by(agent_id=agent.id, tracking_number=tracking_number).filter(
+                Shipment.id != selected_shipment.id).first() is not None:
+            return None, "同一代理存在重复查询单号，无法核对 RTB56 运单身份"
+        # Restore the legacy request number, then require the supplier to echo it.
+        try:
+            payload = {
+                "appToken": agent.app_token or "",
+                "appKey": agent.app_key or "",
+                "serviceMethod": "gettrack",
+                "paramsJson": json.dumps(
+                    {"tracking_number": selected_shipment.tracking_number}, ensure_ascii=False),
+            }
+            response = carrier_http.post(agent, data=payload,
+                headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=15)
+            result = parse_response("rtb56", str(agent.id), response.status_code,
+                                    response.text, expected_number=selected_shipment.tracking_number)
+            if result.status not in (QueryStatus.SUCCESS, QueryStatus.EMPTY):
+                return None, "RTB56 响应失败或单号身份未通过验证"
+            return [{"time": event.time.raw or "", "location": event.location,
+                     "description": event.description} for event in result.events], None
+        except Exception:
+            return None, "tracking:request_failed" if safe_errors else "API请求失败，请检查代理配置或稍后重试"
 
     try:
         # ========================
@@ -44,7 +76,7 @@ def fetch_tracking_from_api(agent: CarrierAgent, tracking_number: str, *, select
             print("tracking:request")
             print("物流操作完成或失败；详细数据不写入日志")
             
-            resp = requests.post(agent.api_url, data=payload, timeout=15)
+            resp = carrier_http.post(agent, data=payload, timeout=15)
             print("物流操作完成或失败；详细数据不写入日志")
 
             if resp.status_code != 200:
@@ -99,7 +131,7 @@ def fetch_tracking_from_api(agent: CarrierAgent, tracking_number: str, *, select
                     "language": "zh"
                 }
             }
-            resp = requests.post(url, headers=headers, json=payload, timeout=15)
+            resp = carrier_http.post(agent, headers=headers, json=payload, timeout=15)
             print("物流操作完成或失败；详细数据不写入日志")
 
             if resp.status_code != 200:
@@ -136,7 +168,7 @@ def fetch_tracking_from_api(agent: CarrierAgent, tracking_number: str, *, select
             print("tracking:request")
             print("物流操作完成或失败；详细数据不写入日志")
             
-            resp = requests.post(agent.api_url, data=payload, timeout=10)
+            resp = carrier_http.post(agent, data=payload, timeout=10)
             print("物流操作完成或失败；详细数据不写入日志")
 
             if resp.status_code != 200:
@@ -157,7 +189,7 @@ def fetch_tracking_from_api(agent: CarrierAgent, tracking_number: str, *, select
             return None, "未找到轨迹字段"
 
     except Exception as e:
-        return None, "tracking:request_failed" if safe_errors else f"API请求失败: {str(e)}"
+        return None, "tracking:request_failed" if safe_errors else "API请求失败，请检查代理配置或稍后重试"
 
 
 # =============== 新增：去重同步函数 ===============
@@ -306,8 +338,8 @@ def edit_agent(agent_id):
             return '代理名称为空或已存在', 400
         a.name = name
         a.api_url = request.form.get("api_url", a.api_url)
-        a.app_key = request.form.get("app_key") or a.app_key
-        a.app_token = request.form.get("app_token") or a.app_token
+        a.app_key = request.form.get("app_key", "").strip() or a.app_key
+        a.app_token = request.form.get("app_token", "").strip() or a.app_token
         a.customer_code = request.form.get("customer_code", a.customer_code)
         db.session.commit()
         flash("代理已更新", "success")

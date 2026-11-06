@@ -11,6 +11,7 @@ import time
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 from types import SimpleNamespace
 from tracking import parse_response
 
@@ -60,7 +61,7 @@ def run_legacy(entry, provider, http_status, body, *, provider_number='FAKE-PROV
         # Deliberate offline boundary; url is merely captured, never contacted.
         calls.append({'url': url, 'data': kwargs.get('data'), 'json': kwargs.get('json')})
         return FixtureResponse(body, http_status)
-    namespace = dict(json=json, time=time, datetime=datetime, requests=SimpleNamespace(post=post),
+    namespace = dict(urlsplit=urlsplit, carrier_http=SimpleNamespace(post=lambda agent, **kwargs: post(agent.api_url, **kwargs)), json=json, time=time, datetime=datetime, requests=SimpleNamespace(post=post),
                      Shipment=SimpleNamespace(query=ReadOnlyQuery(shipment)),
                      CarrierAgent=SimpleNamespace(query=ReadOnlyQuery(agent)), CACHE={}, CACHE_TTL=600,
                      CARRIERS={}, CARRIERS_LIST=[], DEFAULT_API_URL='', TRACK17_API_KEY='fake', TRACK17_API_URL='https://fictional.invalid')

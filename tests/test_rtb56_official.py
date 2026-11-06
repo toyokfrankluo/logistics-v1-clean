@@ -55,12 +55,64 @@ class OfficialBoundary(unittest.TestCase):
     post=base.StabilityTests.post
     token=base.StabilityTests.token
     manual=base.StabilityTests.manual
-    def test_unmapped_service_number_blocks_and_preserves_history(self):
+    def test_legacy_request_timeout_preserves_history(self):
         self.agent.supports_api=True;self.agent.api_url='https://fictional.rtb56.com/api';db.session.commit()
         self.manual();self.login()
-        with patch('views.requests.post',side_effect=TimeoutError('secret')) as remote:
+        with patch('carrier_http.post',side_effect=TimeoutError('secret')) as remote:
             r=self.post('/track',data={'numbers':'FICTIONAL-001'})
-        remote.assert_not_called()
-        self.assertIn('服务商单号映射未确认',r.text)
+        remote.assert_called_once()
+        self.assertIn('API请求失败',r.text)
         self.assertIn('虚构仓库已接收',r.text)
         self.assertEqual(ManualTrack.query.count(),1)
+
+    def test_legacy_number_credentials_and_response_identity(self):
+        import views
+        from unittest.mock import Mock
+        self.agent.supports_api = True
+        self.agent.api_url = 'https://fictional.rtb56.com/api'
+        self.agent.app_key = 'fake-key'
+        self.agent.app_token = 'fake-token'
+        db.session.commit()
+        payload = {'success': 1, 'data': [{'server_hawbcode': self.shipment.tracking_number,
+            'details': [{'track_occur_date': '2026-01-02 12:00:00',
+                         'track_location': '虚构港口', 'track_description': '虚构运输'}]}]}
+        response = Mock(status_code=200, text=json.dumps(payload))
+        with patch('carrier_http.post', return_value=response) as remote:
+            events, error = views.fetch_tracking_from_api(self.agent, self.shipment.tracking_number,
+                                                         selected_shipment=self.shipment)
+        self.assertIsNone(error)
+        self.assertEqual(events[0]['description'], '虚构运输')
+        sent = remote.call_args.kwargs['data']
+        self.assertEqual(sent['appKey'], 'fake-key')
+        self.assertEqual(sent['appToken'], 'fake-token')
+        self.assertEqual(sent['serviceMethod'], 'gettrack')
+        self.assertEqual(json.loads(sent['paramsJson']), {'tracking_number': self.shipment.tracking_number})
+        self.assertNotEqual(self.shipment.tracking_number, self.shipment.shipment_id)
+        for number in ('OTHER', None, self.shipment.shipment_id):
+            payload['data'][0]['server_hawbcode'] = number
+            response.text = json.dumps(payload)
+            with patch('carrier_http.post', return_value=response):
+                events, error = views.fetch_tracking_from_api(self.agent, self.shipment.tracking_number,
+                                                             selected_shipment=self.shipment)
+            self.assertIsNone(events)
+            self.assertIn('身份未通过验证', error)
+        with patch('carrier_http.post') as remote:
+            events, error = views.fetch_tracking_from_api(self.agent, 'OTHER',
+                                                         selected_shipment=self.shipment)
+        remote.assert_not_called()
+        self.assertIsNotNone(error)
+
+
+    def test_duplicate_in_agent_account_blocks_before_transport(self):
+        import views
+        from models import Shipment
+        self.agent.supports_api = True
+        self.agent.api_url = 'https://fictional.rtb56.com./api'
+        db.session.add(Shipment(agent_id=self.agent.id, tracking_number=self.shipment.tracking_number))
+        db.session.commit()
+        with patch('carrier_http.post') as remote:
+            events, error = views.fetch_tracking_from_api(
+                self.agent, self.shipment.tracking_number, selected_shipment=self.shipment)
+        remote.assert_not_called()
+        self.assertIsNone(events)
+        self.assertIn('重复查询单号', error)

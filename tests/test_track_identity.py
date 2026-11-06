@@ -63,7 +63,7 @@ class IdentityTests(unittest.TestCase):
     def test_nextsls_selected_no_requery(self):
         row=self.duplicate(agent=self.agent2)
         response=Mock(status_code=200);response.json.return_value={'status':1,'data':{'shipment':{'traces':[]}}}
-        with patch('views.requests.post',return_value=response) as remote, patch.object(Shipment,'query') as q:
+        with patch('carrier_http.post',return_value=response) as remote, patch.object(Shipment,'query') as q:
             tracks,error=views.fetch_tracking_from_api(self.agent2,row.tracking_number,selected_shipment=row)
             q.filter_by.assert_not_called()
         self.assertEqual((tracks,error),([],None))
@@ -71,11 +71,11 @@ class IdentityTests(unittest.TestCase):
     def test_missing_nextsls_provider_fallback_unchanged(self):
         row=self.duplicate(agent=self.agent2);row.shipment_id=None;db.session.commit()
         response=Mock(status_code=200);response.json.return_value={'status':1,'data':{'shipment':{'traces':[]}}}
-        with patch('views.requests.post',return_value=response) as remote:
+        with patch('carrier_http.post',return_value=response) as remote:
             views.fetch_tracking_from_api(self.agent2,row.tracking_number,selected_shipment=row)
         self.assertEqual(remote.call_args.kwargs['json']['shipment']['shipment_id'],row.tracking_number)
     def test_helper_mismatched_agent_no_calls(self):
-        with patch('views.requests.post') as remote:
+        with patch('carrier_http.post') as remote:
             _,error=views.fetch_tracking_from_api(self.agent2,self.shipment.tracking_number,selected_shipment=self.shipment)
         self.assertIsNotNone(error);remote.assert_not_called()
     def test_unique_text_once(self):

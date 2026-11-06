@@ -43,6 +43,9 @@ class TrackingContracts(unittest.TestCase):
         self.http = patch("requests.post", side_effect=AssertionError("Unconfigured HTTP POST"))
         self.http_post = self.http.start()
         self.addCleanup(self.http.stop)
+        carrier_mock = patch("carrier_http.post", self.http_post)
+        carrier_mock.start()
+        self.addCleanup(carrier_mock.stop)
         for method in ("get", "patch", "put", "delete"):
             guard = patch("requests." + method, side_effect=AssertionError("Unexpected external request"))
             guard.start()
@@ -125,7 +128,7 @@ class TrackingContracts(unittest.TestCase):
         self.login()
         text = self.post('/track', data={"numbers": "FICTIONAL-001"}).get_data(as_text=True)
         self.assertIn('虚构仓库已接收', text)
-        self.assertIn('RTB56 服务商单号映射未确认', text)
+        self.assertIn('API请求失败', text)
         self.assertEqual(ManualTrack.query.count(), 1)
 
     def test_http_error_differs_between_public_and_backend(self):
@@ -142,7 +145,8 @@ class TrackingContracts(unittest.TestCase):
         self.assertEqual(self.public().json['error'], UNAVAILABLE)
         tracks, error = views.fetch_tracking_from_api(self.agent, 'FICTIONAL-001')
         self.assertIsNone(tracks)
-        self.assertIn('fictional invalid JSON', error)
+        self.assertEqual(error, 'API请求失败，请检查代理配置或稍后重试')
+        self.assertNotIn('fictional invalid JSON', error)
 
     def test_string_zero_is_not_normalized_as_error(self):
         self.http_post.side_effect = None

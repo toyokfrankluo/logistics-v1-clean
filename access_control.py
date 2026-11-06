@@ -51,3 +51,10 @@ class OwnedRecordView(SecureModelView):
         except SQLAlchemyError:
             self.session.rollback()
             flash("删除失败，全部修改已回滚", "error")
+
+
+class CarrierAdminView(SecureModelView):
+    # Credentials are managed in /agents, where blank means retain existing value.
+    column_exclude_list = ("app_key", "app_token", "password")
+    form_excluded_columns = ("app_key", "app_token", "password")
+    can_view_details = False
