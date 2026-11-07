@@ -1,0 +1,74 @@
+:root {
+  color-scheme: light;
+  --ink: #172c46;
+  --nav: #112d50;
+  --blue: #165db0;
+  --line: #dce6f1;
+  --muted: #536783;
+  font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+  line-height: 1.55;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: #f3f7fb; color: var(--ink); }
+a { color: var(--blue); text-underline-offset: 3px; }
+.top { min-height: 68px; display: flex; gap: 16px; align-items: center;
+  justify-content: space-between; background: var(--nav); color: white;
+  padding: 12px clamp(16px, 4vw, 48px); }
+.brand { display: flex; align-items: center; gap: 10px; color: white; text-decoration: none; }
+.brand span { display: grid; place-items: center; width: 36px; height: 36px;
+  border-radius: 10px; background: #2866a9; font-weight: 800; }
+.role { color: #d5e6f9; font-size: .9rem; }
+.shell { display: flex; max-width: 1500px; margin: auto; min-height: calc(100vh - 68px); }
+.sidebar { flex: 0 0 175px; display: flex; flex-direction: column; gap: 8px;
+  padding: 24px 16px; border-right: 1px solid var(--line); background: #e9f1fa; }
+.sidebar a, .sidebar button { display: block; padding: 9px 12px; font-weight: 650; text-decoration: none; }
+main { flex: 1; min-width: 0; padding: clamp(18px, 4vw, 44px); }
+h1, h2, p { margin-top: 0; }
+h1 { margin-bottom: .25em; overflow-wrap: anywhere; font-size: clamp(1.6rem, 4vw, 2.1rem); }
+h2 { font-size: 1.23rem; }
+.kicker { margin-bottom: 4px; font-weight: 750; font-size: .82rem; color: var(--blue); }
+.heading { display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
+  justify-content: space-between; margin: 14px 0 20px; }
+.heading p:last-child { margin-bottom: 0; }
+.panel { background: white; border: 1px solid var(--line); padding: clamp(15px, 3vw, 26px);
+  border-radius: 14px; margin-bottom: 16px; }
+.login { margin: 6vh auto; max-width: 490px; }
+label { display: grid; gap: 5px; font-weight: 620; }
+input, select, textarea { color: var(--ink); background: #fff; border: 1px solid #bccde0;
+  padding: 8px 10px; border-radius: 7px; min-height: 40px; width: 100%; font: inherit; }
+button, .button { border: 1px solid var(--blue); border-radius: 8px; padding: 8px 13px;
+  min-height: 40px; color: white; background: var(--blue); font: inherit; font-weight: 650;
+  text-decoration: none; cursor: pointer; display: inline-flex; align-items: center; }
+.secondary, .plain { color: var(--blue); background: white; }
+.plain { border: 0; background: none; }
+form:not(.filters) { display: grid; gap: 12px; justify-items: start; }
+form:not(.filters) label { width: min(100%, 360px); }
+.filters { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; margin-bottom: 14px; }
+.notice, .error { padding: 9px 13px; border-radius: 8px; overflow-wrap: anywhere; }
+.notice { background: #e7f1fd; color: #194d85; }
+.error { background: #ffefeb; color: #8e311e; }
+.steps { color: var(--blue); font-weight: 700; }
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; text-align: left; }
+th, td { padding: 10px 12px; border-bottom: 1px solid var(--line); }
+th { background: #eef4fb; white-space: nowrap; }
+td { min-width: 92px; overflow-wrap: anywhere; }
+.badge { display: inline-block; white-space: nowrap; padding: 4px 9px; border-radius: 8px;
+  font-weight: 700; font-size: .86rem; background: #e8eef8; color: #324b68; }
+.badge.pending { color: #76501a; background: #fff1d1; }
+.badge.approved { color: #125642; background: #e0f5ea; }
+.badge.rejected { color: #8e311e; background: #ffefeb; }
+.empty, .pagination, dt { color: var(--muted); }
+.pagination { display: flex; justify-content: end; gap: 12px; padding-top: 13px; }
+summary { font-weight: 700; cursor: pointer; }
+details[open] summary { margin-bottom: 14px; }
+.fields { margin: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(165px, 1fr)); gap: 12px; }
+dt { font-size: .86rem; }
+dd { margin: 0; overflow-wrap: anywhere; }
+.review { display: grid; gap: 20px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+:focus-visible { outline: 3px solid #2b81d7; outline-offset: 3px; }
+@media (max-width: 740px) {
+  .shell { display: block; }
+  .sidebar { flex-direction: row; flex-wrap: wrap; border-right: 0; padding: 5px 12px; }
+  .sidebar a, .sidebar button { padding: 6px 10px; }
+}

@@ -16,7 +16,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 from flask import (
     Flask, request, render_template, render_template_string,
-    redirect, url_for, flash, send_file, abort
+    redirect, url_for, flash, send_file, abort, session
 )
 from flask_cors import CORS
 
@@ -84,6 +84,8 @@ migrate = Migrate(app, db)
 login_manager = LoginManager(app)
 login_manager.login_view = "login"
 from write_security import csrf, init_write_security
+from tms_portal import SESSION_KEY as TMS_SESSION_KEY, init_tms
+init_tms(app)
 init_write_security(app, login_manager)
 
 # 管理后台
@@ -667,6 +669,7 @@ def login():
         if not user or not user.check_password(password):
             flash("用户名或密码错误")
             return redirect(url_for("login"))
+        session.pop(TMS_SESSION_KEY, None)
         login_user(user)
         flash("登录成功")
         return redirect(url_for("index"))

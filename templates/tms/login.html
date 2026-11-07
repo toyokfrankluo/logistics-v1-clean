@@ -1,0 +1,15 @@
+{% extends "tms/layout.html" %}
+{% block title %}客户登录{% endblock %}
+{% block content %}
+<section class="panel login">
+  <p class="kicker">XINGRUI CUSTOMER PORTAL</p>
+  <h1>客户登录</h1>
+  <p>使用星睿开通的客户账号，上传发票和查看本公司的订单。</p>
+  <form method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label>客户账号<input name="username" autocomplete="username" maxlength="80" required></label>
+    <label>密码<input name="password" type="password" autocomplete="current-password" maxlength="128" required></label>
+    <button>登录客户中心</button>
+  </form>
+</section>
+{% endblock %}

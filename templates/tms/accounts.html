@@ -1,0 +1,17 @@
+{% extends "tms/layout.html" %}
+{% block title %}开通客户账号{% endblock %}
+{% block content %}
+<h1>开通客户账号</h1>
+<section class="panel">
+  <form method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label>关联客户<select name="customer_id" required>
+      <option value="">选择已有客户</option>
+      {% for customer in customers %}<option value="{{ customer.id }}">{{ customer.name }}</option>{% endfor %}
+    </select></label>
+    <label>登录账号<input name="username" minlength="3" maxlength="80" required></label>
+    <label>初始密码<input type="password" name="password" autocomplete="new-password" minlength="12" maxlength="128" required></label>
+    <button>创建账号</button>
+  </form>
+</section>
+{% endblock %}

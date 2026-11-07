@@ -2,6 +2,7 @@
 from flask import abort, request
 from flask_login import current_user
 from flask_wtf.csrf import CSRFProtect, CSRFError
+from tms_portal import CLIENT_POSTS
 
 csrf = CSRFProtect()
 
@@ -30,6 +31,7 @@ def init_write_security(app, login_manager):
         needs_admin = name in ADMIN_ENDPOINTS or (
             request.method not in {"GET", "HEAD", "OPTIONS"}
             and name not in NON_ADMIN_POSTS
+            and request.endpoint not in CLIENT_POSTS
         )
         if needs_admin:
             if not current_user.is_authenticated:

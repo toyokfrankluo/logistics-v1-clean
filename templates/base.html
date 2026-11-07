@@ -11,6 +11,9 @@
     <aside class="sidebar">
       <h2>菜单</h2>
       <ul>
+{% if current_user.is_admin and config.get('TMS_ENABLED') %}
+        <li><a href="{{ url_for('tms_staff.queue') }}">TMS 订单审核</a></li>
+{% endif %}
 {% if current_user.is_admin %}        <li><a href="{{ url_for('views.add_shipment') }}">录入运单</a></li>{% endif %}
         <li><a href="{{ url_for('views.shipments') }}">运单管理</a></li>
         <li><a href="{{ url_for('views.customers') }}">客户管理</a></li>

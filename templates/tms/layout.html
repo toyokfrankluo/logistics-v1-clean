@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>{% block title %}{% endblock %} · 星睿国际物流</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/tms.css') }}">
+</head>
+<body>
+  <header class="top">
+    <a class="brand" href="{{ url_for('tms_staff.queue' if staff else 'tms_client.orders') }}">
+      <span aria-hidden="true">XR</span><strong>星睿国际物流</strong>
+    </a>
+    <span class="role">{{ '管理端' if staff else '客户操作端' }} · TMS 2.0</span>
+  </header>
+  <div class="shell">
+    {% if staff or g.tms_account %}
+    <nav class="sidebar" aria-label="操作导航">
+      {% if staff %}
+      <a href="{{ url_for('tms_staff.queue') }}">订单审核</a>
+      <a href="{{ url_for('tms_staff.accounts') }}">客户账号</a>
+      <a href="{{ url_for('views.shipments') }}">返回物流管理</a>
+      {% else %}
+      <a href="{{ url_for('tms_client.orders') }}">我的运单</a>
+      <a href="{{ url_for('tms_client.upload') }}">Excel 导入</a>
+      <form action="{{ url_for('tms_client.sign_out') }}" method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button class="plain">退出登录</button>
+      </form>
+      {% endif %}
+    </nav>
+    {% endif %}
+    <main>
+      {% if config.ISOLATED_MODE %}<p class="notice">本地验收环境 · 仅使用临时数据库</p>{% endif %}
+      {% for category, message in get_flashed_messages(with_categories=true) %}
+      <p class="notice" role="status">{{ message }}</p>
+      {% endfor %}
+      {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+</body>
+</html>
