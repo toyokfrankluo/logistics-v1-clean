@@ -2,7 +2,7 @@
   <p class="steps">上传发票 <span>→</span> 核对预览 <span>→</span> 提交审核</p>
   <a class="button secondary" href="{{ url_for('tms_client.template_file') }}">下载星睿单票模板</a>
 </div>
-<p>使用 11.6 版星睿发票。每次上传一份 .xlsx（最多 2 MiB），多票请逐份上传。</p>
+<p>使用 11.6 版星睿发票。地址库已包含在本客户的下载模板内，选择 L4 地址编码即可自动带出收件资料。每次上传一份 .xlsx（最多 2 MiB）。</p>
 {% if replacement %}<p class="notice">替换 {{ replacement.invoice.customer_number }} 的发票后，订单将回到待确认，需要再次提交审核。</p>{% endif %}
 <form method="post" action="{{ url_for('tms_client.upload') }}" enctype="multipart/form-data" class="invoice-upload">
   <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -14,7 +14,7 @@
     <span aria-hidden="true" class="upload-plus">＋</span>
     <strong>选择星睿发票</strong>
     <input type="file" name="invoice" accept=".xlsx" required>
-    <small>客户单号、货箱编号和地址库编码请使用文本格式。</small>
+    <small>所有标 * 项填齐后才能预览。每条已填写的明细须在 O 列内嵌 PNG 或 JPEG 产品图片。</small>
   </label>
   <button>解析并预览</button>
 </form>

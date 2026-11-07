@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 from secrets import token_hex
 from unicodedata import normalize
+from zipfile import BadZipFile, ZipFile
 
 import click
 from flask import (
@@ -22,6 +23,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from models import CarrierAgent, Customer, Shipment, db
 from tms_invoice import InvoiceError, MAX_UPLOAD_BYTES, SERVICES, blank_invoice, parse_invoice
 from tms_models import TmsAccount, TmsAudit, TmsOrder
+from tms_xlsx_images import MEDIA_PART, image_type
 
 client = Blueprint("tms_client", __name__, url_prefix="/tms/customer")
 staff = Blueprint("tms_staff", __name__, url_prefix="/tms/admin")
@@ -54,6 +56,7 @@ def init_tms(app):
     app.config.update(
         TMS_ENABLED=app.config.get("ISOLATED_MODE") or os.getenv("TMS_ENABLED") == "1",
         TMS_ADDRESS_BOOK_DIR=os.getenv("TMS_ADDRESS_BOOK_DIR"),
+        TMS_INVOICE_TEMPLATE_PATH=os.getenv("TMS_INVOICE_TEMPLATE_PATH"),
     )
     if app.config["TMS_ENABLED"] and not app.config.get("ISOLATED_MODE"):
         app.config["SESSION_COOKIE_SECURE"] = True
@@ -271,6 +274,25 @@ def orders():
     return order_list(owned_orders(), "tms_client.orders", "all")
 
 
+def read_configured_workbook(path):
+    try:
+        with Path(path).open("rb") as file:
+            return file.read(MAX_UPLOAD_BYTES + 1)
+    except OSError:
+        raise InvoiceError("无法读取配置的工作簿，请联系星睿。") from None
+
+
+def customer_catalogue(customer_id):
+    config = current_app.config
+    local_catalogue = config.get("TMS_LOCAL_CATALOGUE")
+    if config.get("ISOLATED_MODE") and local_catalogue and local_catalogue[0] == customer_id:
+        return read_configured_workbook(local_catalogue[1])
+    directory = config.get("TMS_ADDRESS_BOOK_DIR")
+    if not directory:
+        raise InvoiceError("请联系星睿开通本客户的地址库。")
+    return read_configured_workbook(Path(directory) / f"{customer_id}.xlsx")
+
+
 @client.route("/import", methods=["GET", "POST"])
 def upload():
     if request.method == "GET":
@@ -290,15 +312,9 @@ def upload():
     raw = files[0].stream.read(MAX_UPLOAD_BYTES + 1)
     if not raw or len(raw) > MAX_UPLOAD_BYTES:
         return page("upload", error="每份 .xlsx 文件上限为 2 MiB。", replacement=order), 400
-    directory = current_app.config.get("TMS_ADDRESS_BOOK_DIR")
-    if not directory:
-        return page("upload", error="请联系星睿开通本客户的地址库。", replacement=order), 400
     customer_id = g.tms_account.customer_id
     try:
-        with (Path(directory) / f"{customer_id}.xlsx").open("rb") as catalogue:
-            invoice = parse_invoice(raw, catalogue.read(MAX_UPLOAD_BYTES + 1))
-    except OSError:
-        return page("upload", error="请联系星睿开通本客户的地址库。", replacement=order), 400
+        invoice = parse_invoice(raw, customer_catalogue(customer_id))
     except InvoiceError as error:
         return page("upload", error=str(error), replacement=order), 400
     key = invoice["customer_number"].upper()
@@ -344,10 +360,17 @@ def order_detail(order, **context):
 
 @client.get("/template")
 def template_file():
+    layout_path = current_app.config.get("TMS_INVOICE_TEMPLATE_PATH")
     result = BytesIO()
-    workbook = blank_invoice()
-    workbook.save(result)
-    workbook.close()
+    try:
+        layout = read_configured_workbook(layout_path) if layout_path else None
+        workbook = blank_invoice(customer_catalogue(g.tms_account.customer_id), layout=layout)
+        try:
+            workbook.save(result)
+        finally:
+            workbook.close()
+    except InvoiceError as error:
+        return page("upload", error=str(error)), 400
     result.seek(0)
     return send_file(result, as_attachment=True, download_name="xingrui-invoice-template.xlsx",
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -375,6 +398,31 @@ def original_workbook(order):
 @client.get("/orders/<int:order_id>/invoice")
 def download(order_id):
     return original_workbook(customer_order(order_id))
+
+
+def product_photo(order, item_index):
+    items = order.invoice["declarations"]
+    if item_index >= len(items):
+        abort(404)
+    part = items[item_index].get("image_part")
+    if not part or not MEDIA_PART.fullmatch(part):
+        abort(404)
+    try:
+        with ZipFile(BytesIO(order.workbook)) as archive:
+            if archive.getinfo(part).file_size > 16 * 1024 * 1024:
+                abort(404)
+            data = archive.read(part)
+    except (BadZipFile, KeyError, RuntimeError):
+        abort(404)
+    mimetype = image_type(part, data)
+    if mimetype is None:
+        abort(404)
+    return send_file(BytesIO(data), mimetype=mimetype, download_name="product-photo")
+
+
+@client.get("/orders/<int:order_id>/photos/<int:item_index>")
+def photo(order_id, item_index):
+    return product_photo(customer_order(order_id), item_index)
 
 
 @staff.route("/accounts", methods=["GET", "POST"])
@@ -461,3 +509,8 @@ def decide(order_id):
 @staff.get("/orders/<int:order_id>/invoice")
 def staff_download(order_id):
     return original_workbook(reviewable_order(order_id))
+
+
+@staff.get("/orders/<int:order_id>/photos/<int:item_index>")
+def staff_photo(order_id, item_index):
+    return product_photo(reviewable_order(order_id), item_index)

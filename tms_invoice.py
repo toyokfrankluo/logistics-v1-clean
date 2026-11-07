@@ -1,6 +1,7 @@
 """Server-side reader for the Xingrui 11.6 single-order invoice."""
 from contextlib import contextmanager
-from decimal import Decimal, InvalidOperation
+from copy import copy
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from io import BytesIO
 from itertools import islice
 import re
@@ -9,10 +10,16 @@ from zlib import error as CompressionError
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.formula.tokenizer import Tokenizer, TokenizerError
+from openpyxl.utils import get_column_letter
 from openpyxl.utils.exceptions import InvalidFileException
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.worksheet.datavalidation import DataValidation
 from xml.etree.ElementTree import ParseError, fromstring
+
+from tms_xlsx_images import (
+    PHOTO_CELL, WPS_IMAGE_FORMULA, XLSX_NS, anchored_images, invoice_sheet_part,
+    valid_media, wps_images,
+)
 
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024
 SHEETS = {"星睿发票", "地址库", "服务选项"}
@@ -28,7 +35,24 @@ ADDRESS_COLUMNS = {
     "street2": 10, "street3": 11, "city": 12, "region": 13,
     "country": 14, "postal_code": 15,
 }
-XLSX_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+ADDRESS_LOOKUPS = {
+    5: "recipient", 6: "company", 7: "street", 8: "street2", 9: "street3",
+    10: "city", 11: "region", 12: "postal_code", 13: "country", 14: "phone", 15: "mobile",
+}
+REQUIRED_ADDRESS = {
+    "recipient": "L5（收件人姓名）", "street": "L7（收件地址一）", "city": "L10（城市）",
+    "region": "L11（省份 / 州）", "postal_code": "L12（邮编）", "country": "L13（国家二字代码）",
+}
+REQUIRED_ORDER = {
+    (4, 4): "客户 / FBA 订单号", (5, 4): "运输服务 / 渠道",
+    (7, 4): "是否带电", (8, 4): "是否带磁", (9, 4): "是否带液体", (10, 4): "是否带粉末",
+    (11, 4): "报关方式", (14, 4): "PO Number", (15, 4): "箱数", (4, 12): "地址库编码",
+}
+REQUIRED_LINE = {
+    "A": "货箱编号 / FBA箱号", "B": "英文品名", "C": "中文品名", "D": "材质",
+    "E": "用途", "F": "海关编码 / HS Code", "G": "申报单价", "H": "申报数量",
+    "J": "货箱重量", "K": "箱长", "L": "箱宽", "M": "箱高", "N": "是否带电",
+}
 SAFE_FUNCTIONS = {"CHAR", "COUNTIF", "IF", "IFERROR", "INDEX", "MATCH", "OR", "ROUND", "SUM"}
 SAFE_RANGE = re.compile(r"(?:(?:'?地址库'?)!)?\$?[A-Z]{1,3}\$?\d+(?::\$?[A-Z]{1,3}\$?\d+)?\Z")
 
@@ -37,10 +61,21 @@ class InvoiceError(ValueError):
     pass
 
 
-def check_sheet_xml(xml):
+def check_sheet_xml(xml, image_refs, *, invoice_photos=None):
     shared = set()
-    for formula in fromstring(xml).iter(XLSX_NS + "f"):
+    for cell in fromstring(xml).iter(XLSX_NS + "c"):
+        formula = cell.find(XLSX_NS + "f")
+        if formula is None:
+            continue
         expression = formula.text or ""
+        coordinate = cell.get("r", "")
+        image = WPS_IMAGE_FORMULA.fullmatch(expression)
+        if image and not formula.attrib and invoice_photos is not None and PHOTO_CELL.fullmatch(coordinate):
+            part = image_refs.get(image[1])
+            if not part or coordinate in invoice_photos:
+                raise InvoiceError(f"{coordinate}（产品图片）无法读取唯一的内嵌图片，请重新插入 PNG 或 JPEG。")
+            invoice_photos[coordinate] = part
+            continue
         if formula.get("t") == "shared":
             key = formula.get("si", "")
             ref = formula.get("ref")
@@ -87,8 +122,14 @@ def workbook_from_bytes(raw):
                         for element in fromstring(xml)
                     ):
                         raise InvoiceError("工作簿包含外部链接。")
-                    if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", name):
-                        check_sheet_xml(xml)
+            invoice_part = invoice_sheet_part(archive)
+            photos = anchored_images(archive, invoice_part)
+            image_refs = wps_images(archive)
+            for entry in entries:
+                name = entry.filename
+                if name == invoice_part or re.fullmatch(r"xl/worksheets/[^/]+\.xml", name, re.IGNORECASE):
+                    check_sheet_xml(archive.read(entry), image_refs,
+                                    invoice_photos=photos if name == invoice_part else None)
         book = load_workbook(BytesIO(raw), read_only=True, data_only=False, keep_links=False)
     except (BadZipFile, InvalidFileException, KeyError, ValueError, OSError, ParseError,
             RuntimeError, EOFError, NotImplementedError, CompressionError, TokenizerError) as exc:
@@ -96,7 +137,7 @@ def workbook_from_bytes(raw):
             raise
         raise InvoiceError("无法读取 .xlsx，请使用星睿发票模板。") from None
     try:
-        yield book
+        yield book, photos
     except (BadZipFile, InvalidFileException, KeyError, ParseError, TypeError, OverflowError, IndexError):
         raise InvoiceError("工作簿格式不正确。") from None
     finally:
@@ -147,40 +188,83 @@ def yes_no(cell, label):
     raise InvoiceError(f"{label}请选择「是」或「否」。")
 
 
+def missing_value(cell):
+    return cell.value is None or (isinstance(cell.value, str) and not cell.value.strip())
+
+
+def catalogue_rows(book):
+    if "地址库" not in book:
+        raise InvoiceError("客户地址库缺少「地址库」工作表。")
+    sheet = book["地址库"]
+    sheet.reset_dimensions()
+    rows = sheet.iter_rows(max_col=15)
+    header = next(rows, None)
+    if header is None or header[1].value != "地址编码*":
+        raise InvoiceError("客户地址库表头与星睿模板不符。")
+    for index, row in enumerate(rows, start=2):
+        if index > 5000:
+            raise InvoiceError("客户地址库超出 5,000 行。")
+        if not missing_value(row[1]):
+            yield row
+
+
 def resolve_address(raw, code):
     """Resolve only against the catalogue assigned to this customer by Xingrui."""
-    with workbook_from_bytes(raw) as book:
-        if "地址库" not in book:
-            raise InvoiceError("客户地址库缺少「地址库」工作表。")
-        sheet = book["地址库"]
-        sheet.reset_dimensions()
-        rows = sheet.iter_rows(max_col=15)
-        header = next(rows, None)
-        if header is None or header[1].value != "地址编码*":
-            raise InvoiceError("客户地址库表头与星睿模板不符。")
-        matches = []
-        for index, row in enumerate(rows, start=2):
-            if index > 5000:
-                raise InvoiceError("客户地址库超出 5,000 行。")
-            cell = row[1]
-            if cell.data_type == "s" and cell.value.strip().casefold() == code.casefold():
-                matches.append(row)
+    with workbook_from_bytes(raw) as (book, _photos):
+        matches = [row for row in catalogue_rows(book) if row[1].data_type == "s"
+                   and row[1].value.strip().casefold() == code.casefold()]
         if len(matches) != 1:
             raise InvoiceError("此地址编码在分配给本客户的地址库中不存在或重复。")
         row = matches[0]
+        missing = [label for key, label in REQUIRED_ADDRESS.items() if missing_value(row[ADDRESS_COLUMNS[key] - 1])]
+        if missing:
+            raise InvoiceError("分配的地址库缺少必填资料，请联系星睿补齐：" + "、".join(missing) + "。")
         address = {
-            key: cell_text(row[col - 1], "地址库收件资料",
-                           required=key in {"recipient", "street", "city", "country", "postal_code"})
+            key: cell_text(row[col - 1], REQUIRED_ADDRESS.get(key, "地址库收件资料"), required=False)
             for key, col in ADDRESS_COLUMNS.items()
         }
         address["country"] = address["country"].upper()
         if not re.fullmatch(r"[A-Z]{2}", address["country"]):
-            raise InvoiceError("地址库国家须为两位字母代码。")
+            raise InvoiceError("L13（国家二字代码）须为两位字母。")
         return address
 
 
+def required_fields(rows, photos):
+    missing = [
+        f"{get_column_letter(col)}{line}（{label}）"
+        for (line, col), label in REQUIRED_ORDER.items() if missing_value(rows[line - 1][col - 1])
+    ]
+    used_rows = []
+    for line, row in enumerate(rows[22:52], start=23):
+        if f"O{line}" not in photos and all(missing_value(cell) for i, cell in enumerate(row) if i != 8):
+            continue
+        used_rows.append((line, row))
+        missing.extend(f"{col}{line}（{label}）" for col, label in REQUIRED_LINE.items()
+                       if missing_value(row[ord(col) - ord("A")]))
+        if f"O{line}" not in photos:
+            missing.append(f"O{line}（产品图片，须内嵌 PNG 或 JPEG）")
+    if missing:
+        raise InvoiceError("请补齐以下必填项：" + "、".join(missing) + "。")
+    if not used_rows:
+        raise InvoiceError("请填写至少一行货箱及产品申报。")
+    return used_rows
+
+
+def hs_code(cell, line):
+    if cell.data_type == "n" and type(cell.value) is int:
+        code = str(cell.value)
+        number_format = cell.number_format
+        if re.fullmatch(r"0{2,20}", number_format):
+            code = code.zfill(len(number_format))
+    else:
+        code = cell_text(cell, f"F{line}（海关编码 / HS Code）", limit=20)
+    if not re.fullmatch(r"[0-9]{1,20}", code):
+        raise InvoiceError(f"F{line}（海关编码 / HS Code）须填写数字编码。")
+    return code
+
+
 def parse_invoice(raw, catalogue):
-    with workbook_from_bytes(raw) as book:
+    with workbook_from_bytes(raw) as (book, photos):
         if set(book.sheetnames) != SHEETS:
             raise InvoiceError("请上传星睿三工作表单票模板。")
         sheet = book["星睿发票"]
@@ -197,6 +281,7 @@ def parse_invoice(raw, catalogue):
             or "货箱重量" not in str(rows[21][9].value)
         ):
             raise InvoiceError("发票表头与星睿 11.6 模板不符。")
+        used_rows = required_fields(rows, photos)
         customer_number = identifier(rows[3][3], "客户单号")
         service = cell_text(rows[4][3], "运输服务")
         if service not in SERVICES:
@@ -208,7 +293,7 @@ def parse_invoice(raw, catalogue):
             (6, "battery", "是否带电"), (7, "magnet", "是否带磁"),
             (8, "liquid", "是否带液体"), (9, "powder", "是否带粉末"),
         )}
-        metadata = {key: cell_text(rows[index][3], label, required=False, limit=limit)
+        metadata = {key: cell_text(rows[index][3], label, required=key in {"declaration_mode", "po_number"}, limit=limit)
                     for index, key, label, limit in (
             (5, "sender", "发货公司", 200), (10, "declaration_mode", "报关方式", 200),
             (11, "clearance_mode", "清关方式", 200), (12, "tax_mode", "交税方式", 200),
@@ -217,29 +302,24 @@ def parse_invoice(raw, catalogue):
         )}
         boxes = {}
         declarations = []
-        current_box = None
-        for line, row in enumerate(rows[22:52], start=23):
-            if not any(cell.value not in (None, "") for col, cell in enumerate(row) if col != 8):
-                current_box = None
-                continue
-            current_box = parse_box(row, line, boxes, current_box)
+        for line, row in used_rows:
+            box_key = parse_box(row, line, boxes)
             unit_price = number(row[6], f"第 {line} 行申报单价")
             quantity = number(row[7], f"第 {line} 行申报数量", whole=True)
+            total = (Decimal(unit_price) * quantity).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
             declarations.append({
-                "box_number": boxes[current_box]["box_number"],
+                "box_number": boxes[box_key]["box_number"],
                 "name_en": cell_text(row[1], f"第 {line} 行英文品名"),
                 "name_zh": cell_text(row[2], f"第 {line} 行中文品名"),
-                "material": cell_text(row[3], "材质", required=False),
-                "usage": cell_text(row[4], "用途", required=False),
-                "hs_code": cell_text(row[5], "HS Code", required=False),
+                "material": cell_text(row[3], f"D{line}（材质）"),
+                "usage": cell_text(row[4], f"E{line}（用途）"),
+                "hs_code": hs_code(row[5], line),
                 "unit_price_usd": unit_price, "quantity": quantity,
-                "total_usd": format(Decimal(unit_price) * quantity, "f"),
+                "total_usd": format(total, "f"),
                 "battery": yes_no(row[13], f"第 {line} 行是否带电"),
-                "notes": cell_text(row[14], "产品说明", required=False, limit=1000),
+                "image_part": photos[f"O{line}"],
             })
-        if not boxes:
-            raise InvoiceError("请填写至少一行货箱及产品申报。")
-        if rows[14][3].value not in (None, "") and number(rows[14][3], "箱数", whole=True) != len(boxes):
+        if number(rows[14][3], "D15（箱数）", whole=True) != len(boxes):
             raise InvoiceError("发票箱数与不同箱号的数量不一致。")
         return {
             "customer_number": customer_number, "service": service,
@@ -248,89 +328,147 @@ def parse_invoice(raw, catalogue):
         }
 
 
-def parse_box(row, line, boxes, current_box):
-    measurement_cells = row[9:13]
-    has_dimensions = any(cell.value not in (None, "") for cell in measurement_cells)
-    if row[0].value in (None, ""):
-        if current_box is None or has_dimensions:
-            raise InvoiceError(f"第 {line} 行须填写货箱编号。")
-        return current_box
-    box_number = identifier(row[0], f"第 {line} 行货箱编号")
+def parse_box(row, line, boxes):
+    box_number = identifier(row[0], f"A{line}（货箱编号）")
     key = box_number.casefold()
-    if key not in boxes or has_dimensions:
-        measures = {
-            field: number(cell, f"第 {line} 行{label}")
-            for field, label, cell in zip(
-                ("weight_kg", "length_cm", "width_cm", "height_cm"),
-                ("箱重", "箱长", "箱宽", "箱高"), measurement_cells,
-            )
-        }
-        if key in boxes and any(boxes[key][field] != value for field, value in measures.items()):
-            raise InvoiceError(f"第 {line} 行的重复箱号有不同重量或尺寸。")
-        boxes.setdefault(key, {"box_number": box_number, **measures})
+    measures = {
+        field: number(cell, f"{col}{line}（{label}）")
+        for field, col, label, cell in zip(
+            ("weight_kg", "length_cm", "width_cm", "height_cm"), "JKLM",
+            ("箱重", "箱长", "箱宽", "箱高"), row[9:13],
+        )
+    }
+    if key in boxes and any(boxes[key][field] != value for field, value in measures.items()):
+        raise InvoiceError(f"第 {line} 行的重复箱号有不同重量或尺寸。")
+    boxes.setdefault(key, {"box_number": box_number, **measures})
     return key
 
 
-def blank_invoice():
-    """Generate an empty, layout-compatible template without a private address catalogue."""
+def blank_invoice(catalogue=None, *, layout=None):
+    """Generate a clean 11.6 invoice, including only this customer's assigned address rows."""
     book = Workbook()
     sheet = book.active
     sheet.title = "星睿发票"
     sheet.merge_cells("A1:O2")
-    sheet["A1"] = "星睿国际物流 · 单票发票"
+    sheet["A1"] = "星睿物流发票模板 / SHIPPING INVOICE"
     left = (
         "客户 / FBA 订单号 *", "运输服务 / 渠道 *", "发货公司", "是否带电 *",
-        "是否带磁 *", "是否带液体 *", "是否带粉末 *", "报关方式", "清关方式",
-        "交税方式", "PO Number", "箱数", "VAT / EORI", "产品备注",
+        "是否带磁 *", "是否带液体 *", "是否带粉末 *", "报关方式 *", "清关方式",
+        "交税方式", "PO Number *", "箱数 *", "VAT / EORI", "产品备注",
     )
     right = (
-        "地址库编码 *", "收件人姓名", "收件人公司", "收件地址一", "收件地址二",
-        "收件地址三", "城市", "省份 / 州", "邮编", "国家二字代码", "收件人电话",
-        "收件人手机", "收件人邮箱",
+        "地址库编码 *", "收件人姓名 *", "收件人公司", "收件地址一 *", "收件地址二",
+        "收件地址三", "城市 *", "省份 / 州 *", "邮编 *", "国家二字代码 *", "收件人电话",
+        "收件人手机", "收件人邮箱", "完整收件地址",
     )
     for index, label in enumerate(left, 4):
-        sheet.merge_cells(start_row=index, start_column=1, end_row=index, end_column=3)
-        sheet.merge_cells(start_row=index, start_column=4, end_row=index, end_column=8)
+        if index < 17:
+            sheet.merge_cells(f"A{index}:C{index}")
+            sheet.merge_cells(f"D{index}:H{index}")
         sheet.cell(index, 1, label)
     for index, label in enumerate(right, 4):
-        sheet.merge_cells(start_row=index, start_column=9, end_row=index, end_column=11)
-        sheet.merge_cells(start_row=index, start_column=12, end_row=index, end_column=15)
+        if index < 17:
+            sheet.merge_cells(f"I{index}:K{index}")
+            end_column = "N" if index == 4 else "O"
+            sheet.merge_cells(f"L{index}:{end_column}{index}")
         sheet.cell(index, 9, label)
-    headers = (
-        "货箱编号 / FBA箱号 *", "英文品名 *", "中文品名 *", "材质", "用途",
-        "海关编码 / HS Code", "申报单价 (USD) *", "申报数量 *", "总申报价值 (USD)",
-        "货箱重量 (kg) *", "箱长 (cm) *", "箱宽 (cm) *", "箱高 (cm) *",
-        "是否带电 *", "产品图片 / 说明",
-    )
-    for index, label in enumerate(headers, 1):
-        cell = sheet.cell(22, index, label)
-        cell.font = Font(color="FFFFFF", bold=True)
-        cell.fill = PatternFill("solid", fgColor="17385F")
+    for region, label in (
+        ("A3:H3", "01 发件人信息 / 订单资料"), ("I3:O3", "02 收件人信息 / 地址库自动填充"),
+        ("A20:O20", "03 产品与货物申报资料 / CUSTOMS DECLARATION"),
+        ("A21:O21", "在 L4 选择地址编码，在 D5 选择服务。每条产品明细填写所有星号字段，图片插入 O 列。"),
+        ("A54:E54", "合计"), ("A56:O56", "一份文件填写一票。收件资料以星睿分配给本客户的地址库为准。"),
+    ):
+        sheet.merge_cells(region)
+        cell = sheet[region.split(":")[0]]
+        cell.value = label
+        cell.font = Font(color="9C1F15", bold=True)
+        cell.fill = PatternFill("solid", fgColor="EEEEEE")
+    sheet.merge_cells("D17:H19")
+    sheet.merge_cells("L17:O19")
+    for column, label in REQUIRED_LINE.items():
+        sheet[f"{column}22"] = label + " *"
+    for column, label in {"F": "海关编码* / HS Code*", "G": "申报单价 (USD) *", "I": "总申报价值 (USD)",
+                          "J": "货箱重量 (kg) *", "K": "箱长 (cm) *", "L": "箱宽 (cm) *",
+                          "M": "箱高 (cm) *", "O": "产品图片*"}.items():
+        sheet[f"{column}22"] = label
+    for cell in sheet[22]:
+        cell.font = Font(color="9C1F15" if "*" in cell.value else "111111", bold=True)
+        cell.fill = PatternFill("solid", fgColor="FFE69A")
         cell.alignment = Alignment(wrap_text=True, vertical="center")
-        sheet.column_dimensions[cell.column_letter].width = 17
+        sheet.column_dimensions[cell.column_letter].width = 19
+    sheet.column_dimensions["O"].width = 31
     sheet.row_dimensions[22].height = 36
     for row in range(23, 53):
-        for column in (1, 6):
-            sheet.cell(row, column).number_format = "@"
-        sheet[f"I{row}"] = f'=IF(OR(G{row}="",H{row}=""),"",G{row}*H{row})'
-    for field in ("D4", "D14", "D16", "L4"):
-        sheet[field].number_format = "@"
-    sheet.freeze_panes = "D23"
-    sheet["A56"] = "一份文件填写一票。地址编码由星睿分配，上传时以服务端核验地址为准。"
-    sheet.merge_cells("A56:O56")
+        sheet[f"I{row}"] = f'=IF(OR(G{row}="",H{row}=""),"",ROUND(G{row}*H{row},2))'
+    sheet["F54"], sheet["G54"], sheet["H54"], sheet["I54"] = "总数量", "=SUM(H23:H52)", "总货值 (USD)", "=SUM(I23:I52)"
+
+    for row, field in ADDRESS_LOOKUPS.items():
+        col = get_column_letter(ADDRESS_COLUMNS[field])
+        result = f"INDEX(地址库!${col}$2:${col}$5000,MATCH($L$4,地址库!$B$2:$B$5000,0))"
+        sheet[f"L{row}"] = f'=IF($L$4="","",IFERROR(IF({result}="","",{result})&"",""))'
+    sheet["O4"] = '=IF(L4="","请输入编码",IF(COUNTIF(地址库!$B$2:$B$5000,L4)=1,"地址匹配成功","地址编码不存在或重复"))'
+    sheet["L17"] = ('=IF(L4="","",IF(L6="","",L6&CHAR(10))&L7&CHAR(10)&'
+                    'IF(L8="","",L8&CHAR(10))&IF(L9="","",L9&CHAR(10))&L10&", "&L11&" "&L12&CHAR(10)&L13)')
+    sheet["L17"].alignment = Alignment(wrap_text=True)
+    sheet.freeze_panes = "A4"
+
     addresses = book.create_sheet("地址库")
     addresses.append(("地址简称*", "地址编码*", "映射代码", "FBA仓库代码", "联系人*",
                       "公司名", "联系电话", "联系手机", "地址一*", "地址二", "地址三",
                       "城市*", "省/洲", "国家*", "邮编*"))
+    if catalogue is not None:
+        with workbook_from_bytes(catalogue) as (source, _photos):
+            for index, row in enumerate(catalogue_rows(source), start=2):
+                if any(cell.data_type in {"f", "e"} for cell in row):
+                    raise InvoiceError("分配的地址库必须是纯数据，请联系星睿核对。")
+                addresses.append([cell.value.strip() if isinstance(cell.value, str) else cell.value for cell in row])
+                for cell in addresses[index]:
+                    if isinstance(cell.value, str):
+                        cell.data_type = "s"
+        if addresses.max_row == 1:
+            raise InvoiceError("尚无可下载的地址，请联系星睿开通本客户的地址库。")
     services = book.create_sheet("服务选项")
     services.append(("服务 / 运输渠道",))
     for service in SERVICES:
         services.append((service,))
-    picker = DataValidation(type="list", formula1='INDIRECT("\'服务选项\'!$A$2:$A$14")', allow_blank=False)
-    sheet.add_data_validation(picker)
-    picker.add("D5")
-    yes_no_picker = DataValidation(type="list", formula1='"是,否"', allow_blank=False)
-    sheet.add_data_validation(yes_no_picker)
-    yes_no_picker.add("D7:D10")
-    yes_no_picker.add("N23:N52")
+    for cells, values in (
+        (("L4",), f"""INDIRECT("'地址库'!$B$2:$B${max(2, addresses.max_row)}")"""),
+        (("D5",), """INDIRECT("'服务选项'!$A$2:$A$14")"""),
+        (("D11",), '"普通报关,报关退税"'), (("D13",), '"包税,不包税"'),
+        (("D7:D10", "N23:N52"), '"是,否"'),
+    ):
+        picker = DataValidation(type="list", formula1=values, allow_blank=False, showErrorMessage=True)
+        sheet.add_data_validation(picker)
+        for cell_range in cells:
+            picker.add(cell_range)
+    if layout is not None:
+        copy_invoice_format(sheet, layout)
+    for field in ("D4", "D14", "D16", "L4"):
+        sheet[field].number_format = "@"
+    for line in range(23, 53):
+        sheet[f"A{line}"].number_format = sheet[f"F{line}"].number_format = "@"
     return book
+
+
+def copy_invoice_format(sheet, raw):
+    # Only presentation is copied. Original values, notes, images and address rows never follow the layout.
+    with workbook_from_bytes(raw) as (validated, _photos):
+        if "星睿发票" not in validated or (validated["星睿发票"].max_row, validated["星睿发票"].max_column) != (56, 15):
+            raise InvoiceError("配置的模板版式须为星睿 11.6 单票模板。")
+    source_book = load_workbook(BytesIO(raw), keep_links=False)
+    try:
+        source = source_book["星睿发票"]
+        sheet.column_dimensions.clear()
+        for key, dimension in source.column_dimensions.items():
+            target = sheet.column_dimensions[key]
+            target.width, target.min, target.max = dimension.width, dimension.min, dimension.max
+        for key, dimension in source.row_dimensions.items():
+            sheet.row_dimensions[key].height = dimension.height
+        for row in source.iter_rows(min_row=1, max_row=56, max_col=15):
+            for original in row:
+                if original.has_style:
+                    target = sheet[original.coordinate]
+                    for key in ("font", "fill", "border", "alignment", "number_format"):
+                        setattr(target, key, copy(getattr(original, key)))
+    finally:
+        source_book.close()

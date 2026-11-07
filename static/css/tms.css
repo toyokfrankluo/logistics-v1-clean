@@ -140,3 +140,5 @@ form.invoice-upload label.upload-zone { width: 100%; padding: 16px; justify-item
   .order-search form.search-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .dialog-body { padding: 14px; }
 }
+
+.product-photo { object-fit: contain; vertical-align: middle; }

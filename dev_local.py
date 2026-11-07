@@ -34,16 +34,21 @@ def seed():
         db.session.add(ManualTrack(shipment_id=second.id, description='虚构包裹等待出库', location='演示仓库'))
         db.session.commit()
         from tms_invoice import blank_invoice
-        directory = Path(db.engine.url.database).parent / "tms-addresses"
-        directory.mkdir(exist_ok=True)
-        catalogue = blank_invoice()
-        catalogue["地址库"].append([
-            "演示仓库", "DEMO-US", "", "", "演示收件人", "演示公司", "", "",
-            "1 Example Street", "", "", "Example City", "CA", "US", "00001",
-        ])
-        catalogue.save(directory / f"{customer.id}.xlsx")
-        catalogue.close()
-        app.config["TMS_ADDRESS_BOOK_DIR"] = str(directory)
+        layout = os.environ.get("TMS_LOCAL_INVOICE_TEMPLATE")
+        if layout:
+            app.config["TMS_INVOICE_TEMPLATE_PATH"] = layout
+            app.config["TMS_LOCAL_CATALOGUE"] = (customer.id, layout)
+        else:
+            directory = Path(db.engine.url.database).parent / "tms-addresses"
+            directory.mkdir(exist_ok=True)
+            catalogue = blank_invoice()
+            catalogue["地址库"].append([
+                "演示仓库", "DEMO-US", "", "", "演示收件人", "演示公司", "", "",
+                "1 Example Street", "", "", "Example City", "CA", "US", "00001",
+            ])
+            catalogue.save(directory / f"{customer.id}.xlsx")
+            catalogue.close()
+            app.config["TMS_ADDRESS_BOOK_DIR"] = str(directory)
         from isolated_runtime import register_shadow_fixture
         register_shadow_fixture(app, shipment)
         return admin_password, reader_password

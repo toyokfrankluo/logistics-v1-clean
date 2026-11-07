@@ -56,9 +56,12 @@
 </details>
 <details class="panel" open>
   <summary>产品申报</summary>
-  <div class="table-wrap"><table><thead><tr><th>箱号</th><th>品名（中 / 英）</th><th>材质 / 用途</th><th>HS Code</th><th>单价（USD）</th><th>数量</th><th>金额（USD）</th><th>带电</th><th>说明</th></tr></thead><tbody>
+  <div class="table-wrap"><table><thead><tr><th>箱号</th><th>品名（中 / 英）</th><th>材质 / 用途</th><th>HS Code</th><th>单价（USD）</th><th>数量</th><th>金额（USD）</th><th>带电</th><th>产品图片 / 说明</th></tr></thead><tbody>
   {% for item in invoice.declarations %}
-  <tr><td>{{ item.box_number }}</td><td>{{ item.name_zh }} / {{ item.name_en }}</td><td>{{ item.material or '—' }} / {{ item.usage or '—' }}</td><td>{{ item.hs_code or '—' }}</td><td>{{ item.unit_price_usd }}</td><td>{{ item.quantity }}</td><td>{{ item.total_usd }}</td><td>{{ '是' if item.battery else '否' }}</td><td>{{ item.notes or '—' }}</td></tr>
+  <tr><td>{{ item.box_number }}</td><td>{{ item.name_zh }} / {{ item.name_en }}</td><td>{{ item.material or '—' }} / {{ item.usage or '—' }}</td><td>{{ item.hs_code or '—' }}</td><td>{{ item.unit_price_usd }}</td><td>{{ item.quantity }}</td><td>{{ item.total_usd }}</td><td>{{ '是' if item.battery else '否' }}</td><td>{% if item.image_part %}<img loading="lazy" width="72" height="72" class="product-photo"
+    alt="第 {{ loop.index }} 条申报的产品图片"
+    src="{{ url_for('tms_staff.staff_photo' if staff else 'tms_client.photo', order_id=order.id, item_index=loop.index0) }}">
+    {% else %}{{ item.notes or '—' }}{% endif %}</td></tr>
   {% endfor %}
   </tbody></table></div>
 </details>

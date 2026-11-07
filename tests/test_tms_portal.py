@@ -1,4 +1,5 @@
 """Phase 2 regression checks. All accounts, addresses and workbooks are synthetic."""
+from base64 import b64decode
 from datetime import datetime
 import io
 import os
@@ -8,6 +9,10 @@ import secrets
 import tempfile
 import unittest
 from unittest.mock import patch
+from xml.etree.ElementTree import SubElement, fromstring, tostring
+from zipfile import ZipFile
+
+from openpyxl import load_workbook
 
 os.environ["LOGISTICS_ISOLATED"] = "1"
 
@@ -16,9 +21,16 @@ from app import app, User
 from models import CarrierAgent, Customer, Shipment, db
 from tms_invoice import InvoiceError, SERVICES, blank_invoice, parse_invoice
 from tms_models import TmsAccount, TmsAudit, TmsOrder
+from tms_xlsx_images import XLSX_NS
 
 
-def workbook_bytes(order_number="0000123", code="DEMO-A", *, change=None, recipient="虚构地址甲"):
+PNG = b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j72sAAAAASUVORK5CYII=")
+REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+DRAWING_NS = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+ART_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+
+
+def workbook_bytes(order_number="0000123", code="DEMO-A", *, change=None, recipient="虚构地址甲", pictures=(23, 24, 25)):
     book = blank_invoice()
     address_sheet = book["地址库"]
     address_sheet.append(("虚构仓库", code, "", "", recipient, "", "", "", "1 Fictional Way",
@@ -26,21 +38,44 @@ def workbook_bytes(order_number="0000123", code="DEMO-A", *, change=None, recipi
     sheet = book["星睿发票"]
     for cell, value in {
         "D4": order_number, "D5": "UPS红单", "L4": code, "D7": "否",
-        "D8": "否", "D9": "否", "D10": "否", "D15": 2,
+        "D8": "否", "D9": "否", "D10": "否", "D11": "普通报关", "D14": "DEMO-PO", "D15": 2,
         "A23": "0001", "B23": "Demo item", "C23": "虚构商品", "G23": 1.25,
         "H23": 2, "J23": 1.5, "K23": 20, "L23": 10, "M23": 8, "N23": "否",
         "A24": "0001", "B24": "Second item", "C24": "虚构明细", "G24": 3,
-        "H24": 1, "N24": "否",
+        "H24": 1, "J24": 1.5, "K24": 20, "L24": 10, "M24": 8, "N24": "否",
         "A25": "0002", "B25": "Third item", "C25": "虚构另一箱", "G25": 2,
         "H25": 1, "J25": 1, "K25": 10, "L25": 10, "M25": 10, "N25": "否",
     }.items():
         sheet[cell] = value
+    for line in (23, 24, 25):
+        for col, value in {"D": "Paper", "E": "Demo", "F": "00123456"}.items():
+            sheet[f"{col}{line}"] = value
+        if line in pictures:
+            sheet[f"O{line}"] = '=_xlfn.DISPIMG("ID_DEMO",1)'
     if change:
         change(book)
     stream = io.BytesIO()
     book.save(stream)
     book.close()
-    return stream.getvalue()
+    return with_wps_photo(stream.getvalue())
+
+
+def with_wps_photo(raw):
+    target = io.BytesIO()
+    with ZipFile(io.BytesIO(raw)) as original, ZipFile(target, "w") as output:
+        for entry in original.infolist():
+            output.writestr(entry, original.read(entry))
+        output.writestr("xl/cellimages.xml", f"""
+            <cellImages xmlns:xdr="{DRAWING_NS}" xmlns:a="{ART_NS}" xmlns:r="{REL_NS}">
+              <cellImage><xdr:pic><xdr:nvPicPr><xdr:cNvPr name="ID_DEMO"/></xdr:nvPicPr>
+              <xdr:blipFill><a:blip r:embed="rId1"/></xdr:blipFill></xdr:pic></cellImage>
+            </cellImages>""")
+        output.writestr("xl/_rels/cellimages.xml.rels", f"""
+            <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+              <Relationship Id="rId1" Type="{REL_NS}/image" Target="media/demo.png"/>
+            </Relationships>""")
+        output.writestr("xl/media/demo.png", PNG)
+    return target.getvalue()
 
 
 class InvoiceParsingTests(unittest.TestCase):
@@ -72,6 +107,75 @@ class InvoiceParsingTests(unittest.TestCase):
                 parse_invoice(raw, workbook_bytes())
         with self.assertRaises(InvoiceError):
             parse_invoice(b"not an xlsx", workbook_bytes())
+
+    def test_missing_starred_fields_report_cell_coordinates(self):
+        def blanks(book):
+            for cell in ("D9", "D11", "D14", "D15", "B23", "C23", "D23", "E23", "F23", "J24"):
+                book["星睿发票"][cell] = None
+        with self.assertRaises(InvoiceError) as raised:
+            parse_invoice(workbook_bytes(change=blanks, pictures=(24, 25)), workbook_bytes())
+        for cell in ("D9", "D11", "D14", "D15", "B23", "C23", "D23", "E23", "F23", "J24", "O23"):
+            self.assertIn(f"{cell}（", str(raised.exception))
+        self.assertNotIn("O26", str(raised.exception))
+
+    def test_missing_recipient_field_comes_from_assigned_catalogue(self):
+        def no_region(book):
+            book["地址库"]["M2"] = None
+        with self.assertRaisesRegex(InvoiceError, "L11（省份 / 州）"):
+            parse_invoice(workbook_bytes(), workbook_bytes(change=no_region))
+
+    def test_wps_photo_and_number_formatted_hs_code(self):
+        def format_code(book):
+            cell = book["星睿发票"]["F23"]
+            cell.value = 1234
+            cell.number_format = "000000"
+        invoice = parse_invoice(workbook_bytes(change=format_code), workbook_bytes())
+        self.assertEqual(invoice["declarations"][0]["hs_code"], "001234")
+        self.assertEqual(invoice["declarations"][0]["image_part"], "xl/media/demo.png")
+
+    def test_excel_drawing_photo_anchored_in_column_o(self):
+        def relationships(kind, target):
+            return f'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{REL_NS}/{kind}" Target="{target}"/></Relationships>'
+
+        raw = workbook_bytes(pictures=())
+        output = io.BytesIO()
+        sheet = "xl/worksheets/sheet1.xml"
+        with ZipFile(io.BytesIO(raw)) as source, ZipFile(output, "w") as archive:
+            for entry in source.infolist():
+                data = source.read(entry)
+                if entry.filename == sheet:
+                    xml = fromstring(data)
+                    SubElement(xml, XLSX_NS + "drawing", {"{" + REL_NS + "}id": "rId1"})
+                    data = tostring(xml)
+                archive.writestr(entry, data)
+            archive.writestr("xl/worksheets/_rels/sheet1.xml.rels", relationships("drawing", "../drawings/drawing1.xml"))
+            archive.writestr("xl/drawings/_rels/drawing1.xml.rels", relationships("image", "../media/demo.png"))
+            anchors = "".join(f"""<xdr:oneCellAnchor>
+                <xdr:from><xdr:col>14</xdr:col><xdr:row>{row}</xdr:row></xdr:from>
+                <xdr:pic><xdr:blipFill><a:blip r:embed="rId1"/></xdr:blipFill></xdr:pic>
+                </xdr:oneCellAnchor>""" for row in (22, 23, 24))
+            archive.writestr("xl/drawings/drawing1.xml",
+                             f'<xdr:wsDr xmlns:xdr="{DRAWING_NS}" xmlns:a="{ART_NS}" xmlns:r="{REL_NS}">{anchors}</xdr:wsDr>')
+        invoice = parse_invoice(output.getvalue(), raw)
+        self.assertEqual([item["image_part"] for item in invoice["declarations"]], ["xl/media/demo.png"] * 3)
+
+    def test_declared_total_rounds_like_invoice(self):
+        def fractions(book):
+            book["星睿发票"]["G23"] = 1.005
+            book["星睿发票"]["H23"] = 1
+        self.assertEqual(parse_invoice(workbook_bytes(change=fractions), workbook_bytes())
+                         ["declarations"][0]["total_usd"], "1.01")
+
+    def test_wps_photo_must_reference_internal_image_from_product_cell(self):
+        for cell, formula, message in (
+            ("O23", '=_xlfn.DISPIMG("ID_MISSING",1)', "O23（产品图片）"),
+            ("O23", '=_xlfn.IMAGE("https://example.invalid")', "公式函数"),
+            ("B23", '=_xlfn.DISPIMG("ID_DEMO",1)', "公式函数"),
+        ):
+            with self.subTest(cell=cell, formula=formula), self.assertRaises(InvoiceError) as raised:
+                parse_invoice(workbook_bytes(change=lambda book: book["星睿发票"].__setitem__(cell, formula)),
+                              workbook_bytes())
+            self.assertIn(message, str(raised.exception))
 
     def test_active_formula_and_conflicting_box_measurements_rejected(self):
         def formula(book):
@@ -315,6 +419,56 @@ class PortalTests(unittest.TestCase):
         with patch.dict(app.config, TMS_ENABLED=False):
             self.assertEqual(self.get(self.alice, "/tms/customer/login").status_code, 404)
         self.assertEqual(TmsOrder.query.count(), 0)
+
+    def test_download_preserves_layout_and_includes_only_assigned_catalogue(self):
+        self.sign_in(self.alice, "customer-a")
+        directory = app.config["TMS_ADDRESS_BOOK_DIR"]
+        layout = Path(directory, f"{self.customer_b.id}.xlsx")
+        with patch.dict(app.config, TMS_INVOICE_TEMPLATE_PATH=str(layout)):
+            response = self.get(self.alice, "/tms/customer/template")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("no-store", response.headers["Cache-Control"])
+        with ZipFile(io.BytesIO(response.data)) as archive:
+            self.assertFalse(any(name.startswith("xl/media/") for name in archive.namelist()))
+        book = load_workbook(io.BytesIO(response.data))
+        self.addCleanup(book.close)
+        self.assertEqual(book.sheetnames, ["星睿发票", "地址库", "服务选项"])
+        self.assertEqual([row[0] for row in book["地址库"].iter_rows(min_row=2, min_col=2, max_col=2, values_only=True)],
+                         ["DEMO-A"])
+        sheet = book["星睿发票"]
+        self.assertIn("L4:N4", sheet.merged_cells)
+        self.assertIn("地址库!", sheet["L7"].value)
+        self.assertTrue(any("L4" in item and "地址库" in item.formula1 for item in sheet.data_validations.dataValidation))
+        self.assertEqual(sheet["O22"].value, "产品图片*")
+        self.assertIsNone(sheet["D4"].value)
+        self.assertIsNone(sheet["O23"].value)
+
+    def test_validation_stops_preview_and_creates_no_order(self):
+        self.sign_in(self.alice, "customer-a")
+        raw = workbook_bytes(change=lambda book: book["星睿发票"].__setitem__("D9", None))
+        response = self.upload(self.alice, raw)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("D9（是否带液体）", response.get_data(as_text=True))
+        self.assertEqual(TmsOrder.query.count(), 0)
+
+    def test_photo_visible_in_preview_and_protected_by_order_permissions(self):
+        order_id = self.get_order()
+        path = f"/tms/customer/orders/{order_id}/photos/0"
+        preview = self.get(self.alice, f"/tms/customer/orders/{order_id}")
+        self.assertIn(path, preview.get_data(as_text=True))
+        image = self.get(self.alice, path)
+        self.assertEqual(image.content_type, "image/png")
+        self.assertEqual(image.data, PNG)
+        self.assertIn("no-store", image.headers["Cache-Control"])
+        self.assertEqual(self.get(self.alice, path[:-1] + "9").status_code, 404)
+        self.assertEqual(self.get(self.bob, path).status_code, 302)
+        self.sign_in(self.bob, "customer-b")
+        self.assertEqual(self.get(self.bob, path).status_code, 404)
+        self.staff_login()
+        staff_path = f"/tms/admin/orders/{order_id}/photos/0"
+        self.assertEqual(self.get(self.staff, staff_path).status_code, 404)
+        self.post(self.alice, f"/tms/customer/orders/{order_id}/confirm", {"revision": 1})
+        self.assertEqual(self.get(self.staff, staff_path).data, PNG)
 
     def test_additive_upgrade_idempotent(self):
         existing = self.customer_a.id
