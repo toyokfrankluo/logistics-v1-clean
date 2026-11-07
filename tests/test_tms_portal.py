@@ -1,4 +1,5 @@
 """Phase 2 regression checks. All accounts, addresses and workbooks are synthetic."""
+from datetime import datetime
 import io
 import os
 from pathlib import Path
@@ -226,6 +227,80 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(self.sign_in(self.bob, "created-demo").status_code, 302)
         self.assertEqual(self.post(self.bob, "/tms/customer/logout", {}).status_code, 302)
         self.assertEqual(self.get(self.bob, "/tms/customer/").status_code, 302)
+
+    def test_account_errors_stay_on_form_and_chinese_account_can_sign_in(self):
+        url = "/tms/admin/accounts"
+        self.staff_login()
+        data = {"customer_id": self.customer_b.id, "username": "星睿", "password": "short"}
+        response = self.post(self.staff, url, data, "/login")
+        html = response.get_data(as_text=True)
+        self.assertEqual(response.status_code, 422)
+        self.assertIn('id="password-error"', html)
+        self.assertNotIn('id="username-error"', html)
+        self.assertIn(f'value="{self.customer_b.id}" selected', html)
+        self.assertIn('value="星睿"', html)
+        self.assertNotIn('value="short"', html)
+        self.assertIsNone(TmsAccount.query.filter_by(username="星睿").first())
+
+        data["password"] = self.password
+        self.assertEqual(self.post(self.staff, url, data, "/login").status_code, 302)
+        self.assertIn("星睿", self.get(self.staff, url).get_data(as_text=True))
+        self.assertEqual(self.sign_in(self.bob, " 星睿 ").location, "/tms/customer/")
+        conflict = self.post(self.staff, url, data, "/login")
+        self.assertEqual(conflict.status_code, 409)
+        self.assertIn('id="username-error"', conflict.get_data(as_text=True))
+
+    def test_account_selection_and_invalid_username_have_separate_errors(self):
+        self.staff_login()
+        response = self.post(self.staff, "/tms/admin/accounts",
+                             {"customer_id": 2 ** 100, "username": "非法 账号", "password": self.password},
+                             "/login")
+        self.assertEqual(response.status_code, 422)
+        html = response.get_data(as_text=True)
+        self.assertIn('id="customer-error"', html)
+        self.assertIn('id="username-error"', html)
+        self.assertNotIn('id="password-error"', html)
+
+    def test_list_filters_keep_customer_scope_and_use_business_dates(self):
+        order_id = self.get_order()
+        another = self.upload(self.alice, workbook_bytes("OTHER-001"))
+        other_id = int(another.location.rsplit("/", 1)[1])
+        db.session.get(TmsOrder, order_id).created_at = datetime(2026, 11, 7, 16)
+        db.session.get(TmsOrder, other_id).created_at = datetime(2026, 11, 8, 16)
+        db.session.commit()
+        response = self.get(self.alice, "/tms/customer/?created_from=2026-11-08&created_to=2026-11-08"
+                            "&country=US&address=DEMO-A&recipient=虚构地址&service=UPS红单")
+        html = response.get_data(as_text=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(f'href="/tms/customer/orders/{order_id}"', html)
+        self.assertNotIn(f'href="/tms/customer/orders/{other_id}"', html)
+        self.assertIn("2026-11-08 00:00", html)
+        self.assertIn("7.50", html)
+        self.assertIn("2.5", html)
+        response = self.get(self.alice, f"/tms/customer/?q=XR-{order_id}，NO-MATCH")
+        self.assertIn(f'href="/tms/customer/orders/{order_id}"', response.get_data(as_text=True))
+        self.sign_in(self.bob, "customer-b")
+        response = self.get(self.bob, f"/tms/customer/?q=XR-{order_id}")
+        self.assertIn("当前没有符合条件的订单", response.get_data(as_text=True))
+        response = self.get(self.alice, "/tms/customer/?created_from=2026-11-09&created_to=2026-11-08")
+        self.assertEqual(response.status_code, 400)
+
+    def test_drawer_reuses_authorized_detail_and_hides_internal_fields(self):
+        order_id = self.get_order()
+        self.post(self.alice, f"/tms/customer/orders/{order_id}/confirm", {"revision": 1})
+        self.staff_login()
+        self.decision(order_id, 2, decision="approve", agent_id=self.agent.id, agent_service="后台专用渠道")
+        drawer = self.get(self.alice, f"/tms/customer/orders/{order_id}?drawer=1")
+        html = drawer.get_data(as_text=True)
+        self.assertIn("data-order-detail", html)
+        self.assertIn("提交审核", html)
+        self.assertIn("暂无物流轨迹", html)
+        self.assertNotIn("<!doctype html>", html)
+        self.assertNotIn("后台专用渠道", html)
+        self.sign_in(self.bob, "customer-b")
+        self.assertEqual(self.get(self.bob, f"/tms/customer/orders/{order_id}?drawer=1").status_code, 404)
+        staff = self.get(self.staff, f"/tms/admin/orders/{order_id}?drawer=1")
+        self.assertIn("后台专用渠道", staff.get_data(as_text=True))
 
     def test_upload_security_and_disabled_flag(self):
         self.assertEqual(self.get(self.alice, "/tms/customer/import").status_code, 302)

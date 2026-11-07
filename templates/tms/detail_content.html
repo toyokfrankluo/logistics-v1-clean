@@ -1,0 +1,104 @@
+{% set invoice = order.invoice %}
+<article class="order-detail" data-order-detail>
+<div class="heading"><div><p class="kicker">{{ '导入预览' if order.status == 'draft' else '运单详情' }} · XR-{{ order.id }}</p>
+<h1>{{ invoice.customer_number }}</h1><p>{{ business_date(order.created_at) }}（北京时间）</p></div>
+<a class="button secondary" href="{{ url_for('tms_staff.staff_download' if staff else 'tms_client.download', order_id=order.id) }}">下载原始发票</a></div>
+<dl class="order-metrics">
+  <div><dt>运输服务</dt><dd>{{ invoice.service }}</dd></div>
+  <div><dt>目的国家或地区</dt><dd>{{ invoice.address.country }}</dd></div>
+  <div><dt>箱数</dt><dd>{{ invoice.boxes|length }} 箱</dd></div>
+  <div><dt>申报重量</dt><dd>{{ totals.weight }} kg</dd></div>
+  <div><dt>申报货值</dt><dd>{{ totals.value }} USD</dd></div>
+  <div><dt>订单审核</dt><dd><span class="badge {{ order.status }}">{{ status_labels[order.status] }}</span></dd></div>
+</dl>
+{% if order.rejection_reason %}<p class="error">驳回原因：{{ order.rejection_reason }}</p>{% endif %}
+{% if staff %}
+<p class="notice">客户：{{ customer.name }}{% if order.agent_service %} · 代理服务：{{ order.agent_service }}{% endif %}</p>
+{% endif %}
+<div class="detail-top-grid">
+<details class="panel" open>
+  <summary>基础信息和收件地址</summary>
+  <dl class="fields">
+    {% for label, value in (
+      ('地址编码', invoice.address_code), ('收件人', invoice.address.recipient),
+      ('公司', invoice.address.company), ('收件地址', [invoice.address.street, invoice.address.street2, invoice.address.street3]|select|join('，')),
+      ('城市 / 州省', [invoice.address.city, invoice.address.region]|select|join(' / ')),
+      ('邮编', invoice.address.postal_code), ('联系电话', invoice.address.phone),
+      ('手机', invoice.address.mobile), ('邮箱', invoice.address.email),
+      ('发货公司', invoice.metadata.sender), ('报关方式', invoice.metadata.declaration_mode),
+      ('清关方式', invoice.metadata.clearance_mode), ('交税方式', invoice.metadata.tax_mode),
+      ('PO Number', invoice.metadata.po_number), ('VAT / EORI', invoice.metadata.vat_eori),
+      ('产品备注', invoice.metadata.product_note),
+      ('带电 / 带磁 / 液体 / 粉末', [invoice.flags.battery, invoice.flags.magnet, invoice.flags.liquid, invoice.flags.powder]|map('string')|join(' / ')|replace('True', '是')|replace('False', '否'))
+    ) %}
+    <div><dt>{{ label }}</dt><dd>{{ value or '—' }}</dd></div>
+    {% endfor %}
+  </dl>
+</details>
+<aside class="panel journey">
+  <h2>物流轨迹</h2>
+  <p class="muted">暂无物流轨迹。</p>
+  {% if events %}
+  <h3>订单操作记录</h3>
+  <ol class="timeline">
+    {% for label, timestamp in events %}
+    <li><strong>{{ label }}</strong><small>{{ timestamp }}</small></li>
+    {% endfor %}
+  </ol>
+  {% endif %}
+</aside>
+</div>
+<details class="panel" open>
+  <summary>货箱信息</summary>
+  <div class="table-wrap"><table><thead><tr><th>箱号</th><th>客户申报重量（kg）</th><th>客户申报长 × 宽 × 高（cm）</th><th>仓库实测</th></tr></thead><tbody>
+  {% for box in invoice.boxes %}<tr><td>{{ box.box_number }}</td><td>{{ box.weight_kg }}</td><td>{{ box.length_cm }} × {{ box.width_cm }} × {{ box.height_cm }}</td><td class="muted">—</td></tr>{% endfor %}
+  </tbody></table></div>
+</details>
+<details class="panel" open>
+  <summary>产品申报</summary>
+  <div class="table-wrap"><table><thead><tr><th>箱号</th><th>品名（中 / 英）</th><th>材质 / 用途</th><th>HS Code</th><th>单价（USD）</th><th>数量</th><th>金额（USD）</th><th>带电</th><th>说明</th></tr></thead><tbody>
+  {% for item in invoice.declarations %}
+  <tr><td>{{ item.box_number }}</td><td>{{ item.name_zh }} / {{ item.name_en }}</td><td>{{ item.material or '—' }} / {{ item.usage or '—' }}</td><td>{{ item.hs_code or '—' }}</td><td>{{ item.unit_price_usd }}</td><td>{{ item.quantity }}</td><td>{{ item.total_usd }}</td><td>{{ '是' if item.battery else '否' }}</td><td>{{ item.notes or '—' }}</td></tr>
+  {% endfor %}
+  </tbody></table></div>
+</details>
+<details class="panel">
+  <summary>费用明细</summary>
+  <p class="muted">暂无已确认的收费记录。</p>
+</details>
+<details class="panel">
+  <summary>附件</summary>
+  <p><a href="{{ url_for('tms_staff.staff_download' if staff else 'tms_client.download', order_id=order.id) }}">下载上传的发票</a></p>
+</details>
+{% if not staff and order.status != 'approved' %}
+<section class="panel filters">
+  {% if order.status == 'draft' %}
+  <form method="post" action="{{ url_for('tms_client.confirm', order_id=order.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="revision" value="{{ order.revision }}">
+    <button>确认并提交审核</button>
+  </form>
+  {% endif %}
+  <a class="button secondary" href="{{ url_for('tms_client.upload', replace=order.id) }}">上传更正发票</a>
+</section>
+{% elif staff and order.status == 'pending' %}
+<section class="panel"><h2>审核决定</h2>
+  <p>审核通过后记录所选代理及服务。</p>
+  <div class="review">
+    <form method="post" action="{{ url_for('tms_staff.decide', order_id=order.id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="revision" value="{{ order.revision }}">
+      <label>物流代理<select name="agent_id" required><option value="">请选择</option>{% for agent in agents %}<option value="{{ agent.id }}">{{ agent.name }}</option>{% endfor %}</select></label>
+      <label>代理服务<input name="agent_service" maxlength="100" required></label>
+      <button name="decision" value="approve">审核通过</button>
+    </form>
+    <form method="post" action="{{ url_for('tms_staff.decide', order_id=order.id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="revision" value="{{ order.revision }}">
+      <label>可向客户显示的驳回原因<textarea name="reason" maxlength="500" required></textarea></label>
+      <button class="secondary" name="decision" value="reject">驳回订单</button>
+    </form>
+  </div>
+</section>
+{% endif %}
+</article>

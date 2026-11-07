@@ -1,11 +1,13 @@
 """Customer ordering and administrator review. This module performs no carrier calls."""
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta, timezone
+from decimal import Decimal
 from hashlib import sha256
 from io import BytesIO
 import os
 from pathlib import Path
 import re
 from secrets import token_hex
+from unicodedata import normalize
 
 import click
 from flask import (
@@ -13,12 +15,12 @@ from flask import (
     send_file, session, url_for,
 )
 from flask_login import current_user, logout_user
-from sqlalchemy import func, select, text, update
+from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from models import CarrierAgent, Customer, Shipment, db
-from tms_invoice import InvoiceError, MAX_UPLOAD_BYTES, blank_invoice, parse_invoice
+from tms_invoice import InvoiceError, MAX_UPLOAD_BYTES, SERVICES, blank_invoice, parse_invoice
 from tms_models import TmsAccount, TmsAudit, TmsOrder
 
 client = Blueprint("tms_client", __name__, url_prefix="/tms/customer")
@@ -26,9 +28,26 @@ staff = Blueprint("tms_staff", __name__, url_prefix="/tms/admin")
 SESSION_KEY = "xingrui_customer"
 CLIENT_POSTS = frozenset(f"tms_client.{name}" for name in ("sign_in", "sign_out", "upload", "confirm"))
 SESSION_TTL = timedelta(hours=8)
-ACCOUNT_NAME = re.compile(r"[a-z0-9][a-z0-9_.@+-]{2,79}\Z")
 DUMMY_HASH = generate_password_hash(token_hex(32))
 STATUS_LABELS = {"draft": "待确认", "pending": "待审核", "approved": "审核通过", "rejected": "审核驳回"}
+AUDIT_LABELS = {
+    "upload": "上传发票", "replace": "更正发票", "confirm": "提交审核",
+    "approve": "审核通过", "reject": "审核驳回",
+}
+BUSINESS_TIME = timezone(timedelta(hours=8))
+ORDER_FILTERS = {
+    "q": 300, "service": 60, "country": 2, "address": 50, "recipient": 100,
+    "created_from": 10, "created_to": 10,
+}
+
+
+def account_name(value):
+    return normalize("NFKC", value.strip()).casefold()
+
+
+def valid_account_name(value):
+    return (2 <= len(value) <= 80 and value[0].isalnum()
+            and all(char.isalnum() or char in "_.@+-" for char in value))
 
 
 def init_tms(app):
@@ -111,11 +130,11 @@ def page(template, **context):
 def sign_in():
     if request.method == "GET":
         return page("login")
-    username = request.form.get("username", "").strip().casefold()
+    username = account_name(request.form.get("username", ""))
     password = request.form.get("password", "")
     if len(password) > 128:
         return page("login", error="账号或密码不正确。"), 401
-    account = TmsAccount.query.filter_by(username=username).one_or_none() if ACCOUNT_NAME.fullmatch(username) else None
+    account = TmsAccount.query.filter_by(username=username).one_or_none() if valid_account_name(username) else None
     valid = check_password_hash(account.password_hash if account else DUMMY_HASH, password)
     if not valid or not account or not account.active:
         return page("login", error="账号或密码不正确。"), 401
@@ -163,17 +182,93 @@ def legacy_duplicate(customer_id, key):
     ).limit(1)) is not None
 
 
+def invoice_totals(invoice):
+    declared_weight = sum(Decimal(box["weight_kg"]) for box in invoice["boxes"])
+    declared_value = sum(Decimal(item["total_usd"]) for item in invoice["declarations"])
+    return {"weight": format(declared_weight.normalize(), "f"), "value": format(declared_value, ",.2f")}
+
+
+def business_date(value):
+    return value.replace(tzinfo=timezone.utc).astimezone(BUSINESS_TIME).strftime("%Y-%m-%d %H:%M")
+
+
+def filter_orders(query, filters):
+    keywords = [word.strip().upper() for word in re.split(r"[,，\n]", filters["q"]) if word.strip()]
+    if len(keywords) > 20:
+        raise ValueError("一次最多搜索 20 个单号。")
+    conditions = []
+    for word in keywords:
+        if len(word) > 50:
+            raise ValueError("每个单号最多 50 个字符。")
+        if len(keywords) == 1:
+            conditions.append(TmsOrder.number_key.contains(word, autoescape=True))
+        else:
+            conditions.append(TmsOrder.number_key == word)
+        if re.fullmatch(r"XR-[0-9]{1,10}", word) and int(word[3:]) <= 2_147_483_647:
+            conditions.append(TmsOrder.id == int(word[3:]))
+    if conditions:
+        query = query.filter(or_(*conditions))
+    if filters["service"]:
+        if filters["service"] not in SERVICES:
+            raise ValueError("请选择列表中的运输服务。")
+        query = query.filter(TmsOrder.invoice["service"].as_string() == filters["service"])
+    if filters["country"]:
+        if not re.fullmatch(r"[A-Za-z]{2}", filters["country"]):
+            raise ValueError("国家或地区请填写两位代码，例如 US。")
+        query = query.filter(TmsOrder.invoice["address"]["country"].as_string() == filters["country"].upper())
+    if filters["address"]:
+        query = query.filter(TmsOrder.invoice["address_code"].as_string().icontains(
+            filters["address"], autoescape=True))
+    if filters["recipient"]:
+        query = query.filter(TmsOrder.invoice["address"]["recipient"].as_string().icontains(
+            filters["recipient"], autoescape=True))
+    try:
+        start, end = (date.fromisoformat(filters[key]) if filters[key] else None
+                      for key in ("created_from", "created_to"))
+        if start and end and start > end:
+            raise ValueError
+        if start:
+            query = query.filter(TmsOrder.created_at >= utc_midnight(start))
+        if end:
+            query = query.filter(TmsOrder.created_at < utc_midnight(end + timedelta(days=1)))
+    except (ValueError, OverflowError):
+        raise ValueError("请检查创建日期范围，开始日期不能晚于结束日期。") from None
+    return query
+
+
+def utc_midnight(day):
+    return datetime.combine(day, time.min, BUSINESS_TIME).astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def order_list(query, endpoint, default_status):
+    filters = {key: request.args.get(key, "").strip() for key in ORDER_FILTERS}
+    status = request.args.get("status", default_status)
+    statuses = {key: value for key, value in STATUS_LABELS.items()
+                if endpoint == "tms_client.orders" or key != "draft"}
+    if status not in statuses and status != "all":
+        status = default_status
+    error = None
+    try:
+        if any(len(filters[key]) > limit for key, limit in ORDER_FILTERS.items()):
+            raise ValueError("筛选内容超出长度限制，请缩短后再查。")
+        query = filter_orders(query, filters)
+    except ValueError as exc:
+        error = str(exc)
+        query = query.filter(False)
+    counts = dict(query.with_entities(TmsOrder.status, func.count(TmsOrder.id))
+                  .group_by(TmsOrder.status).all())
+    if status != "all":
+        query = query.filter_by(status=status)
+    pagination = query.order_by(TmsOrder.id.desc()).paginate(per_page=25, error_out=False)
+    args = {key: value for key, value in filters.items() if value}
+    return page("orders", pagination=pagination, filters=filters, filter_args=args, counts=counts,
+                statuses=statuses, status=status, services=SERVICES, endpoint=endpoint,
+                invoice_totals=invoice_totals, business_date=business_date, error=error), (400 if error else 200)
+
+
 @client.get("/")
 def orders():
-    query = owned_orders()
-    term = request.args.get("q", "").strip()[:50]
-    status = request.args.get("status", "")
-    if term:
-        query = query.filter(TmsOrder.number_key.contains(term.upper(), autoescape=True))
-    if status in STATUS_LABELS:
-        query = query.filter_by(status=status)
-    pagination = query.order_by(TmsOrder.id.desc()).paginate(per_page=25)
-    return page("orders", pagination=pagination, term=term, status=status)
+    return order_list(owned_orders(), "tms_client.orders", "all")
 
 
 @client.route("/import", methods=["GET", "POST"])
@@ -233,7 +328,18 @@ def upload():
 
 @client.get("/orders/<int:order_id>")
 def detail(order_id):
-    return page("detail", order=customer_order(order_id))
+    return order_detail(customer_order(order_id))
+
+
+def order_detail(order, **context):
+    template = "detail_content" if request.args.get("drawer") == "1" else "detail"
+    audit = db.session.execute(select(TmsAudit.action, TmsAudit.created_at)
+                               .where(TmsAudit.order_id == order.id)
+                               .order_by(TmsAudit.id.desc()).limit(30)).all()
+    events = [(AUDIT_LABELS[action], business_date(timestamp)) for action, timestamp in audit
+              if action in AUDIT_LABELS and timestamp]
+    return page(template, order=order, totals=invoice_totals(order.invoice),
+                business_date=business_date, events=events, **context)
 
 
 @client.get("/template")
@@ -274,31 +380,44 @@ def download(order_id):
 @staff.route("/accounts", methods=["GET", "POST"])
 def accounts():
     if request.method == "GET":
-        return page("accounts", customers=Customer.query.order_by(Customer.name).all())
+        return accounts_page()
     customer_id = request.form.get("customer_id", type=int)
-    username = request.form.get("username", "").strip().casefold()
+    raw_username = request.form.get("username", "").strip()
+    username = account_name(raw_username)
     password = request.form.get("password", "")
-    if not (customer_id and db.session.get(Customer, customer_id)
-            and ACCOUNT_NAME.fullmatch(username) and 12 <= len(password) <= 128):
-        abort(400, "请选择已有客户、填写合法账号，并使用 12–128 个字符的密码。")
+    errors = {}
+    if not customer_id or not 0 < customer_id <= 2_147_483_647 or not db.session.get(Customer, customer_id):
+        errors["customer_id"] = "请选择一个已有客户。"
+    if not valid_account_name(username):
+        errors["username"] = "账号须为 2–80 个字符，以中文、字母或数字开头，可包含 _ . @ + -。"
+    if not 12 <= len(password) <= 128 or not password.strip():
+        errors["password"] = "初始密码须为 12–128 个字符，不能全是空格。"
+    if errors:
+        return accounts_page(errors=errors, customer_id=customer_id, username=raw_username[:80]), 422
     db.session.add(TmsAccount(customer_id=customer_id, username=username,
                               password_hash=generate_password_hash(password)))
     try:
         db.session.commit()
     except IntegrityError:
         db.session.rollback()
-        abort(409, "该客户登录账号已存在。")
-    flash("客户登录账号已创建。", "success")
+        return accounts_page(errors={"username": "这个登录账号已被使用，请换一个。"},
+                             customer_id=customer_id, username=raw_username[:80]), 409
+    flash("客户账号已创建，可从客户登录页进入。", "success")
     return redirect(url_for("tms_staff.accounts"))
+
+
+def accounts_page(*, errors=None, customer_id=None, username=""):
+    customers = Customer.query.order_by(Customer.name).all()
+    accounts = db.session.execute(select(TmsAccount.username, TmsAccount.active, Customer.name)
+                                 .join(Customer, Customer.id == TmsAccount.customer_id)
+                                 .order_by(TmsAccount.id.desc())).all()
+    return page("accounts", customers=customers, accounts=accounts, errors=errors or {},
+                selected_customer=customer_id, username=username)
 
 
 @staff.get("/")
 def queue():
-    status = request.args.get("status", "pending")
-    if status not in {"pending", "approved", "rejected"}:
-        status = "pending"
-    pagination = TmsOrder.query.filter_by(status=status).order_by(TmsOrder.id.desc()).paginate(per_page=25)
-    return page("orders", pagination=pagination, status=status, term="")
+    return order_list(TmsOrder.query.filter(TmsOrder.status != "draft"), "tms_staff.queue", "pending")
 
 
 def reviewable_order(order_id):
@@ -309,7 +428,7 @@ def reviewable_order(order_id):
 def review(order_id):
     order = reviewable_order(order_id)
     agents = CarrierAgent.query.filter_by(is_active=True).order_by(CarrierAgent.name).all()
-    return page("detail", order=order, agents=agents, customer=db.session.get(Customer, order.customer_id))
+    return order_detail(order, agents=agents, customer=db.session.get(Customer, order.customer_id))
 
 
 @staff.post("/orders/<int:order_id>/decision")

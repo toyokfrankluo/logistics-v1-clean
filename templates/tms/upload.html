@@ -2,19 +2,8 @@
 {% block title %}Excel 导入{% endblock %}
 {% block content %}
 <div class="heading"><div><p class="kicker">客户下单</p><h1>{{ '更正发票' if replacement else 'Excel 导入' }}</h1></div>
-<a class="button secondary" href="{{ url_for('tms_client.template_file') }}">下载星睿单票模板</a></div>
+<a href="{{ url_for('tms_client.orders') }}">返回运单列表</a></div>
 <section class="panel">
-  <p class="steps">1. 上传发票　→　2. 核对预览　→　3. 提交审核</p>
-  <p>每次上传一份 .xlsx，最多 2 MiB。请将客户单号、货箱编号和地址库编码填写为文本。多份文件可依次上传。</p>
-  {% if replacement %}<p class="notice">替换 {{ replacement.invoice.customer_number }} 的发票后，订单将回到待确认，需要再次提交审核。</p>{% endif %}
-  <form method="post" enctype="multipart/form-data">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    {% if replacement %}
-    <input type="hidden" name="replace" value="{{ replacement.id }}">
-    <input type="hidden" name="revision" value="{{ replacement.revision }}">
-    {% endif %}
-    <label>星睿发票 <input type="file" name="invoice" accept=".xlsx" required></label>
-    <button>解析并预览</button>
-  </form>
+  {% include "tms/import_form.html" %}
 </section>
 {% endblock %}

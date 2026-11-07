@@ -3,38 +3,86 @@
 {% block content %}
 <div class="heading">
   <div><p class="kicker">{{ '星睿管理端' if staff else '客户操作端' }}</p><h1>{{ '订单审核' if staff else '我的运单' }}</h1></div>
-  <a class="button" href="{{ url_for('tms_staff.accounts' if staff else 'tms_client.upload') }}">{{ '开通客户账号' if staff else 'Excel 导入' }}</a>
-</div>
-<section class="panel">
-  <form method="get" class="filters">
-    {% if not staff %}<label>客户单号<input name="q" value="{{ term }}" maxlength="50" placeholder="输入单号关键词"></label>{% endif %}
-    <label>业务审核状态<select name="status">
-      {% if not staff %}<option value="">全部状态</option>{% endif %}
-      {% for code, label in status_labels.items() if not staff or code != 'draft' %}
-      <option value="{{ code }}"{% if status == code %} selected{% endif %}>{{ label }}</option>
-      {% endfor %}
-    </select></label>
-    <button class="secondary">筛选</button>
-  </form>
-  <div class="table-wrap">
-  <table><thead><tr><th>客户单号</th><th>运输服务</th><th>国家</th><th>箱数</th><th>业务审核状态</th><th>创建时间（UTC）</th></tr></thead>
-  <tbody>
-  {% for order in pagination.items %}
-    <tr>
-      <td><a href="{{ url_for('tms_staff.review' if staff else 'tms_client.detail', order_id=order.id) }}">{{ order.invoice.customer_number }}</a></td>
-      <td>{{ order.invoice.service }}</td><td>{{ order.invoice.address.country }}</td><td>{{ order.invoice.boxes|length }}</td>
-      <td><span class="badge {{ order.status }}">{{ status_labels[order.status] }}</span></td>
-      <td>{{ order.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
-    </tr>
+  {% if staff %}
+  <a class="button secondary" href="{{ url_for('tms_staff.accounts') }}">开通客户账号</a>
   {% else %}
-    <tr><td colspan="6" class="empty">当前没有符合条件的订单。</td></tr>
-  {% endfor %}
-  </tbody></table>
+  <a class="button" data-open-import href="{{ url_for('tms_client.upload') }}">＋ Excel 导入</a>
+  {% endif %}
+</div>
+
+<section class="panel order-search">
+  <form method="get" action="{{ url_for(endpoint) }}" class="search-form">
+    <input type="hidden" name="status" value="{{ status }}">
+    <label class="keyword">运单号<input name="q" value="{{ filters.q }}" maxlength="300" placeholder="客户单号或 XR 单号，多个以逗号分隔"></label>
+    <label>运输服务<select name="service">
+      <option value="">全部服务</option>
+      {% for service in services %}<option{% if service == filters.service %} selected{% endif %}>{{ service }}</option>{% endfor %}
+    </select></label>
+    <label>国家或地区<input name="country" value="{{ filters.country }}" maxlength="2" placeholder="例如 US"></label>
+    <label>地址编码<input name="address" value="{{ filters.address }}" maxlength="50" placeholder="输入编码"></label>
+    <label>收件人<input name="recipient" value="{{ filters.recipient }}" maxlength="100" placeholder="输入收件人"></label>
+    <fieldset class="date-filter">
+      <legend>创建日期（北京时间）</legend>
+      <input type="date" name="created_from" value="{{ filters.created_from }}" aria-label="创建开始日期">
+      <span aria-hidden="true">至</span>
+      <input type="date" name="created_to" value="{{ filters.created_to }}" aria-label="创建结束日期">
+    </fieldset>
+    <div class="inline-actions search-actions">
+      <button>搜索</button>
+      <a class="button secondary" href="{{ url_for(endpoint) }}">重置</a>
+    </div>
+  </form>
+</section>
+
+<section class="panel shipment-results" aria-label="运单结果">
+  <nav class="status-tabs" aria-label="按订单审核状态筛选">
+    {% for code, label in statuses.items() %}
+    <a href="{{ url_for(endpoint, status=code, **filter_args) }}"{% if code == status %} aria-current="page"{% endif %}>{{ label }} <span>{{ counts.get(code, 0) }}</span></a>
+    {% endfor %}
+    <a href="{{ url_for(endpoint, status='all', **filter_args) }}"{% if status == 'all' %} aria-current="page"{% endif %}>全部 <span>{{ counts.values()|sum }}</span></a>
+  </nav>
+  <div class="results-meta"><strong>运单列表</strong><span>共 {{ pagination.total }} 票</span></div>
+  <div class="table-wrap" tabindex="0" aria-label="运单表格，可横向滚动">
+    <table class="shipment-table">
+      <thead><tr><th scope="col">运单号</th><th scope="col">运输服务</th><th scope="col">收件人</th><th scope="col">目的地</th>
+        <th scope="col">箱数</th><th scope="col">申报货值</th><th scope="col">申报重量</th><th scope="col">审核状态</th><th scope="col">创建时间</th></tr></thead>
+      <tbody>
+        {% for order in pagination.items %}
+        {% set link = url_for('tms_staff.review' if staff else 'tms_client.detail', order_id=order.id) %}
+        {% set totals = invoice_totals(order.invoice) %}
+        <tr>
+          <td><a class="shipment-number" href="{{ link }}" data-order-drawer>{{ order.invoice.customer_number }}</a><small class="cell-note">XR-{{ order.id }}</small></td>
+          <td>{{ order.invoice.service }}</td><td>{{ order.invoice.address.recipient }}</td>
+          <td>{{ order.invoice.address.country }}<small class="cell-note">{{ order.invoice.address.postal_code }}</small></td>
+          <td>{{ order.invoice.boxes|length }}</td><td>{{ totals.value }} <small>USD</small></td>
+          <td>{{ totals.weight }} <small>kg</small></td><td><span class="badge {{ order.status }}">{{ status_labels[order.status] }}</span></td>
+          <td>{{ business_date(order.created_at) }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="9" class="empty">当前没有符合条件的订单。</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
   </div>
   <nav class="pagination" aria-label="分页">
-    {% if pagination.has_prev %}<a href="?page={{ pagination.prev_num }}&amp;status={{ status|urlencode }}&amp;q={{ term|urlencode }}">上一页</a>{% endif %}
-    <span>第 {{ pagination.page }} 页 · 共 {{ pagination.total }} 票</span>
-    {% if pagination.has_next %}<a href="?page={{ pagination.next_num }}&amp;status={{ status|urlencode }}&amp;q={{ term|urlencode }}">下一页</a>{% endif %}
+    {% if pagination.has_prev %}<a href="{{ url_for(endpoint, page=pagination.prev_num, status=status, **filter_args) }}">上一页</a>{% endif %}
+    <span>第 {{ pagination.page }} 页</span>
+    {% if pagination.has_next %}<a href="{{ url_for(endpoint, page=pagination.next_num, status=status, **filter_args) }}">下一页</a>{% endif %}
   </nav>
 </section>
+
+{% if not staff %}
+<dialog id="import-dialog" class="work-dialog" aria-labelledby="import-title">
+  <header class="dialog-header"><div><p class="kicker">客户下单</p><h2 id="import-title">Excel 导入</h2></div>
+    <form method="dialog"><button class="secondary">关闭</button></form>
+  </header>
+  <div class="dialog-body">{% include "tms/import_form.html" %}</div>
+</dialog>
+{% endif %}
+<dialog id="order-drawer" class="work-dialog order-drawer" aria-labelledby="drawer-title">
+  <header class="dialog-header"><h2 id="drawer-title">运单详情</h2>
+    <form method="dialog"><button class="secondary">关闭</button></form>
+  </header>
+  <div class="dialog-body" id="drawer-body" aria-busy="false"></div>
+</dialog>
 {% endblock %}
