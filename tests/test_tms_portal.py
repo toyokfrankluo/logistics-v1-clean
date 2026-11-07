@@ -1,6 +1,7 @@
 """Phase 2 regression checks. All accounts, addresses and workbooks are synthetic."""
 from base64 import b64decode
 from datetime import datetime
+from decimal import Decimal
 import io
 import os
 from pathlib import Path
@@ -18,9 +19,9 @@ os.environ["LOGISTICS_ISOLATED"] = "1"
 
 from werkzeug.security import check_password_hash, generate_password_hash
 from app import app, User
-from models import CarrierAgent, Customer, Shipment, db
+from models import BankAccount, CarrierAgent, Customer, Shipment, db
 from tms_invoice import InvoiceError, SERVICES, blank_invoice, parse_invoice
-from tms_models import TmsAccount, TmsAudit, TmsOrder
+from tms_models import TmsAccount, TmsAudit, TmsChargeAdjustment, TmsOrder, TmsReceivable
 from tms_xlsx_images import XLSX_NS
 
 
@@ -247,6 +248,19 @@ class PortalTests(unittest.TestCase):
         return self.post(client, "/tms/customer/import",
                          {"invoice": (io.BytesIO(raw or workbook_bytes()), "fictional.xlsx"), **form})
 
+    def pricing(self, **changes):
+        return dict(agent_id=self.agent.id, agent_service="虚构代理渠道",
+                    unit="kg", quantity="100", quantity_source="declared", rate="12",
+                    surcharge="0", operation="0", high_value="0", currency="CNY",
+                    other_mode="none", confirmed="yes") | changes
+
+    def pending_order(self):
+        order_id = self.get_order()
+        self.assertEqual(self.post(self.alice, f"/tms/customer/orders/{order_id}/confirm",
+                                   {"revision": 1}).status_code, 302)
+        self.assertEqual(self.staff_login().status_code, 302)
+        return order_id
+
     def decision(self, order_id, revision, **form):
         return self.post(self.staff, f"/tms/admin/orders/{order_id}/decision",
                          {"revision": revision, **form}, "/login")
@@ -284,14 +298,19 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(self.post(self.alice, path, {"revision": 1}).status_code, 302)
         self.assertEqual(self.post(self.alice, path, {"revision": 1}).status_code, 409)
         self.assertIn(b"0000123", self.get(self.staff, "/tms/admin/").data)
-        self.assertEqual(self.decision(order_id, 2, decision="approve", agent_id=self.agent.id,
-                                       agent_service="内部代理服务代码").status_code, 302)
+        self.assertEqual(self.decision(order_id, 2, decision="approve", **self.pricing(agent_service="内部代理服务代码")).status_code, 302)
         self.assertEqual(self.decision(order_id, 2, decision="reject", reason="重复").status_code, 409)
         db.session.expire_all()
         self.assertEqual(db.session.get(TmsOrder, order_id).status, "approved")
         self.assertEqual(TmsAudit.query.count(), 3)
         self.assertNotIn("内部代理服务代码", self.get(self.alice, f"/tms/customer/orders/{order_id}").get_data(as_text=True))
-        self.assertEqual(Shipment.query.count(), 0)
+        self.assertEqual(Shipment.query.count(), 1)
+        charge = db.session.get(TmsReceivable, order_id)
+        self.assertEqual(charge.total, Decimal("1200.00"))
+        shipment = db.session.get(Shipment, charge.shipment_id)
+        self.assertEqual((shipment.customer_id, shipment.agent_id), (self.customer_a.id, self.agent.id))
+        self.assertIsNone(shipment.shipment_id)
+        self.assertIsNone(shipment.third_party_tracking_number)
 
     def test_reject_and_replace(self):
         order_id = self.get_order()
@@ -393,7 +412,7 @@ class PortalTests(unittest.TestCase):
         order_id = self.get_order()
         self.post(self.alice, f"/tms/customer/orders/{order_id}/confirm", {"revision": 1})
         self.staff_login()
-        self.decision(order_id, 2, decision="approve", agent_id=self.agent.id, agent_service="后台专用渠道")
+        self.decision(order_id, 2, decision="approve", **self.pricing(agent_service="后台专用渠道"))
         drawer = self.get(self.alice, f"/tms/customer/orders/{order_id}?drawer=1")
         html = drawer.get_data(as_text=True)
         self.assertIn("data-order-detail", html)
@@ -470,10 +489,150 @@ class PortalTests(unittest.TestCase):
         self.post(self.alice, f"/tms/customer/orders/{order_id}/confirm", {"revision": 1})
         self.assertEqual(self.get(self.staff, staff_path).data, PNG)
 
+    def test_required_pricing_fields_and_explicit_zero(self):
+        order_id = self.pending_order()
+        cases = (("agent_id", "", "启用的实际物流代理"), ("agent_service", "", "实际代理运输渠道"),
+                 ("rate", "", "计费单价"), ("quantity", "0", "计费数量"),
+                 ("quantity", "NaN", "计费数量"), ("quantity_source", "", "计费数量来源"),
+                 ("operation", "", "操作费"), ("surcharge", "", "附加费"),
+                 ("high_value", "-1", "超值费"), ("other_mode", "", "无其他费用"),
+                 ("confirmed", "", "请确认收费"))
+        for field, value, error in cases:
+            with self.subTest(field=field, value=value):
+                res = self.decision(order_id, 2, decision="approve", **self.pricing(**{field: value}))
+                self.assertEqual(res.status_code, 400)
+                self.assertIn(error, res.get_data(as_text=True))
+        self.assertEqual(Shipment.query.count(), 0)
+        self.assertEqual(TmsReceivable.query.count(), 0)
+        self.assertEqual(self.decision(order_id, 2, decision="approve", **self.pricing()).status_code, 302)
+
+    def test_draft_remove_fee_then_approve_finance_and_excel(self):
+        order_id = self.pending_order()
+        db.session.add_all([
+            Shipment(customer_id=self.customer_a.id, tracking_number="LEGACY-EXAMPLE", fee=3),
+            BankAccount(bank_name="虚构演示银行", account_name="虚构公司", account_no="DEMO-0000", is_default=True),
+        ])
+        db.session.commit()
+        values = self.pricing(currency="USD", operation="7", other_mode="items", other_name=["偏远派送费", "测试待删除"],
+                              other_amount=["10.10", "22.00"], other_currency=["USD", "USD"], other_note=["", ""])
+        self.assertEqual(self.decision(order_id, 2, decision="draft", **values).status_code, 302)
+        draft = db.session.get(TmsReceivable, order_id)
+        self.assertIsNone(draft.shipment_id)
+        self.assertEqual(len(draft.details["other"]), 2)
+        values.update(other_name=["偏远派送费"], other_amount=["10.10"], other_currency=["EUR"], other_note=[""])
+        self.assertEqual(self.decision(order_id, 3, decision="approve", **values).status_code, 400)
+        values["other_currency"] = ["USD"]
+        self.assertEqual(self.decision(order_id, 3, decision="approve", **values).status_code, 302)
+        self.assertEqual(self.decision(order_id, 3, decision="approve", **values).status_code, 409)
+        db.session.expire_all()
+        row = db.session.get(TmsReceivable, order_id)
+        self.assertEqual(row.total, Decimal("1217.10"))
+        self.assertEqual(len(row.details["other"]), 1)
+        self.assertEqual(Shipment.query.count(), 2)
+        body = self.get(self.staff, "/finance").get_data(as_text=True)
+        self.assertIn("1217.10 USD", body)
+        self.assertIn("3.00 CNY", body)
+        result = self.post(self.staff, "/finance", {"export": "1"}, "/login")
+        self.assertEqual(result.status_code, 200)
+        workbook = load_workbook(io.BytesIO(result.data))
+        self.addCleanup(workbook.close)
+        fees = list(workbook["TMS 收费明细"].values)
+        self.assertIn(("0000123", "偏远派送费", "USD", 10.1), fees)
+        self.assertNotIn("测试待删除", str(fees))
+        self.assertIn(("0000123", "应收总额", "USD", 1217.1), fees)
+        self.assertIn("账号：DEMO-0000", [cell[0] for cell in workbook["账单"].values])
+        body = self.get(self.staff, "/shipments?review=legacy").get_data(as_text=True)
+        self.assertIn("LEGACY-EXAMPLE", body)
+        self.assertNotIn("0000123", body)
+
+    def test_adjustments_preserve_history_and_linked_mutations_are_guarded(self):
+        order_id = self.pending_order()
+        self.assertEqual(self.decision(order_id, 2, decision="approve", **self.pricing()).status_code, 302)
+        receivable = db.session.get(TmsReceivable, order_id)
+        shipment_id = receivable.shipment_id
+        self.assertEqual(self.decision(order_id, 3, decision="adjust", **self.pricing(rate="13")).status_code, 400)
+        response = self.decision(order_id, 3, decision="adjust", **self.pricing(
+            rate="13", adjustment_reason="虚构实测更正", review_note="仅管理端备注", quantity_source="warehouse"))
+        self.assertEqual(response.status_code, 302)
+        db.session.expire_all()
+        history = TmsChargeAdjustment.query.one()
+        self.assertEqual((history.previous["total"], history.revised["total"]), ("1200.00", "1300.00"))
+        self.assertEqual(history.reason, "虚构实测更正")
+        self.assertIsNotNone(history.actor_id)
+        self.assertIsNotNone(history.created_at)
+        for url in (f"/shipments/edit/{shipment_id}", f"/shipments/{shipment_id}/edit"):
+            self.assertEqual(self.post(self.staff, url, {"fee": "1"}, "/login").status_code, 409)
+        self.assertEqual(self.post(self.staff, f"/shipments/delete/{shipment_id}", {}, "/login").status_code, 409)
+        customer_view = self.get(self.alice, f"/tms/customer/orders/{order_id}").get_data(as_text=True)
+        self.assertIn("1300.00 CNY", customer_view)
+        self.assertNotIn("仅管理端备注", customer_view)
+        self.assertNotIn("虚构实测更正", customer_view)
+        self.assertIn("1300.00 CNY", self.get(self.staff, "/finance").get_data(as_text=True))
+
+    def test_duplicate_legacy_reference_and_commit_failure_do_not_approve(self):
+        order_id = self.pending_order()
+        shipment = Shipment(customer_id=self.customer_a.id, tracking_number="0000123")
+        db.session.add(shipment)
+        db.session.commit()
+        self.assertEqual(self.decision(order_id, 2, decision="approve", **self.pricing()).status_code, 409)
+        db.session.delete(shipment)
+        db.session.commit()
+        from sqlalchemy.exc import SQLAlchemyError
+        with patch.object(db.session, "commit", side_effect=SQLAlchemyError):
+            self.assertEqual(self.decision(order_id, 2, decision="approve", **self.pricing()).status_code, 409)
+        self.assertEqual(Shipment.query.count(), 0)
+        self.assertEqual(TmsReceivable.query.count(), 0)
+        self.assertEqual(db.session.get(TmsOrder, order_id).status, "pending")
+
+    def test_shared_navigation_and_account_deactivation(self):
+        self.staff_login()
+        for path in ("/tms/admin/", "/tms/admin/accounts", "/shipments", "/agents", "/finance", "/bank_accounts", "/track"):
+            response = self.get(self.staff, path)
+            self.assertEqual(response.status_code, 200, path)
+            html = response.get_data(as_text=True)
+            self.assertIn('class="tms-admin"', html, path)
+            self.assertIn("收款账户管理", html, path)
+            self.assertNotIn("录入运单</a>", html, path)
+            self.assertNotIn("客户管理</a>", html, path)
+        account_id = TmsAccount.query.filter_by(username="customer-a").one().id
+        path = f"/tms/admin/accounts/{account_id}/availability"
+        self.sign_in(self.alice, "customer-a")
+        self.assertEqual(self.staff.post(path, data={"state": "disable"}).status_code, 400)
+        self.assertEqual(self.post(self.staff, path, {"state": "disable"}, "/login").status_code, 302)
+        self.assertEqual(self.get(self.alice, "/tms/customer/").status_code, 302)
+        self.staff_login("tms-test-reader")
+        self.assertEqual(self.post(self.staff, path, {"state": "enable"}, "/login").status_code, 403)
+
+    def test_billing_migration_preserves_old_approved_order_and_legacy_fee(self):
+        order_id = self.pending_order()
+        order = db.session.get(TmsOrder, order_id)
+        order.status = "approved"
+        db.session.add(Shipment(customer_id=self.customer_a.id, tracking_number="HISTORIC-FEE", fee=25))
+        db.session.commit()
+        with db.engine.begin() as connection:
+            TmsChargeAdjustment.__table__.drop(connection)
+            TmsReceivable.__table__.drop(connection)
+        self.assertIn("25.00 CNY", self.get(self.staff, "/finance").get_data(as_text=True))
+        result = app.test_cli_runner().invoke(args=["tms-upgrade-v1", "--confirm"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(db.session.get(TmsOrder, order_id).status, "approved")
+        self.assertEqual(TmsReceivable.query.count(), 0)
+        self.assertIn("25.00 CNY", self.get(self.staff, "/finance").get_data(as_text=True))
+
+    def test_corrected_invoice_discards_stale_pricing_draft(self):
+        order_id = self.pending_order()
+        self.assertEqual(self.decision(order_id, 2, decision="draft", **self.pricing()).status_code, 302)
+        self.assertEqual(self.decision(order_id, 3, decision="reject", reason="请更正重量").status_code, 302)
+        response = self.upload(self.alice, workbook_bytes(change=lambda book:
+            book["星睿发票"].__setitem__("J25", 3)), replace=order_id, revision=4)
+        self.assertEqual(response.status_code, 302)
+        self.assertIsNone(db.session.get(TmsReceivable, order_id))
+
     def test_additive_upgrade_idempotent(self):
         existing = self.customer_a.id
         with db.engine.begin() as connection:
-            for table in (TmsAudit.__table__, TmsOrder.__table__, TmsAccount.__table__):
+            for table in (TmsChargeAdjustment.__table__, TmsReceivable.__table__, TmsAudit.__table__,
+                          TmsOrder.__table__, TmsAccount.__table__):
                 table.drop(connection)
         runner = app.test_cli_runner()
         self.assertNotEqual(runner.invoke(args=["tms-upgrade-v1"]).exit_code, 0)

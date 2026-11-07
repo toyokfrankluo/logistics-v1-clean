@@ -58,3 +58,11 @@ class CarrierAdminView(SecureModelView):
     column_exclude_list = ("app_key", "app_token", "password")
     form_excluded_columns = ("app_key", "app_token", "password")
     can_view_details = False
+
+
+class ShipmentAdminView(OwnedRecordView):
+    def on_model_change(self, form, model, is_created):
+        if not is_created:
+            from tms_billing import linked_receivable
+            if linked_receivable(model.id):
+                raise ValueError("已审核运单请在 TMS 维护物流资料或调整收费。")

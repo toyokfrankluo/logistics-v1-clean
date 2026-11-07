@@ -8,6 +8,7 @@
   <div><dt>目的国家或地区</dt><dd>{{ invoice.address.country }}</dd></div>
   <div><dt>箱数</dt><dd>{{ invoice.boxes|length }} 箱</dd></div>
   <div><dt>申报重量</dt><dd>{{ totals.weight }} kg</dd></div>
+  <div><dt>申报体积</dt><dd>{{ totals.volume }} m³</dd></div>
   <div><dt>申报货值</dt><dd>{{ totals.value }} USD</dd></div>
   <div><dt>订单审核</dt><dd><span class="badge {{ order.status }}">{{ status_labels[order.status] }}</span></dd></div>
 </dl>
@@ -15,6 +16,9 @@
 {% if staff %}
 <p class="notice">客户：{{ customer.name }}{% if order.agent_service %} · 代理服务：{{ order.agent_service }}{% endif %}</p>
 {% endif %}
+{% if staff and order.status == 'pending' %}
+<a class="button secondary review-jump" href="#review-pricing">跳到收费设置</a>
+<div class="review-workspace"><div>{% endif %}
 <div class="detail-top-grid">
 <details class="panel" open>
   <summary>基础信息和收件地址</summary>
@@ -37,7 +41,14 @@
 </details>
 <aside class="panel journey">
   <h2>物流轨迹</h2>
-  <p class="muted">暂无物流轨迹。</p>
+  {% if tracks %}
+  <ol class="timeline">{% for track in tracks %}<li><small>{{ business_date(track.happen_time) }}</small><span>{{ track.location or '' }} {{ track.description }}</span></li>{% endfor %}</ol>
+  {% else %}<p class="muted">暂无物流轨迹。</p>{% endif %}
+  {% if shipment %}
+  <p><a href="{{ url_for('views.manual_tracks', shipment_id=shipment.id) }}">查看手工轨迹</a> · <a href="{{ url_for('views.track') }}">查询物流轨迹</a></p>
+  <p>物流状态：{{ shipment.status or '—' }}。代理单号：{{ shipment.shipment_id or '—' }}。承运单号：{{ shipment.third_party_tracking_number or '—' }}。</p>
+  <a class="button secondary" href="{{ url_for('views.edit_shipment', shipment_id=shipment.id) }}">维护物流资料</a>
+  {% endif %}
   {% if events %}
   <h3>订单操作记录</h3>
   <ol class="timeline">
@@ -65,10 +76,19 @@
   {% endfor %}
   </tbody></table></div>
 </details>
-<details class="panel">
+{% if order.status != 'pending' or not staff %}
+<details class="panel" open>
   <summary>费用明细</summary>
-  <p class="muted">暂无已确认的收费记录。</p>
+  {% if receivable and receivable.shipment_id %}
+    {% include "tms/charge_summary.html" %}
+    {% if staff %}
+    <p class="muted">审核人 #{{ receivable.confirmed_by }} · {{ business_date(receivable.confirmed_at) }}（北京时间）</p>
+    <p>计费依据：{{ receivable.details.quantity }} {{ units[receivable.details.unit] }} × {{ receivable.details.rate }} {{ receivable.currency }} · {{ sources[receivable.details.quantity_source] }}{% if receivable.details.source_note %} · {{ receivable.details.source_note }}{% endif %}</p>
+    {% if receivable.details.review_note %}<p>审核备注：{{ receivable.details.review_note }}</p>{% endif %}
+    {% endif %}
+  {% else %}<p class="muted">暂无已确认的收费记录。</p>{% endif %}
 </details>
+{% endif %}
 <details class="panel">
   <summary>附件</summary>
   <p><a href="{{ url_for('tms_staff.staff_download' if staff else 'tms_client.download', order_id=order.id) }}">下载上传的发票</a></p>
@@ -85,23 +105,34 @@
   <a class="button secondary" href="{{ url_for('tms_client.upload', replace=order.id) }}">上传更正发票</a>
 </section>
 {% elif staff and order.status == 'pending' %}
-<section class="panel"><h2>审核决定</h2>
-  <p>审核通过后记录所选代理及服务。</p>
-  <div class="review">
-    <form method="post" action="{{ url_for('tms_staff.decide', order_id=order.id) }}">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-      <input type="hidden" name="revision" value="{{ order.revision }}">
-      <label>物流代理<select name="agent_id" required><option value="">请选择</option>{% for agent in agents %}<option value="{{ agent.id }}">{{ agent.name }}</option>{% endfor %}</select></label>
-      <label>代理服务<input name="agent_service" maxlength="100" required></label>
-      <button name="decision" value="approve">审核通过</button>
-    </form>
-    <form method="post" action="{{ url_for('tms_staff.decide', order_id=order.id) }}">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-      <input type="hidden" name="revision" value="{{ order.revision }}">
-      <label>可向客户显示的驳回原因<textarea name="reason" maxlength="500" required></textarea></label>
-      <button class="secondary" name="decision" value="reject">驳回订单</button>
-    </form>
-  </div>
+</div>
+<aside>
+<section class="panel" id="review-pricing"><h2>收费设置</h2>
+<p class="muted">审核确认后生成一票运单及客户应收。代理运输渠道与客户所选星睿服务分别保存。</p>
+{% include "tms/pricing_form.html" %}
 </section>
+<section class="panel">
+  <h2>审核驳回</h2>
+  {% if rejection_error %}<p class="error" role="alert">{{ rejection_error }}</p>{% endif %}
+  <form method="post" action="{{ url_for('tms_staff.decide', order_id=order.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="revision" value="{{ order.revision }}">
+    <label>可向客户显示的原因<textarea name="reason" maxlength="500" required></textarea></label>
+    <button class="secondary" name="decision" value="reject">审核驳回</button>
+  </form>
+</section>
+</aside></div>
+{% elif staff and order.status == 'approved' and receivable and receivable.shipment_id %}
+<details class="panel"{% if pricing_error %} open{% endif %}>
+<summary>调整已审核费用</summary>
+{% include "tms/pricing_form.html" %}
+</details>
+{% if adjustments %}
+<details class="panel" open><summary>费用调整记录</summary>
+<div class="table-wrap"><table><thead><tr><th>原金额</th><th>新金额</th><th>原因</th><th>操作人</th><th>时间（北京时间）</th></tr></thead>
+<tbody>{% for item in adjustments %}
+<tr><td>{{ item.previous.total }} {{ item.previous.currency }}</td><td>{{ item.revised.total }} {{ item.revised.currency }}</td><td>{{ item.reason }}</td><td>#{{ item.actor_id }}</td><td>{{ business_date(item.created_at) }}</td></tr>
+{% endfor %}</tbody></table></div></details>
+{% endif %}
 {% endif %}
 </article>

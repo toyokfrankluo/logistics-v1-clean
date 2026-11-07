@@ -1,0 +1,8 @@
+{% macro tracking_actions(shipment, allow_delete=false) %}
+<div class="inline-actions">
+{% for action, label in [('refresh_single_tracking', '刷新轨迹'), ('refresh_full_history', '刷新完整历史'), ('auto_sync_single', '同步运单'), ('delete_shipment', '删除历史运单')] if action != 'delete_shipment' or allow_delete %}
+<form method="post" action="{{ url_for('views.' ~ action, shipment_id=shipment.id) }}" onsubmit="return confirm('确定对该运单执行此操作？')">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="secondary">{{ label }}</button></form>
+{% endfor %}
+</div>
+{% endmacro %}

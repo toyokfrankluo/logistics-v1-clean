@@ -142,3 +142,57 @@ form.invoice-upload label.upload-zone { width: 100%; padding: 16px; justify-item
 }
 
 .product-photo { object-fit: contain; vertical-align: middle; }
+
+/* Shared internal workspace, including the existing management pages. */
+.sidebar a[aria-current="page"] { color: #124f99; background: #d7e8fc; border-radius: 8px; }
+.sidebar a:hover { background: #dfeaf7; border-radius: 8px; }
+.tms-admin main { padding: clamp(16px, 3vw, 36px); }
+.container { min-width: 0; }
+.tms-admin .container > form, .tms-admin form.track-form, .tms-admin .container > .table-wrap {
+  background: white; border: 1px solid var(--line); border-radius: 14px; padding: 16px;
+  margin-bottom: 16px;
+}
+.tms-admin .container form.row, .tms-admin form.editor-form {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 200px), 1fr)); align-items: end;
+  justify-items: stretch;
+}
+.tms-admin .container form.row label, .tms-admin form.editor-form label { width: 100%; }
+.tms-admin .btn { display: inline-flex; align-items: center; border: 1px solid #aec5df; padding: 8px 12px;
+  color: var(--blue); background: white; border-radius: 8px; text-decoration: none; font-weight: 650; }
+.tms-admin .btn-primary { background: var(--blue); color: white; }
+.tms-admin .btn-danger { color: #982c20; }
+.tms-admin .alert-info { background: #e7f1fd; color: #194d85; padding: 9px 13px; border-radius: 8px; }
+.tms-admin form.track-form { display: grid; width: 100%; justify-items: stretch; }
+.track-form .row { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); }
+.track-form label { width: auto !important; }
+.tracking-result { white-space: normal; }
+.track-entry { white-space: pre-wrap; overflow-wrap: anywhere; }
+.review-workspace { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(315px, 1fr); gap: 16px; }
+.review-workspace .detail-top-grid { display: block; }
+.review-workspace > *, .other-fees, .pricing-grid > *, .fee-row > * { min-width: 0; }
+form.pricing-form { justify-items: stretch; }
+form.pricing-form label { width: 100%; }
+.pricing-grid, .fee-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.pricing-grid.fixed-fees { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.other-fees { margin: 0; padding: 12px; border: 1px solid var(--line); border-radius: 8px; }
+.other-fees legend { font-weight: 700; }
+.other-fees small { display: block; margin-top: 6px; }
+.fee-row { background: #f3f7fb; padding: 10px; margin: 10px 0; border-radius: 8px; }
+.fee-row button { justify-self: start; }
+.charge-total { margin: 0; padding: 12px; border-radius: 8px; color: var(--blue); background: #e7f1fd;
+  display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.check-label { display: flex; gap: 8px; align-items: flex-start; }
+.check-label input { flex: none; width: 17px; height: 17px; min-height: 0; margin-top: 4px; }
+.editor-form > button { justify-self: start; }
+@media (max-width: 900px) {
+  .review-workspace { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 450px) {
+  .pricing-grid.fixed-fees { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+.shipment-actions { font-size: .92rem; }
+.shipment-actions[open] { white-space: normal; }
+.review-jump { display: none; }
+@media (max-width: 900px) {
+  .review-jump { display: inline-flex; margin-bottom: 12px; }
+}

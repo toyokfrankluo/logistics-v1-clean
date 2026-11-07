@@ -8,20 +8,19 @@
   <link rel="stylesheet" href="{{ url_for('static', filename='css/tms.css') }}">
   <script src="{{ url_for('static', filename='tms.js') }}" defer></script>
 </head>
-<body>
+{% set management = staff or legacy_admin %}
+<body{% if management %} class="tms-admin"{% endif %}>
   <header class="top">
-    <a class="brand" href="{{ url_for('tms_staff.queue' if staff else 'tms_client.orders') }}">
+    <a class="brand" href="{{ url_for(('tms_staff.queue' if config.TMS_ENABLED and current_user.is_admin else 'views.shipments') if management else 'tms_client.orders') }}">
       <span aria-hidden="true">XR</span><strong>星睿国际物流</strong>
     </a>
-    <span class="role">{{ '管理端' if staff else '客户操作端' }} · TMS 2.0</span>
+    <span class="role">{{ '管理端' if management else '客户操作端' }} · TMS 2.0</span>
   </header>
   <div class="shell">
-    {% if staff or g.tms_account %}
+    {% if management or g.tms_account %}
     <nav class="sidebar" aria-label="操作导航">
-      {% if staff %}
-      <a href="{{ url_for('tms_staff.queue') }}">订单审核</a>
-      <a href="{{ url_for('tms_staff.accounts') }}">客户账号</a>
-      <a href="{{ url_for('views.shipments') }}">返回物流管理</a>
+      {% if management %}
+      {% include "tms/admin_nav.html" %}
       {% else %}
       <a href="{{ url_for('tms_client.orders') }}">我的运单</a>
       <a href="{{ url_for('tms_client.upload') }}">Excel 导入</a>
@@ -35,7 +34,7 @@
     <main>
       {% if config.ISOLATED_MODE %}<p class="notice">本地验收环境 · 仅使用临时数据库</p>{% endif %}
       {% for category, message in get_flashed_messages(with_categories=true) %}
-      <p class="notice" role="status">{{ message }}</p>
+      <p class="{{ 'error' if category in ('danger', 'error') else 'notice' }}" role="status">{{ message }}</p>
       {% endfor %}
       {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
       {% block content %}{% endblock %}

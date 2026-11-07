@@ -44,3 +44,37 @@ class TmsAudit(db.Model, TimestampMixin):
     actor_type = db.Column(db.String(12), nullable=False)
     actor_id = db.Column(db.Integer, nullable=False)
     action = db.Column(db.String(20), nullable=False)
+
+
+class TmsReceivable(db.Model, TimestampMixin):
+    """One pricing draft or confirmed receivable per order, linked to one legacy shipment."""
+    __tablename__ = "tms_receivable"
+    __table_args__ = (
+        db.CheckConstraint(
+            "(shipment_id IS NULL AND confirmed_by IS NULL AND confirmed_at IS NULL "
+            "AND total IS NULL AND currency IS NULL) OR "
+            "(shipment_id IS NOT NULL AND confirmed_by IS NOT NULL AND confirmed_at IS NOT NULL "
+            "AND agent_id IS NOT NULL AND agent_service IS NOT NULL AND total IS NOT NULL AND total >= 0 "
+            "AND currency IS NOT NULL)",
+            name="ck_tms_receivable_confirmation"),
+    )
+    order_id = db.Column(db.Integer, db.ForeignKey("tms_order.id", ondelete="RESTRICT"), primary_key=True)
+    shipment_id = db.Column(db.Integer, db.ForeignKey("shipment.id", ondelete="RESTRICT"), unique=True)
+    agent_id = db.Column(db.Integer, db.ForeignKey("carrier_agent.id", ondelete="RESTRICT"))
+    agent_service = db.Column(db.String(100))
+    details = db.Column(db.JSON, nullable=False)
+    total = db.Column(db.Numeric(18, 2))
+    currency = db.Column(db.String(3))
+    confirmed_by = db.Column(db.Integer)
+    confirmed_at = db.Column(db.DateTime)
+
+
+class TmsChargeAdjustment(db.Model, TimestampMixin):
+    __tablename__ = "tms_charge_adjustment"
+    id = db.Column(db.Integer, primary_key=True)
+    order_id = db.Column(db.Integer, db.ForeignKey("tms_receivable.order_id", ondelete="RESTRICT"),
+                         nullable=False, index=True)
+    previous = db.Column(db.JSON, nullable=False)
+    revised = db.Column(db.JSON, nullable=False)
+    reason = db.Column(db.String(500), nullable=False)
+    actor_id = db.Column(db.Integer, nullable=False)

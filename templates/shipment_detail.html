@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% from "tms/shipment_actions.html" import tracking_actions with context %}
+{% block title %}运单详情{% endblock %}
+{% block content %}
+<div class="heading"><div><p class="kicker">运单详情</p><h1>{{ shipment.tracking_number }}</h1></div><a class="button secondary" href="{{ url_for('views.shipments') }}">返回列表</a></div>
+<section class="panel"><h2>基础资料</h2><dl class="fields">
+{% for label, value in [('客户', shipment.customer.name if shipment.customer else ''), ('代理', shipment.agent.name if shipment.agent else ''), ('代理单号', shipment.shipment_id), ('承运单号', shipment.third_party_tracking_number), ('运输服务', shipment.channel), ('目的地', shipment.destination), ('箱数', shipment.pieces), ('重量 kg', shipment.weight), ('物流状态', shipment.status)] %}
+<div><dt>{{ label }}</dt><dd>{{ value or '—' }}</dd></div>{% endfor %}
+</dl></section>
+<section class="panel"><h2>收费明细</h2>
+{% if receivable %}{% include "tms/charge_summary.html" %}{% else %}<p>历史费用 {{ "%.2f"|format(shipment.fee or 0) }} CNY</p>{% endif %}</section>
+<section class="panel"><h2>物流轨迹</h2>
+<a href="{{ url_for('views.manual_tracks', shipment_id=shipment.id) }}">查看手工轨迹</a> · <a href="{{ url_for('views.track') }}">查询物流轨迹</a>
+<ol class="timeline">{% for track in tracks %}<li><small>{{ track.happen_time }}</small><span>{{ track.location or '' }} {{ track.description }}</span></li>{% else %}<li>暂无手工轨迹。</li>{% endfor %}</ol></section>
+{% if current_user.is_admin %}
+<section class="panel"><h2>运单操作</h2><div class="inline-actions">
+<a class="button secondary" href="{{ url_for('views.edit_shipment', shipment_id=shipment.id) }}">编辑运单</a>
+{{ tracking_actions(shipment, not receivable) }}
+</div></section>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,8 @@
+{% set charges = receivable.details %}
+<dl class="fields">
+{% for key, label in [('base','基础运费'), ('surcharge','附加费'), ('operation','操作费'), ('high_value','超值费')] %}
+<div><dt>{{ label }}</dt><dd>{{ charges[key] }} {{ receivable.currency }}</dd></div>
+{% endfor %}
+{% for item in charges.other %}<div><dt>{{ item.name }}</dt><dd>{{ item.amount }} {{ item.currency }}</dd></div>{% endfor %}
+<div><dt>客户应收总额</dt><dd><strong>{{ "%.2f"|format(receivable.total) }} {{ receivable.currency }}</strong></dd></div>
+</dl>

@@ -1,8 +1,8 @@
 {% extends "base.html" %}
 {% block content %}
-<h2>轨迹查询</h2>
+<div class="heading"><div><p class="kicker">运输进度</p><h1>轨迹查询</h1><p>可查询单票或粘贴多票单号，手工轨迹随结果显示。</p></div></div>
 
-<form method="post" class="mb-3">
+<form method="post" class="track-form">
 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <div class="row g-3">
     {% if not public_mode %}
@@ -54,10 +54,10 @@
   <hr>
   <h3>查询结果</h3>
   {% for no, r in results.items() %}
-  <details open class="tracking-result">
+  <details open class="panel tracking-result">
     <summary>{{ r.get('tracking_number', no) }}</summary>
     {% if r.error %}<p role="alert">{{ r.error }}</p>{% endif %}
-    <div style="white-space:pre-wrap">{{ r.tracks or '暂无轨迹' }}</div>
+    <ol class="timeline">{% for line in (r.tracks or '暂无轨迹').splitlines() if line.strip() %}<li class="track-entry">{{ line }}</li>{% endfor %}</ol>
   </details>
   {% endfor %}
 {% endif %}

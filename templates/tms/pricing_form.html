@@ -1,0 +1,50 @@
+{% set value = posted if posted is defined else (receivable.details if receivable else {}) %}
+{% set adjusting = order.status == 'approved' %}
+{% set active_agent = value.agent_id if posted is defined else (receivable.agent_id if receivable else none) %}
+{% set agent_service = value.agent_service if posted is defined else (receivable.agent_service if receivable else '') %}
+<form method="post" class="pricing-form" action="{{ url_for('tms_staff.decide', order_id=order.id) }}" data-pricing>
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <input type="hidden" name="revision" value="{{ order.revision }}">
+  {% if pricing_error %}<p class="error" role="alert">{{ pricing_error }}</p>{% endif %}
+  {% if not adjusting %}
+  <label>实际物流代理<select name="agent_id" required><option value="">请选择启用的代理</option>
+  {% for agent in agents %}<option value="{{ agent.id }}"{% if agent.id == active_agent %} selected{% endif %}>{{ agent.name }}</option>{% endfor %}
+  </select></label>
+  <label>实际代理运输渠道<input name="agent_service" value="{{ agent_service or '' }}" maxlength="100" required></label>
+  {% endif %}
+  <div class="pricing-grid">
+    <label>账单币种<select name="currency" required><option value="">请选择</option>
+    {% for currency in currencies %}<option{% if currency == value.currency %} selected{% endif %}>{{ currency }}</option>{% endfor %}</select></label>
+    <label>计费方式<select name="unit" required><option value="">请选择</option>
+    {% for key, label in units.items() %}<option value="{{ key }}"{% if key == value.unit %} selected{% endif %}>按 {{ label }}</option>{% endfor %}</select></label>
+    <label>计费数量<input name="quantity" inputmode="decimal" value="{{ value.quantity or '' }}" maxlength="24" required></label>
+    <label>计费单价<input name="rate" inputmode="decimal" value="{{ value.rate or '' }}" maxlength="24" required></label>
+  </div>
+  <label>计费数量来源<select name="quantity_source" required><option value="">请选择</option>
+  {% for key, label in sources.items() %}<option value="{{ key }}"{% if key == value.quantity_source %} selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
+  <label>数量来源说明<input name="source_note" maxlength="200" value="{{ value.source_note or '' }}" placeholder="选择其他来源时必填"></label>
+  <p class="muted">使用客户申报重量时请选「客户申报」。基础运费 <output data-base>—</output></p>
+  <div class="pricing-grid fixed-fees">
+    {% for key, label in fixed.items() %}<label>{{ label }}<input name="{{ key }}" inputmode="decimal" value="{{ value.get(key, '') }}" maxlength="24" required placeholder="无费用请填 0"></label>{% endfor %}
+  </div>
+  <fieldset class="other-fees">
+    <legend>其他费用</legend>
+    <label>收费确认<select name="other_mode" required>
+    {% for key, label in [('', '请选择'), ('none', '无其他费用'), ('items', '有其他费用')] %}
+    <option value="{{ key }}"{% if key == value.other_mode %} selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
+    <div data-fee-lines>
+    {% for row in value.other or [] %}{% include "tms/fee_row.html" %}{% endfor %}
+    </div>
+    <template data-fee-template>{% with row={} %}{% include "tms/fee_row.html" %}{% endwith %}</template>
+    <button type="button" class="secondary" data-add-fee>＋ 添加其他费用</button>
+    <small>其他费用小计 <output data-other-total>—</output>。单票最多 200 项，所有币种须一致。</small>
+  </fieldset>
+  <p class="charge-total"><strong>客户应收总额</strong><output data-total aria-live="polite">填写完整后计算</output></p>
+  {% if adjusting %}<label>调整原因<textarea name="adjustment_reason" maxlength="500" required>{{ value.adjustment_reason or '' }}</textarea></label>{% endif %}
+  <label>审核备注（内部）<textarea name="review_note" maxlength="500">{{ value.review_note or '' }}</textarea></label>
+  <label class="check-label"><input type="checkbox" name="confirmed" value="yes" required>我已核对收费项目、计费来源及客户应收总额</label>
+  <div class="inline-actions">
+  {% if adjusting %}<button name="decision" value="adjust">确认费用调整</button>
+  {% else %}<button class="secondary" name="decision" value="draft" formnovalidate>保存草稿</button><button name="decision" value="approve">审核通过</button>{% endif %}
+  </div>
+</form>

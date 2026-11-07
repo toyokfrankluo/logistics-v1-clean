@@ -17,12 +17,15 @@ from flask import (
 )
 from flask_login import current_user, logout_user
 from sqlalchemy import func, or_, select, text, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from werkzeug.security import check_password_hash, generate_password_hash
 
-from models import CarrierAgent, Customer, Shipment, db
+from models import CarrierAgent, Customer, ManualTrack, Shipment, db
 from tms_invoice import InvoiceError, MAX_UPLOAD_BYTES, SERVICES, blank_invoice, parse_invoice
-from tms_models import TmsAccount, TmsAudit, TmsOrder
+from tms_models import TmsAccount, TmsAudit, TmsOrder, TmsReceivable, TmsChargeAdjustment
+from tms_billing import (
+    CURRENCIES, FIXED, SOURCES, UNITS, billing_available, confirm_price, price_form, valid_draft,
+)
 from tms_xlsx_images import MEDIA_PART, image_type
 
 client = Blueprint("tms_client", __name__, url_prefix="/tms/customer")
@@ -34,7 +37,7 @@ DUMMY_HASH = generate_password_hash(token_hex(32))
 STATUS_LABELS = {"draft": "待确认", "pending": "待审核", "approved": "审核通过", "rejected": "审核驳回"}
 AUDIT_LABELS = {
     "upload": "上传发票", "replace": "更正发票", "confirm": "提交审核",
-    "approve": "审核通过", "reject": "审核驳回",
+    "approve": "审核通过", "reject": "审核驳回", "pricing_draft": "保存收费草稿", "adjust": "调整费用",
 }
 BUSINESS_TIME = timezone(timedelta(hours=8))
 ORDER_FILTERS = {
@@ -89,14 +92,14 @@ def init_tms(app):
         if not confirm:
             raise click.UsageError("请先核对数据库目标并备份，再明确使用 --confirm。")
         create_tms_schema()
-        click.echo("TMS v1 表已就绪。")
+        click.echo("TMS 表已就绪。")
 
 
 def create_tms_schema():
     with db.engine.begin() as connection:
         if connection.dialect.name == "postgresql":
             connection.execute(text("SELECT pg_advisory_xact_lock(651360348)"))
-        for model in (TmsAccount, TmsOrder, TmsAudit):
+        for model in (TmsAccount, TmsOrder, TmsAudit, TmsReceivable, TmsChargeAdjustment):
             model.__table__.create(connection, checkfirst=True)
 
 
@@ -188,7 +191,10 @@ def legacy_duplicate(customer_id, key):
 def invoice_totals(invoice):
     declared_weight = sum(Decimal(box["weight_kg"]) for box in invoice["boxes"])
     declared_value = sum(Decimal(item["total_usd"]) for item in invoice["declarations"])
-    return {"weight": format(declared_weight.normalize(), "f"), "value": format(declared_value, ",.2f")}
+    volume = sum((Decimal(box["length_cm"]) * Decimal(box["width_cm"]) * Decimal(box["height_cm"])
+                  for box in invoice["boxes"]), Decimal("0")) / Decimal("1000000")
+    return {"weight": format(declared_weight.normalize(), "f"), "value": format(declared_value, ",.2f"),
+            "volume": format(volume, ".3f")}
 
 
 def business_date(value):
@@ -330,6 +336,10 @@ def upload():
         values = dict(number_key=key, file_sha256=digest, invoice=invoice, workbook=raw)
         if order:
             update_order(order, dict(**values, status="draft", rejection_reason=None))
+            if billing_available():
+                draft_charge = db.session.get(TmsReceivable, order.id)
+                if draft_charge and draft_charge.shipment_id is None:
+                    db.session.delete(draft_charge)
         else:
             order = TmsOrder(customer_id=customer_id, **values)
             db.session.add(order)
@@ -354,8 +364,14 @@ def order_detail(order, **context):
                                .order_by(TmsAudit.id.desc()).limit(30)).all()
     events = [(AUDIT_LABELS[action], business_date(timestamp)) for action, timestamp in audit
               if action in AUDIT_LABELS and timestamp]
-    return page(template, order=order, totals=invoice_totals(order.invoice),
-                business_date=business_date, events=events, **context)
+    receivable = db.session.get(TmsReceivable, order.id) if billing_available() else None
+    shipment = (db.session.get(Shipment, receivable.shipment_id)
+                if request.blueprint == staff.name and receivable and receivable.shipment_id else None)
+    tracks = (db.session.scalars(select(ManualTrack).where(ManualTrack.shipment_id == shipment.id)
+                                 .order_by(ManualTrack.happen_time.desc())).all() if shipment else [])
+    return page(template, order=order, totals=invoice_totals(order.invoice), shipment=shipment, tracks=tracks,
+                business_date=business_date, events=events, receivable=receivable,
+                units=UNITS, sources=SOURCES, currencies=CURRENCIES, fixed=FIXED, **context)
 
 
 @client.get("/template")
@@ -456,11 +472,23 @@ def accounts():
 
 def accounts_page(*, errors=None, customer_id=None, username=""):
     customers = Customer.query.order_by(Customer.name).all()
-    accounts = db.session.execute(select(TmsAccount.username, TmsAccount.active, Customer.name)
+    accounts = db.session.execute(select(TmsAccount.id, TmsAccount.username, TmsAccount.active, Customer.name)
                                  .join(Customer, Customer.id == TmsAccount.customer_id)
                                  .order_by(TmsAccount.id.desc())).all()
     return page("accounts", customers=customers, accounts=accounts, errors=errors or {},
                 selected_customer=customer_id, username=username)
+
+
+@staff.post("/accounts/<int:account_id>/availability")
+def account_availability(account_id):
+    account = db.get_or_404(TmsAccount, account_id)
+    state = request.form.get("state")
+    if state not in {"enable", "disable"}:
+        abort(400)
+    account.active = state == "enable"
+    db.session.commit()
+    flash("客户账号状态已更新。", "success")
+    return redirect(url_for("tms_staff.accounts"))
 
 
 @staff.get("/")
@@ -472,38 +500,121 @@ def reviewable_order(order_id):
     return TmsOrder.query.filter(TmsOrder.status != "draft", TmsOrder.id == order_id).first_or_404()
 
 
+def staff_detail(order, **context):
+    agents = CarrierAgent.query.filter_by(is_active=True).order_by(CarrierAgent.name).all()
+    adjustments = (db.session.scalars(select(TmsChargeAdjustment).where(
+        TmsChargeAdjustment.order_id == order.id).order_by(TmsChargeAdjustment.id.desc())).all()
+        if order.status == "approved" and billing_available() else [])
+    return order_detail(order, agents=agents, customer=db.session.get(Customer, order.customer_id),
+                        adjustments=adjustments, **context)
+
+
 @staff.get("/orders/<int:order_id>")
 def review(order_id):
-    order = reviewable_order(order_id)
-    agents = CarrierAgent.query.filter_by(is_active=True).order_by(CarrierAgent.name).all()
-    return order_detail(order, agents=agents, customer=db.session.get(Customer, order.customer_id))
+    return staff_detail(reviewable_order(order_id))
 
 
 @staff.post("/orders/<int:order_id>/decision")
 def decide(order_id):
     order = reviewable_order(order_id)
-    if order.status != "pending" or request.form.get("revision", type=int) != order.revision:
-        abort(409, "订单刚刚变更，请刷新后再审核。")
     decision = request.form.get("decision")
-    if decision == "approve":
-        agent = db.session.get(CarrierAgent, request.form.get("agent_id", type=int) or 0)
-        service = request.form.get("agent_service", "").strip()
-        if not agent or not agent.is_active or not 1 <= len(service) <= 100:
-            abort(400, "请选择启用的代理，并填写代理服务。")
-        if legacy_duplicate(order.customer_id, order.number_key):
-            abort(409, "本客户已存在同一单号的运单，请先人工核对。")
-        changes = {"status": "approved", "agent_id": agent.id, "agent_service": service}
-    elif decision == "reject":
+    if decision not in {"approve", "reject", "draft", "adjust"}:
+        abort(400)
+    required_status = "approved" if decision == "adjust" else "pending"
+    if order.status != required_status or request.form.get("revision", type=int) != order.revision:
+        abort(409, "订单刚刚变更，请刷新后再审核。")
+
+    if decision == "reject":
         reason = request.form.get("reason", "").strip()
         if not 1 <= len(reason) <= 500:
-            abort(400, "请填写可向客户显示的驳回原因。")
-        changes = {"status": "rejected", "rejection_reason": reason}
+            return staff_detail(order, rejection_error="请填写可向客户显示的驳回原因。"), 400
+        update_order(order, {"status": "rejected", "rejection_reason": reason})
+        history(order, "reject")
     else:
-        abort(400)
-    update_order(order, changes)
-    history(order, decision)
-    db.session.commit()
+        if not billing_available():
+            abort(503, "收费功能待执行增量迁移。")
+        try:
+            save_pricing(order, decision)
+        except ValueError as error:
+            return staff_detail(order, pricing_error=str(error), posted=pricing_input()), 400
+        except SQLAlchemyError:
+            db.session.rollback()
+            abort(409, "收费或运单保存失败，所有修改已回滚。")
+    try:
+        db.session.commit()
+    except SQLAlchemyError:
+        db.session.rollback()
+        abort(409, "审核保存失败，所有修改已回滚。")
     return redirect(url_for("tms_staff.review", order_id=order_id))
+
+
+def pricing_input():
+    try:
+        fields = price_form(request.form)
+        valid_draft(fields)
+    except ValueError:
+        return {}
+    fields.update(agent_id=request.form.get("agent_id", type=int), agent_service=request.form.get("agent_service", "")[:100],
+                  adjustment_reason=request.form.get("adjustment_reason", "")[:500])
+    return fields
+
+
+def save_pricing(order, decision):
+    form = request.form
+    values = price_form(form)
+    valid_draft(values)
+    receivable = db.session.get(TmsReceivable, order.id)
+    if decision == "adjust":
+        if not receivable or receivable.shipment_id is None:
+            raise ValueError("该历史订单没有已确认的收费记录。")
+        reason = form.get("adjustment_reason", "").strip()
+        if not 1 <= len(reason) <= 500:
+            raise ValueError("请填写本次费用调整的原因。")
+        details = confirm_price(values, form)
+        update_order(order, {})
+        db.session.add(TmsChargeAdjustment(
+            order_id=order.id, previous=receivable.details, revised=details,
+            reason=reason, actor_id=current_user.id,
+        ))
+        receivable.details, receivable.total, receivable.currency = details, Decimal(details["total"]), details["currency"]
+        history(order, "adjust")
+        return
+
+    agent_id = form.get("agent_id", type=int)
+    service = form.get("agent_service", "").strip()
+    if len(service) > 100 or (agent_id is not None and not 0 < agent_id < 2**31):
+        raise ValueError("代理或运输渠道格式不正确。")
+    agent = db.session.get(CarrierAgent, agent_id, with_for_update=True) if agent_id else None
+    if (agent_id or decision == "approve") and (not agent or not agent.is_active):
+        raise ValueError("请选择启用的实际物流代理。")
+    if decision == "approve" and not service:
+        raise ValueError("请填写实际代理运输渠道。")
+    details = confirm_price(values, form) if decision == "approve" else values
+    if decision == "approve":
+        db.session.get(Customer, order.customer_id, with_for_update=True)
+        if legacy_duplicate(order.customer_id, order.number_key):
+            abort(409, "本客户已存在同一单号的运单，请先人工核对。")
+        update_order(order, {"status": "approved", "agent_id": agent.id, "agent_service": service})
+        invoice = order.invoice
+        shipment = Shipment(
+            tracking_number=invoice["customer_number"], customer_id=order.customer_id, agent_id=agent.id,
+            destination=invoice["address"]["country"], channel=invoice["service"],
+            pieces=len(invoice["boxes"]), weight=float(invoice_totals(invoice)["weight"]),
+            status="已创建",
+        )
+        db.session.add(shipment)
+        db.session.flush()
+    else:
+        update_order(order, {})
+    if receivable is None:
+        receivable = TmsReceivable(order_id=order.id)
+        db.session.add(receivable)
+    receivable.details, receivable.agent_id, receivable.agent_service = details, agent_id, service or None
+    if decision == "approve":
+        receivable.shipment_id = shipment.id
+        receivable.total, receivable.currency = Decimal(details["total"]), details["currency"]
+        receivable.confirmed_by, receivable.confirmed_at = current_user.id, datetime.now(timezone.utc).replace(tzinfo=None)
+    history(order, "approve" if decision == "approve" else "pricing_draft")
 
 
 @staff.get("/orders/<int:order_id>/invoice")

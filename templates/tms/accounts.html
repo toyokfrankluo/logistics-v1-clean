@@ -1,5 +1,21 @@
 {% extends "tms/layout.html" %}
-{% block title %}开通客户账号{% endblock %}
+{% block title %}开通客户账号<section class="panel"><h2>客户资料</h2>
+<div class="table-wrap"><table><thead><tr><th>客户名称</th><th>邮箱</th><th>电话</th><th>操作</th></tr></thead>
+<tbody>{% for customer in customers %}
+<tr><td>{{ customer.name }}</td><td>{{ customer.email or '—' }}</td><td>{{ customer.phone or '—' }}</td>
+<td><a href="{{ url_for('views.edit_customer', customer_id=customer.id, return_to='tms') }}">编辑资料</a></td></tr>
+{% else %}<tr><td colspan="4" class="empty">暂无客户。</td></tr>{% endfor %}</tbody></table></div>
+<details><summary>新增客户资料</summary>
+<form method="post" action="{{ url_for('views.customers') }}" class="editor-form">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <input type="hidden" name="return_to" value="tms">
+  <label>客户名称<input name="name" maxlength="100" required></label>
+  <label>邮箱<input type="email" name="email" maxlength="120"></label>
+  <label>电话<input name="phone" maxlength="50"></label>
+  <label>银行信息<textarea name="bankinfo"></textarea></label>
+  <button>保存客户资料</button>
+</form></details></section>
+{% endblock %}
 {% block content %}
 <div class="heading">
   <div><p class="kicker">星睿管理端</p><h1>开通客户账号</h1></div>
@@ -35,12 +51,30 @@
 <section class="panel">
   <h2>已开通账号</h2>
   <div class="table-wrap">
-    <table><thead><tr><th>登录账号</th><th>关联客户</th><th>状态</th></tr></thead><tbody>
-      {% for account_name, active, customer_name in accounts %}
-      <tr><td>{{ account_name }}</td><td>{{ customer_name }}</td><td>{{ '启用' if active else '停用' }}</td></tr>
-      {% else %}<tr><td class="empty" colspan="3">暂无客户账号。</td></tr>{% endfor %}
+    <table><thead><tr><th>登录账号</th><th>关联客户</th><th>状态</th><th>操作</th></tr></thead><tbody>
+      {% for account_id, account_name, active, customer_name in accounts %}
+      <tr><td>{{ account_name }}</td><td>{{ customer_name }}</td><td><span class="badge {{ 'approved' if active else '' }}">{{ '启用' if active else '停用' }}</span></td>
+      <td><form method="post" action="{{ url_for('tms_staff.account_availability', account_id=account_id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="secondary" name="state" value="{{ 'disable' if active else 'enable' }}">{{ '停用登录' if active else '启用登录' }}</button></form></td></tr>
+      {% else %}<tr><td class="empty" colspan="4">暂无客户账号。</td></tr>{% endfor %}
     </tbody></table>
   </div>
 </section>
 </div>
+<section class="panel"><h2>客户资料</h2>
+<div class="table-wrap"><table><thead><tr><th>客户名称</th><th>邮箱</th><th>电话</th><th>操作</th></tr></thead>
+<tbody>{% for customer in customers %}
+<tr><td>{{ customer.name }}</td><td>{{ customer.email or '—' }}</td><td>{{ customer.phone or '—' }}</td>
+<td><a href="{{ url_for('views.edit_customer', customer_id=customer.id, return_to='tms') }}">编辑资料</a></td></tr>
+{% else %}<tr><td colspan="4" class="empty">暂无客户。</td></tr>{% endfor %}</tbody></table></div>
+<details><summary>新增客户资料</summary>
+<form method="post" action="{{ url_for('views.customers') }}" class="editor-form">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <input type="hidden" name="return_to" value="tms">
+  <label>客户名称<input name="name" maxlength="100" required></label>
+  <label>邮箱<input type="email" name="email" maxlength="120"></label>
+  <label>电话<input name="phone" maxlength="50"></label>
+  <label>银行信息<textarea name="bankinfo"></textarea></label>
+  <button>保存客户资料</button>
+</form></details></section>
 {% endblock %}

@@ -1,0 +1,18 @@
+{% set entries = [
+  ('tms_staff.queue', '订单审核', true, ['tms_staff.review', 'tms_staff.decide']),
+  ('tms_staff.accounts', '客户账号', true, ['views.edit_customer', 'views.customers', 'tms_staff.account_availability']),
+  ('views.shipments', '运单管理', false, ['shipments', 'views.shipment_detail', 'views.edit_shipment', 'views.manual_tracks']),
+  ('views.agents', '代理管理', true, ['agents', 'views.edit_agent', 'edit_agent']),
+  ('views.finance', '财务模块', false, ['finance']),
+  ('views.bank_accounts', '收款账户管理', true, ['bank_accounts', 'views.edit_bank_account']),
+  ('views.track', '轨迹查询', false, ['track', 'views.track_17track'])
+] %}
+{% for endpoint, label, admin_only, also in entries %}
+  {% if (not admin_only or current_user.is_admin) and (not endpoint.startswith('tms_') or config.TMS_ENABLED) %}
+  <a href="{{ url_for(endpoint) }}"{% if request.endpoint == endpoint or request.endpoint in also %} aria-current="page"{% endif %}>{{ label }}</a>
+  {% endif %}
+{% endfor %}
+<form action="{{ url_for('views.logout') }}" method="post">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <button class="plain">退出登录</button>
+</form>

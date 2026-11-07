@@ -1,0 +1,9 @@
+<div class="fee-row" data-fee-row>
+  <label>费用名称<input name="other_name" maxlength="100" value="{{ row.name or '' }}" required></label>
+  <label>金额<input name="other_amount" inputmode="decimal" maxlength="24" value="{{ row.amount or '' }}" required></label>
+  <label>币种<select name="other_currency" required><option value="">请选择</option>
+  {% for currency in currencies %}<option{% if currency == row.currency %} selected{% endif %}>{{ currency }}</option>{% endfor %}
+  </select></label>
+  <label>备注（可选）<input name="other_note" maxlength="200" value="{{ row.note or '' }}"></label>
+  <button type="button" class="secondary" data-remove-fee>删除此项</button>
+</div>

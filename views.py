@@ -7,6 +7,8 @@ from sqlalchemy.orm import joinedload, selectinload
 from datetime import datetime, timedelta
 from sqlalchemy import inspect as sqlalchemy_inspect, MetaData, Table, select, func
 from utils import export_invoice
+from tms_models import TmsOrder, TmsReceivable
+from tms_billing import billing_available, linked_receivable, receivable_totals
 import requests
 import carrier_http
 import json
@@ -354,9 +356,10 @@ def agents():
         flash("代理已添加", "success")
         return redirect(url_for("views.agents"))
 
-    data = CarrierAgent.query.filter_by(is_active=True).all()
-    return render_template("agent.html", agents=data)
-
+    data = CarrierAgent.query.order_by(CarrierAgent.is_active.desc(), CarrierAgent.name).all()
+    counts = dict(db.session.execute(select(Shipment.agent_id, func.count(Shipment.id))
+                                    .group_by(Shipment.agent_id)).all())
+    return render_template("agent.html", agents=data, shipment_counts=counts)
 
 @views.route("/agents/<int:agent_id>/edit", methods=["GET", "POST"])
 @login_required
@@ -399,30 +402,57 @@ def delete_agent(agent_id):
 @login_required
 def shipments():
     query = Shipment.query.order_by(Shipment.created_at.desc(), Shipment.id.desc())
-
-    # 从 URL 获取查询参数
-    customer = request.args.get("customer")
-    agent = request.args.get("agent")
-    tracking_number = request.args.get("tracking_number")
-
-    if customer:
-        query = query.join(Customer).filter(Customer.name.ilike(f"%{customer}%"))
-    if agent:
-        query = query.join(CarrierAgent).filter(CarrierAgent.name.ilike(f"%{agent}%"))
-    if tracking_number:
-        query = query.filter(db.or_(Shipment.tracking_number.ilike(f"%{tracking_number.strip()}%"), Shipment.shipment_id.ilike(f"%{tracking_number.strip()}%")))
-
-    page = request.args.get('page', 1, type=int)
+    filters = {key: request.args[key].strip()[:200] for key in (
+        "customer", "agent", "tracking_number", "customer_number", "supplier_number",
+        "service", "country", "date_from", "date_to", "review", "status",
+    ) if request.args.get(key, "").strip()}
+    if filters.get("customer"):
+        query = query.join(Customer).filter(Customer.name.icontains(filters["customer"], autoescape=True))
+    if filters.get("agent"):
+        query = query.join(CarrierAgent).filter(CarrierAgent.name.icontains(filters["agent"], autoescape=True))
+    for key, columns in {
+        "tracking_number": (Shipment.tracking_number, Shipment.shipment_id),
+        "customer_number": (Shipment.tracking_number,),
+        "supplier_number": (Shipment.shipment_id, Shipment.third_party_tracking_number),
+        "service": (Shipment.channel,), "country": (Shipment.destination,), "status": (Shipment.status,),
+    }.items():
+        if key in filters:
+            query = query.filter(db.or_(*(col.icontains(filters[key], autoescape=True) for col in columns)))
+    try:
+        query = filter_shipment_dates(query, filters.get("date_from"), filters.get("date_to"))
+    except (ValueError, OverflowError):
+        abort(400, "日期范围无效")
+    has_receivables = billing_available()
+    if filters.get("review") in {"approved", "legacy"}:
+        if has_receivables:
+            linked = select(TmsReceivable.order_id).where(TmsReceivable.shipment_id == Shipment.id).exists()
+            query = query.filter(linked if filters["review"] == "approved" else ~linked)
+        elif filters["review"] == "approved":
+            query = query.filter(db.false())
+    page = request.args.get("page", 1, type=int)
     if not 1 <= page <= 2**31 - 1:
         abort(404)
     pagination = query.options(joinedload(Shipment.customer), joinedload(Shipment.agent)).paginate(
         page=page, per_page=50
     )
-    filters = {key: value for key, value in (
-        ('customer', customer), ('agent', agent), ('tracking_number', tracking_number)
-    ) if value}
+    receivables = {}
+    if has_receivables and pagination.items:
+        receivables = {row.shipment_id: row for row in db.session.scalars(select(TmsReceivable).where(
+            TmsReceivable.shipment_id.in_([shipment.id for shipment in pagination.items])
+        ))}
     return render_template("shipments.html", shipments=pagination.items,
-                           pagination=pagination, filters=filters)
+                           pagination=pagination, filters=filters, receivables=receivables)
+
+
+@views.get("/shipments/<int:shipment_id>/detail")
+@login_required
+def shipment_detail(shipment_id):
+    shipment = db.get_or_404(Shipment, shipment_id)
+    receivable = linked_receivable(shipment_id)
+    if receivable and current_user.is_admin and current_app.config.get("TMS_ENABLED"):
+        return redirect(url_for("tms_staff.review", order_id=receivable.order_id))
+    tracks = ManualTrack.query.filter_by(shipment_id=shipment_id).order_by(ManualTrack.happen_time.desc()).all()
+    return render_template("shipment_detail.html", shipment=shipment, receivable=receivable, tracks=tracks)
 
 
 @views.route("/shipments/add", methods=["GET", "POST"])
@@ -446,7 +476,15 @@ def add_shipment():
                     raise ValueError()
         except (ValueError, TypeError, OverflowError):
             return '运单号、件数、费用或客户代理选择无效', 400
-        if Shipment.query.filter_by(tracking_number=tracking_number).first():
+        customer_id = request.form.get("customer_id", type=int)
+        if customer_id:
+            db.session.get(Customer, customer_id, with_for_update=True)
+        duplicate = Shipment.query.filter(db.or_(
+            Shipment.tracking_number == tracking_number,
+            db.and_(Shipment.customer_id == customer_id,
+                    func.upper(func.trim(Shipment.tracking_number)) == tracking_number.upper()),
+        )).first()
+        if duplicate:
             flash(f"运单号 {tracking_number} 已存在，请更换", "danger")
             return redirect(url_for("views.add_shipment"))
 
@@ -579,6 +617,17 @@ def add_shipment():
 @login_required
 def edit_shipment(shipment_id):
     s = Shipment.query.get_or_404(shipment_id)
+    if linked_receivable(shipment_id):
+        if request.method == "POST":
+            from shipment_updates import update_shipment
+            allowed = {"shipment_id", "third_party_tracking_number", "status"}
+            if set(request.form) - allowed - {"csrf_token"} or any(len(request.form.get(field, "")) > 50 for field in allowed):
+                abort(409, "已审核的运单只可在这里维护物流单号和状态。收费请使用调整流程。")
+            update_shipment(s, request.form)
+            db.session.commit()
+            flash("运单物流资料已更新。", "success")
+            return redirect(url_for("views.shipment_detail", shipment_id=shipment_id))
+        return render_template("shipment_logistics.html", shipment=s)
     if request.method == "POST":
         from shipment_updates import update_shipment
         try:
@@ -813,23 +862,25 @@ def manual_tracks(shipment_id):
 @login_required
 def customers():
     if request.method == "POST":
+        accounts_return = request.form.get("return_to") == "tms" and current_app.config.get("TMS_ENABLED")
+        destination = "tms_staff.accounts" if accounts_return else "views.customers"
         name = request.form.get("name", "").strip()
         bankinfo = request.form.get("bankinfo", "").strip()
         email = request.form.get("email", "").strip() or None
         phone = request.form.get("phone", "").strip() or None
         if not name:
             flash("客户名称不能为空", "danger")
-            return redirect(url_for("views.customers"))
+            return redirect(url_for(destination))
 
         if len(name) > 100 or (email and len(email) > 120) or (phone and len(phone) > 50):
             flash("客户信息超出长度限制", "danger")
-            return redirect(url_for("views.customers"))
+            return redirect(url_for(destination))
         if Customer.query.filter_by(name=name).first():
             flash('客户名称已存在，请使用现有客户', 'danger')
-            return redirect(url_for('views.customers'))
+            return redirect(url_for(destination))
         if email and Customer.query.filter_by(email=email).first():
             flash("客户邮箱已被其他客户使用", "danger")
-            return redirect(url_for("views.customers"))
+            return redirect(url_for(destination))
         c = Customer(name=name, bank_info=bankinfo, email=email, phone=phone)
         db.session.add(c)
         try:
@@ -837,9 +888,9 @@ def customers():
         except Exception:
             db.session.rollback()
             flash("客户信息保存失败，请检查填写内容", "danger")
-            return redirect(url_for("views.customers"))
+            return redirect(url_for(destination))
         flash("客户已添加", "success")
-        return redirect(url_for("views.customers"))
+        return redirect(url_for(destination))
 
     data = Customer.query.all()
     return render_template("customers.html", customers=data)
@@ -849,6 +900,7 @@ def customers():
 @login_required
 def edit_customer(customer_id):
     customer = Customer.query.get_or_404(customer_id)
+    accounts_return = request.values.get("return_to") == "tms" and current_app.config.get("TMS_ENABLED")
     if request.method == "POST":
         name = request.form.get("name", "").strip()
         email = request.form.get("email", "").strip() or None
@@ -870,8 +922,8 @@ def edit_customer(customer_id):
             db.session.rollback()
             return "客户信息保存失败，请检查填写内容", 400
         flash("客户信息已更新", "success")
-        return redirect(url_for("views.customers"))
-    return render_template("edit_customer.html", customer=customer)
+        return redirect(url_for("tms_staff.accounts" if accounts_return else "views.customers"))
+    return render_template("edit_customer.html", customer=customer, accounts_return=accounts_return)
 
 
 @views.route("/customers/<int:customer_id>/delete", methods=["POST"])
@@ -890,88 +942,86 @@ def delete_customer(customer_id):
 # -------------------------------
 # 财务模块
 # -------------------------------
+def filter_shipment_dates(query, date_from, date_to):
+    start_date = datetime.strptime(date_from, "%Y-%m-%d") if date_from else None
+    end_date = datetime.strptime(date_to, "%Y-%m-%d") if date_to else None
+    if start_date and end_date and start_date > end_date:
+        raise ValueError("日期范围颠倒")
+    if start_date:
+        query = query.filter(Shipment.created_at >= start_date)
+    if end_date:
+        query = query.filter(Shipment.created_at < end_date + timedelta(days=1))
+    return query
+
+
 @views.route("/finance", methods=["GET", "POST"])
 @login_required
 def finance():
     customers = Customer.query.all()
+    agents = CarrierAgent.query.order_by(CarrierAgent.name).all()
     accounts = BankAccount.query.order_by(BankAccount.id.asc()).all()
+    form = request.form
+    selected_customer_id = form.get("customer_id")
+    selected_agent_id = form.get("agent_id")
+    tracking_number = form.get("tracking_number", "").strip()[:50]
+    date_from, date_to = form.get("date_from"), form.get("date_to")
+    defaults = [account for account in accounts if account.is_default]
+    selected_account_id = form.get("bank_account_id") or (str(defaults[0].id) if len(defaults) == 1 else "")
 
-    selected_customer_id = request.form.get("customer_id")
-    raw_account_id = request.form.get("bank_account_id")
-    default_accounts = [account for account in accounts if account.is_default]
-    selected_account_id = raw_account_id or (
-        str(default_accounts[0].id) if len(default_accounts) == 1 else "")
-    date_from = request.form.get("date_from")
-    date_to = request.form.get("date_to")
-
-    query = Shipment.query
-    if selected_customer_id:
-        query = query.filter_by(customer_id=selected_customer_id)
+    query = Shipment.query.options(joinedload(Shipment.customer), joinedload(Shipment.agent))
+    for value, column in ((selected_customer_id, Shipment.customer_id), (selected_agent_id, Shipment.agent_id)):
+        if value:
+            if not value.isascii() or not value.isdigit() or len(value) > 10 or not 0 < int(value) < 2**31:
+                return "客户或代理无效", 400
+            query = query.filter(column == int(value))
+    if tracking_number:
+        query = query.filter(db.or_(Shipment.tracking_number.icontains(tracking_number, autoescape=True),
+                                    Shipment.shipment_id.icontains(tracking_number, autoescape=True)))
     try:
-        start_date = datetime.strptime(date_from, "%Y-%m-%d") if date_from else None
-        end_date = datetime.strptime(date_to, "%Y-%m-%d") if date_to else None
-        if start_date and end_date and start_date > end_date:
-            raise ValueError("日期范围颠倒")
-        if start_date:
-            query = query.filter(Shipment.created_at >= start_date)
-        if end_date:
-            query = query.filter(Shipment.created_at < end_date + timedelta(days=1))
+        query = filter_shipment_dates(query, date_from, date_to)
     except (ValueError, OverflowError):
         return "日期范围无效", 400
+    if billing_available():
+        rows = query.add_entity(TmsReceivable).outerjoin(TmsReceivable, TmsReceivable.shipment_id == Shipment.id).all()
+    else:
+        rows = [(shipment, None) for shipment in query.all()]
+    totals = receivable_totals(rows)
 
-    shipments = query.all()
-    total_fees = sum(s.fee or 0 for s in shipments)
-    total_shipments = len(shipments)
-
-    if request.form.get("export"):
+    if form.get("export"):
         if not selected_account_id:
             return "请先选择收款银行账户", 400
-        if not selected_account_id.isdigit():
+        if (not selected_account_id.isascii() or not selected_account_id.isdigit()
+                or len(selected_account_id) > 10 or not 0 < int(selected_account_id) < 2**31):
             return "收款银行账户无效", 400
-        selected_account = BankAccount.query.get(int(selected_account_id))
+        selected_account = db.session.get(BankAccount, int(selected_account_id))
         if selected_account is None:
             return "收款银行账户无效", 400
-        customer_name = "全部客户"
-        if selected_customer_id:
-            customer = Customer.query.get(selected_customer_id)
-            customer_name = customer.name if customer else "未知客户"
-
+        customer = db.session.get(Customer, int(selected_customer_id)) if selected_customer_id else None
+        customer_name = customer.name if customer else "未知客户" if selected_customer_id else "全部客户"
         orders = []
-        for s in shipments:
+        for shipment, receivable in rows:
+            details = receivable.details if receivable else None
             orders.append({
-                "date": s.created_at.strftime("%Y-%m-%d") if s.created_at else "",
-                "order_no": s.tracking_number,
-                "service_no": s.shipment_id or "",
-                "qty": s.pieces,
-                "type": s.product_type or "",
-                "weight": s.weight,
-                "destination": s.destination or "",
-                "channel": s.channel or "",
-                "fee": s.fee,
-                "summary": s.note or ""
+                "date": shipment.created_at.strftime("%Y-%m-%d") if shipment.created_at else "",
+                "order_no": shipment.tracking_number, "service_no": shipment.shipment_id or "",
+                "qty": shipment.pieces, "type": shipment.product_type or "",
+                "weight": (details["quantity"] if details and details["unit"] == "kg" else None)
+                          if details else shipment.weight,
+                "destination": shipment.destination or "", "channel": shipment.channel or "",
+                "fee": receivable.total if receivable else shipment.fee,
+                "currency": receivable.currency if receivable else "CNY",
+                "summary": "TMS 审核应收" if receivable else shipment.note or "",
+                "pricing": details,
             })
-
-        company_info = {
-            "公司名称": "物流公司",
-            "地址": ""
-        }
-
-        # 传递 date_from/date_to 给导出函数
-        filename = export_invoice(company_info, customer_name, orders, [selected_account],
+        filename = export_invoice({"公司名称": "物流公司", "地址": ""}, customer_name, orders, [selected_account],
                                   date_from=date_from or None, date_to=date_to or None, filename=None)
         return send_file(filename, as_attachment=True, download_name="invoice.xlsx",
                          mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-    return render_template("finance.html",
-                           customers=customers,
-                           accounts=accounts,
-                           shipments=shipments,
-                           total_shipments=total_shipments,
-                           total_fees=total_fees,
-                           selected_customer_id=selected_customer_id,
-                           selected_account_id=selected_account_id,
-                           date_from=date_from,
-                           date_to=date_to)
+    return render_template("finance.html", customers=customers, agents=agents, accounts=accounts, rows=rows,
+                           total_shipments=len(rows), totals=totals, selected_customer_id=selected_customer_id,
+                           selected_agent_id=selected_agent_id, tracking_number=tracking_number,
+                           selected_account_id=selected_account_id, date_from=date_from, date_to=date_to)
 
 
 def _select_tracking_shipments(numbers, customer_id, agent_id):

@@ -89,7 +89,7 @@ init_tms(app)
 init_write_security(app, login_manager)
 
 # 管理后台
-from access_control import SecureAdminIndexView, SecureModelView, OwnedRecordView, CarrierAdminView
+from access_control import SecureAdminIndexView, SecureModelView, OwnedRecordView, CarrierAdminView, ShipmentAdminView
 admin = Admin(app, name="后台管理", template_mode="bootstrap4",
               index_view=SecureAdminIndexView())
 
@@ -150,7 +150,7 @@ class User(UserMixin, db.Model):
 admin.add_view(SecureModelView(User, db.session))
 admin.add_view(SecureModelView(Customer, db.session))
 admin.add_view(CarrierAdminView(CarrierAgent, db.session))
-admin.add_view(OwnedRecordView(Shipment, db.session))
+admin.add_view(ShipmentAdminView(Shipment, db.session))
 admin.add_view(OwnedRecordView(ManualTrack, db.session))
 admin.add_view(SecureModelView(BankAccount, db.session))
 
@@ -699,7 +699,7 @@ def logout():
 @app.route("/")
 @login_required
 def index():
-    return redirect(url_for("shipments"))
+    return redirect(url_for("tms_staff.queue" if app.config.get("TMS_ENABLED") and current_user.is_admin else "shipments"))
 
 # ------------------------------
 # 代理管理：新增 / 列表（兼容你的模板）
@@ -795,6 +795,9 @@ def import_shipments():
 @app.route("/shipments/<int:sid>/edit", methods=["GET", "POST"])
 @login_required
 def edit_shipment(sid):
+    from tms_billing import linked_receivable
+    if linked_receivable(sid):
+        return app.view_functions["views.edit_shipment"](sid)
     s = Shipment.query.get_or_404(sid)
     if request.method == "POST":
         from shipment_updates import update_shipment

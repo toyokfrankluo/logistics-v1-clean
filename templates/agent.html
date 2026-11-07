@@ -36,7 +36,7 @@
 
     <!-- 代理列表 -->
     <h3>已有代理</h3>
-    <table class="table table-bordered">
+    <div class="table-wrap"><table class="table table-bordered">
         <thead>
             <tr>
                 <th>ID</th>
@@ -44,7 +44,7 @@
                 <th>API 地址</th>
                 <th>App Key</th>
                 <th>App Token</th>
-                <th>客户代码</th>
+                <th>状态 / 接口能力</th><th>关联运单</th>
                 <th>操作</th>
             </tr>
         </thead>
@@ -53,24 +53,25 @@
             <tr>
                 <td>{{ agent.id }}</td>
                 <td>{{ agent.name }}</td>
-                <td>{{ agent.api_url }}</td>
+                <td>{{ agent.api_url.split('?', 1)[0].split('#', 1)[0].split('@')[-1] if agent.api_url else '手工代理' }}</td>
                 <td>{{ "已配置" if agent.app_key else "未配置" }}</td>
                 <td>{{ "已配置" if agent.app_token else "未配置" }}</td>
-                <td>{{ agent.customer_code }}</td>
+                <td><span class="badge {{ 'approved' if agent.is_active else '' }}">{{ '启用' if agent.is_active else '停用' }}</span><small class="cell-note">{{ '已配置轨迹能力，连通性待验证' if agent.supports_api and agent.api_url else '手工轨迹' }}</small></td>
+                <td>{{ shipment_counts.get(agent.id, 0) }}</td>
                 <td>
                     <a href="{{ url_for('views.edit_agent', agent_id=agent.id) }}" class="btn btn-sm btn-warning">编辑</a>
-                    <form method="POST" action="{{ url_for('views.delete_agent', agent_id=agent.id) }}" style="display:inline;">
+                    {% if agent.is_active %}<form method="POST" action="{{ url_for('views.delete_agent', agent_id=agent.id) }}" style="display:inline;">
 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                        <button type="submit" class="btn btn-sm btn-danger" onclick="return confirm('确定要删除这个代理吗？');">删除</button>
-                    </form>
+                        <button type="submit" class="btn btn-sm btn-danger" onclick="return confirm('停用此代理？历史运单会保留。');">停用</button>
+                    </form>{% endif %}
                 </td>
             </tr>
             {% else %}
             <tr>
-                <td colspan="7" class="text-center">暂无代理</td>
+                <td colspan="8" class="text-center">暂无代理</td>
             </tr>
             {% endfor %}
         </tbody>
-    </table>
+    </table></div>
 </div>
 {% endblock %}

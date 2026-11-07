@@ -22,7 +22,7 @@
 
 <hr>
 <h3>客户列表</h3>
-<table class="table table-striped">
+<div class="table-wrap"><table class="table table-striped">
   <thead><tr><th>客户名称</th>{% if current_user.is_admin %}<th>邮箱</th><th>电话</th><th>银行信息</th><th>操作</th>{% endif %}</tr></thead>
   <tbody>{% for c in customers %}
     <tr><td>{{ c.name }}</td>
@@ -35,5 +35,5 @@
       </td>{% endif %}
     </tr>
   {% else %}<tr><td colspan="5">暂无客户</td></tr>{% endfor %}</tbody>
-</table>
+</table></div>
 {% endblock %}

@@ -1,62 +1,38 @@
 {% extends "base.html" %}
+{% block title %}财务模块{% endblock %}
 {% block content %}
-<h1>财务模块</h1>
-
-<form method="post" action="{{ url_for('views.finance') }}" class="row g-3 mb-3">
-<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-  <div class="col-md-3">
-    <label>选择客户</label>
-    <select name="customer_id" class="form-select">
-      <option value="">-- 全部 --</option>
-      {% for c in customers %}
-        <option value="{{ c.id }}" {% if selected_customer_id and selected_customer_id|int == c.id %}selected{% endif %}>{{ c.name }}</option>
-      {% endfor %}
-    </select>
+<div class="heading"><div><p class="kicker">客户结算</p><h1>财务模块</h1><p>新运单按审核收费计入，历史运单沿用原费用。</p></div></div>
+<section class="panel order-search">
+<form method="post" action="{{ url_for('views.finance') }}" class="search-form">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <label>客户<select name="customer_id"><option value="">全部</option>{% for c in customers %}<option value="{{ c.id }}" {% if selected_customer_id|int == c.id %}selected{% endif %}>{{ c.name }}</option>{% endfor %}</select></label>
+  <label>代理<select name="agent_id"><option value="">全部</option>{% for agent in agents %}<option value="{{ agent.id }}" {% if selected_agent_id|int == agent.id %}selected{% endif %}>{{ agent.name }}</option>{% endfor %}</select></label>
+  <label>运单号<input name="tracking_number" value="{{ tracking_number }}"></label>
+  <label>开始日期<input type="date" name="date_from" value="{{ date_from or '' }}"></label>
+  <label>结束日期<input type="date" name="date_to" value="{{ date_to or '' }}"></label>
+  <label class="keyword">收款银行账户<select name="bank_account_id">
+      <option value="">{% if accounts %}请选择{% else %}暂无账户，请联系管理员添加{% endif %}</option>
+      {% for account in accounts %}<option value="{{ account.id }}" {% if selected_account_id|int == account.id %}selected{% endif %}>{{ account.account_type == 'private' and '私人' or '公账' }} · {{ account.bank_name }} · {{ account.account_name }} · ****{{ account.account_no[-4:] }}{% if account.is_default %}（默认）{% endif %}</option>{% endfor %}
+  </select></label>
+  <div class="inline-actions"><button>筛选</button><button name="export" value="1" class="secondary">导出 Excel</button></div>
+</form></section>
+<section class="panel">
+  <div class="results-meta"><span>共 {{ total_shipments }} 票</span>
+  <strong>应收合计 {% for currency, total in totals|dictsort %}{{ "%.2f"|format(total) }} {{ currency }}{% if not loop.last %} · {% endif %}{% else %}—{% endfor %}</strong></div>
+  <div class="table-wrap">
+  <table><thead><tr><th>运单号</th><th>客户</th><th>代理</th><th>日期</th><th>基础运费</th><th>附加费</th><th>操作费</th><th>超值费</th><th>自定义收费</th><th>应收总额</th><th>付款状态</th></tr></thead>
+  <tbody>{% for shipment, charge in rows %}
+  <tr><td><a href="{{ url_for('views.shipment_detail', shipment_id=shipment.id) }}">{{ shipment.tracking_number }}</a></td>
+  <td>{{ shipment.customer.name if shipment.customer else '—' }}</td><td>{{ shipment.agent.name if shipment.agent else '—' }}</td><td>{{ shipment.created_at.strftime('%Y-%m-%d') if shipment.created_at else '—' }}</td>
+  {% if charge %}
+  {% for key in ['base', 'surcharge', 'operation', 'high_value'] %}<td>{{ charge.details[key] }}</td>{% endfor %}
+  <td>{% if charge.details.other %}<details><summary>{{ charge.details.other_total }}</summary>
+  {% for item in charge.details.other %}<small class="cell-note">{{ item.name }} · {{ item.amount }}</small>{% endfor %}
+  </details>{% else %}{{ charge.details.other_total }}{% endif %}</td>
+  {% else %}<td colspan="5" class="muted">历史费用 · 无拆分明细</td>{% endif %}
+  <td>{{ "%.2f"|format(charge.total if charge else (shipment.fee or 0)) }} {{ charge.currency if charge else 'CNY' }}</td>
+  <td><span class="badge">未记录</span></td></tr>
+  {% else %}<tr><td colspan="11" class="empty">没有符合条件的运单。</td></tr>{% endfor %}</tbody></table>
   </div>
-  <div class="col-md-2">
-    <label>开始日期</label>
-    <input type="date" name="date_from" value="{{ date_from or '' }}" class="form-control">
-  </div>
-  <div class="col-md-2">
-    <label>结束日期</label>
-    <input type="date" name="date_to" value="{{ date_to or '' }}" class="form-control">
-  </div>
-  <div class="col-md-3">
-    <label>收款银行账户</label>
-    <select name="bank_account_id" class="form-select" {% if request.form.get('export') and not accounts %}required{% endif %}>
-      <option value="">-- {% if accounts %}请选择{% else %}暂无账户，请先联系管理员添加{% endif %} --</option>
-      {% for account in accounts %}
-        <option value="{{ account.id }}" {% if selected_account_id and selected_account_id|int == account.id %}selected{% endif %}>
-          {{ account.account_type == 'private' and '私人' or '公账' }} · {{ account.bank_name }} · {{ account.account_name }} · ****{{ account.account_no[-4:] }}{% if account.is_default %}（默认）{% endif %}
-        </option>
-      {% endfor %}
-    </select>
-  </div>
-  <div class="col-md-2 align-self-end">
-    <button type="submit" class="btn btn-primary">筛选</button>
-    <button type="submit" name="export" value="1" class="btn btn-secondary">导出</button>
-  </div>
-</form>
-
-<p>总单数：{{ total_shipments }}， 总费用：{{ total_fees }}</p>
-
-{% if shipments %}
-<h2>筛选结果</h2>
-<table class="table">
-<thead><tr><th>日期</th><th>运单号</th><th>客户</th><th>渠道</th><th>件数</th><th>计费重</th><th>费用</th></tr></thead>
-<tbody>
-  {% for s in shipments %}
-  <tr>
-    <td>{{ s.created_at.strftime('%Y-%m-%d') if s.created_at else '' }}</td>
-    <td>{{ s.tracking_number }}</td>
-    <td>{{ s.customer.name if s.customer else '' }}</td>
-    <td>{{ s.channel }}</td>
-    <td>{{ s.pieces }}</td>
-    <td>{{ s.weight }}</td>
-    <td>{{ s.fee }}</td>
-  </tr>
-  {% endfor %}
-</tbody>
-</table>
-{% endif %}
+</section>
 {% endblock %}
