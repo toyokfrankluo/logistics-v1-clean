@@ -1138,6 +1138,8 @@ def finance():
         customer_name = customer.name if customer else "未知客户" if selected_customer_id else "全部客户"
         orders = []
         for shipment, receivable in rows:
+            if receivable and receivable.final_total is None:
+                continue
             details = receivable.details if receivable else None
             orders.append({
                 "date": shipment.created_at.strftime("%Y-%m-%d") if shipment.created_at else "",
@@ -1146,11 +1148,13 @@ def finance():
                 "weight": (details["quantity"] if details and details["unit"] == "kg" else None)
                           if details else shipment.weight,
                 "destination": shipment.destination or "", "channel": shipment.channel or "",
-                "fee": receivable.total if receivable else shipment.fee,
+                "fee": receivable.final_total if receivable else shipment.fee,
                 "currency": receivable.currency if receivable else "CNY",
-                "summary": "TMS 审核应收" if receivable else "",
+                "summary": "TMS 已确认应收" if receivable else "",
                 "pricing": details,
             })
+        if rows and not orders:
+            return "当前筛选结果没有已确认应收，待核算或待复核的订单不能导出账单。", 400
         filename = export_invoice({"公司名称": "物流公司", "地址": ""}, customer_name, orders, [selected_account],
                                   date_from=date_from or None, date_to=date_to or None, filename=None)
         return send_file(filename, as_attachment=True, download_name="invoice.xlsx",

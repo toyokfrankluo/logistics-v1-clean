@@ -36,9 +36,9 @@
 {% if shipment.third_party_tracking_number %}<small class="cell-note">承运：{{ shipment.third_party_tracking_number }}</small>{% endif %}</td>
 <td>{{ shipment.customer.name if shipment.customer else '—' }}</td><td>{{ shipment.channel or '—' }}</td><td>{{ shipment.agent.name if shipment.agent else '—' }}</td>
 <td>{{ shipment.pieces or '—' }}</td><td>{{ shipment.weight or 0 }}{% if charge %}<small class="cell-note">申报</small>{% endif %}</td>
-<td>{{ charge.details.base if charge else '—' }}</td>
+<td>{{ (charge.details.base if charge.final_total is not none else charge.billing_label) if charge else '—' }}</td>
 <td>{{ charge.details.extras_total if charge else '—' }}</td>
-<td>{{ "%.2f"|format(charge.total if charge else (shipment.fee or 0)) }} {{ charge.currency if charge else 'CNY' }}</td>
+<td>{% if charge and charge.final_total is none %}{{ charge.billing_label }}{% else %}{{ "%.2f"|format(charge.final_total if charge else (shipment.fee or 0)) }} {{ charge.currency if charge else 'CNY' }}{% endif %}</td>
 <td><span class="badge">{{ shipment.status or '—' }}</span></td><td>{{ shipment.created_at.strftime('%Y-%m-%d') if shipment.created_at else '—' }}</td>
 <td><a href="{{ url_for('views.shipment_detail', shipment_id=shipment.id) }}">详情</a>
 {% if current_user.is_admin %} · <a href="{{ url_for('views.edit_shipment', shipment_id=shipment.id) }}">编辑</a>

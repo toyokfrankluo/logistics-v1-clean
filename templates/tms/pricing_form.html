@@ -42,13 +42,9 @@
     {% for currency in currencies %}<option{% if currency == value.currency %} selected{% endif %}>{{ currency }}</option>{% endfor %}</select></label>
     <label>计费方式<select name="unit" required><option value="">请选择</option>
     {% for key, label in units.items() %}<option value="{{ key }}"{% if key == value.unit %} selected{% endif %}>按 {{ label }}</option>{% endfor %}</select></label>
-    <label>计费数量<input name="quantity" inputmode="decimal" value="{{ value.quantity or '' }}" maxlength="24" required></label>
-    <label>计费单价<input name="rate" inputmode="decimal" value="{{ value.rate or '' }}" maxlength="24" required></label>
+    <label>客户销售单价<input name="rate" inputmode="decimal" value="{{ value.rate or '' }}" maxlength="24" required></label>
   </div>
-  <label>计费数量来源<select name="quantity_source" required><option value="">请选择</option>
-  {% for key, label in sources.items() %}<option value="{{ key }}"{% if key == value.quantity_source %} selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
-  <label>数量来源说明<input name="source_note" maxlength="200" value="{{ value.source_note or '' }}" placeholder="选择其他来源时必填"></label>
-  <p class="muted">使用客户申报重量时请选「客户申报」。基础运费 <output data-base>—</output></p>
+  <p class="muted">计费数量待代理实测或人工核实。确认数量后再核算基础运费和最终应收。</p>
   <div class="pricing-grid fixed-fees">
     {% for key, label in fixed.items() %}<label>{{ label }}<input name="{{ key }}" inputmode="decimal" value="{{ value.get(key, '') }}" maxlength="24" required placeholder="无费用请填 0"></label>{% endfor %}
   </div>
@@ -64,12 +60,12 @@
     <button type="button" class="secondary" data-add-fee>＋ 添加其他费用</button>
     <small>其他费用小计 <output data-other-total>—</output>。单票最多 200 项，所有币种须一致。</small>
   </fieldset>
-  <p class="charge-total"><strong>客户应收总额</strong><output data-total aria-live="polite">填写完整后计算</output></p>
+  <p class="charge-total"><strong>最终应收</strong><span>待核算</span></p>
   {% if adjusting %}<label>调整原因<textarea name="adjustment_reason" maxlength="500" required>{{ value.adjustment_reason or '' }}</textarea></label>{% endif %}
   <label>审核备注（内部）<textarea name="review_note" maxlength="500">{{ value.review_note or '' }}</textarea></label>
-  <label class="check-label"><input type="checkbox" name="confirmed" value="yes" required>我已核对收费项目、计费来源及客户应收总额</label>
+  <label class="check-label"><input type="checkbox" name="confirmed" value="yes" required>我已核对计费方式、客户销售单价及附加收费</label>
   <div class="inline-actions">
-  {% if adjusting %}<button name="decision" value="adjust">确认费用调整</button>
+  {% if adjusting %}<button name="decision" value="adjust">保存销售条款并待核算</button>
   {% else %}<button class="secondary" name="decision" value="draft" formnovalidate>保存草稿</button><button name="decision" value="approve">审核通过</button>{% endif %}
   </div>
 </form>

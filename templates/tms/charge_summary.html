@@ -1,8 +1,10 @@
 {% set charges = receivable.details %}
 <dl class="fields">
+<div><dt>客户销售单价</dt><dd>{{ charges.rate }} {{ receivable.currency }} / {{ {'kg':'KG', 'cbm':'CBM', 'box':'箱', 'shipment':'票'}.get(charges.unit, '—') }}</dd></div>
+<div><dt>计费数量</dt><dd>{% if receivable.final_total is not none %}{{ charges.quantity }}{% elif receivable.total is not none %}待复核{% elif charges.unit in ['box','shipment'] %}待核实箱数或票数{% else %}待代理实测{% endif %}</dd></div>
 {% for key, label in [('base','基础运费'), ('surcharge','附加费'), ('operation','操作费'), ('high_value','超值费')] %}
-<div><dt>{{ label }}</dt><dd>{{ charges[key] }} {{ receivable.currency }}</dd></div>
+<div><dt>{{ label }}</dt><dd>{% if key == 'base' and receivable.final_total is none %}{{ receivable.billing_label }}{% else %}{{ charges[key] }} {{ receivable.currency }}{% endif %}</dd></div>
 {% endfor %}
 {% for item in charges.other %}<div><dt>{{ item.name }}</dt><dd>{{ item.amount }} {{ item.currency }}</dd></div>{% endfor %}
-<div><dt>客户应收总额</dt><dd><strong>{{ "%.2f"|format(receivable.total) }} {{ receivable.currency }}</strong></dd></div>
+<div><dt>客户应收总额</dt><dd><strong>{% if receivable.final_total is not none %}{{ "%.2f"|format(receivable.final_total) }} {{ receivable.currency }}{% else %}{{ receivable.billing_label }}{% endif %}</strong></dd></div>
 </dl>

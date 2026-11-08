@@ -10,7 +10,7 @@ from tms_models import TmsReceivable
 
 
 UNITS = {"kg": "KG", "cbm": "CBM", "box": "箱", "shipment": "票"}
-SOURCES = {"declared": "客户申报", "warehouse": "仓库实测", "carrier": "代理确认", "manual": "其他已核实资料"}
+SETTLEMENT_SOURCES = {"snapshot": "代理接口已核对计费量", "manual": "人工核实凭证"}
 CURRENCIES = ("CNY", "USD", "EUR", "HKD", "GBP")
 FIXED = {"surcharge": "附加费", "operation": "操作费", "high_value": "超值费"}
 MAX_OTHER_FEES = 200
@@ -32,7 +32,7 @@ def linked_receivable(shipment_id):
 
 def price_form(form):
     values = {name: form.get(name, "").strip() for name in (
-        "unit", "quantity", "quantity_source", "source_note", "rate", *FIXED, "currency",
+        "unit", "rate", *FIXED, "currency",
         "other_mode", "review_note",
     )}
     fields = [form.getlist(name) for name in ("other_name", "other_amount", "other_currency", "other_note")]
@@ -45,7 +45,7 @@ def price_form(form):
 
 def valid_draft(values):
     if any(len(values[key]) > limit for key, limit in (
-        ("unit", 10), ("quantity", 24), ("quantity_source", 15), ("source_note", 200), ("rate", 24),
+        ("unit", 10), ("rate", 24),
         ("surcharge", 24), ("operation", 24), ("high_value", 24), ("currency", 3),
         ("other_mode", 10), ("review_note", 500),
     )):
@@ -65,20 +65,14 @@ def decimal_field(value, label, scale, maximum, *, positive=False):
     return amount
 
 
-def confirm_price(values, form):
+def confirm_sales_terms(values, form):
     valid_draft(values)
-    unit, source, currency = (values[k] for k in ("unit", "quantity_source", "currency"))
+    unit, currency = values["unit"], values["currency"]
     if unit not in UNITS:
         raise ValueError("请选择计费方式。")
-    if source not in SOURCES or (source == "manual" and not values["source_note"]):
-        raise ValueError("请选择计费数量来源；选择其他来源时请填写说明。")
     if currency not in CURRENCIES:
         raise ValueError("请选择账单币种。")
-    quantity = decimal_field(values["quantity"], "计费数量", 3, 1_000_000, positive=True)
-    if (unit == "box" and quantity != quantity.to_integral_value()) or (unit == "shipment" and quantity != 1):
-        raise ValueError("按箱须为整数，按票计费的一票订单须填写 1。")
     rate = decimal_field(values["rate"], "计费单价", 4, 1_000_000)
-    base = (quantity * rate).quantize(CENT, rounding=ROUND_HALF_UP)
     charges = {key: decimal_field(values[key], label, 2, 100_000_000).quantize(CENT)
                for key, label in FIXED.items()}
     other = values["other"]
@@ -91,19 +85,32 @@ def confirm_price(values, form):
                for i, row in enumerate(other, 1)]
     if form.get("confirmed") != "yes":
         raise ValueError("请确认收费后再提交。")
-    total = base + sum(charges.values()) + sum(amounts)
+    extras = sum(charges.values(), Decimal("0.00")) + sum(amounts)
     return {
-        **values, "quantity": str(quantity), "rate": str(rate), "base": str(base),
+        **values, "rate": str(rate), "billing_state": "pending",
         **{key: str(amount) for key, amount in charges.items()},
         "other": [{**row, "amount": str(amount)} for row, amount in zip(other, amounts)],
-        "other_total": str(sum(amounts, Decimal("0.00"))), "extras_total": str(total - base), "total": str(total),
+        "other_total": str(sum(amounts, Decimal("0.00"))), "extras_total": str(extras),
     }
+
+
+def settle_charge(terms, raw_quantity, source, note):
+    quantity = decimal_field(raw_quantity, "计费数量", 12, 1_000_000, positive=True)
+    unit = terms["unit"]
+    if (unit == "box" and quantity != quantity.to_integral_value()) or (unit == "shipment" and quantity != 1):
+        raise ValueError("按箱须为整数，按票计费的一票订单须填写 1。")
+    base = (quantity * Decimal(terms["rate"])).quantize(CENT, rounding=ROUND_HALF_UP)
+    total = base + Decimal(terms["extras_total"])
+    return dict(terms, billing_state="confirmed", quantity=str(quantity), quantity_source=source,
+                source_note=note, base=str(base), total=str(total))
 
 
 def receivable_totals(rows):
     totals = {}
     for shipment, receivable in rows:
         currency = receivable.currency if receivable else "CNY"
-        amount = receivable.total if receivable else Decimal(str(shipment.fee or 0))
+        amount = receivable.final_total if receivable else Decimal(str(shipment.fee or 0))
+        if amount is None:
+            continue
         totals[currency] = totals.get(currency, Decimal("0.00")) + amount
     return totals

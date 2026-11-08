@@ -51,12 +51,13 @@ class NextSLSTests(unittest.TestCase):
     upload = fixture.PortalTests.upload
     decision = fixture.PortalTests.decision
     pricing = fixture.PortalTests.pricing
+    settle = fixture.PortalTests.settle
     pending_order = fixture.PortalTests.pending_order
 
-    def approve(self):
+    def approve(self, **pricing):
         order_id = self.pending_order()
         self.assertEqual(self.decision(order_id, 2, decision="approve", **self.pricing(
-            agent_service="TMS_DEMO")).status_code, 302)
+            agent_service="TMS_DEMO", **pricing)).status_code, 302)
         return order_id
 
     def profile(self, **changes):
@@ -72,6 +73,8 @@ class NextSLSTests(unittest.TestCase):
         return profile
 
     def action(self, order_id, action, **form):
+        if action == "create":
+            form.setdefault("revision", db.session.get(TmsOrder, order_id).revision)
         return self.post(self.staff, f"/tms/admin/orders/{order_id}/supplier",
                          {"action": action, **form}, "/login")
 
@@ -107,7 +110,9 @@ class NextSLSTests(unittest.TestCase):
     def test_default_gate_confirmation_and_admin_permissions(self):
         order_id = self.approve()
         self.profile()
-        self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 400)
+        blocked = self.action(order_id, "create", confirm="yes")
+        self.assertEqual(blocked.status_code, 400)
+        self.assertIn("系统未开放真实下单", blocked.get_data(as_text=True))
         self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
         self.assertEqual(self.staff.post(f"/tms/admin/orders/{order_id}/supplier",
                                          data={"action": "create"}).status_code, 400)
@@ -146,7 +151,8 @@ class NextSLSTests(unittest.TestCase):
         self.assertEqual(self.decision(order_id, 2, decision="approve", **pricing).status_code, 302)
         self.carrier_post.assert_not_called()
         receivable = db.session.get(TmsReceivable, order_id)
-        self.assertEqual(str(receivable.total), "1227.90")
+        self.assertIsNone(receivable.total)
+        self.assertEqual(receivable.details["extras_total"], "27.90")
         shipment = db.session.get(Shipment, receivable.shipment_id)
         self.assertIsNone(shipment.shipment_id)
         sent = []
@@ -299,6 +305,79 @@ class NextSLSTests(unittest.TestCase):
         self.assertEqual(request.call_count, 1)
         self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
 
+    def test_create_requires_configured_channel_and_live_account_visibility(self):
+        order_id = self.approve()
+        profile = self.profile(service_codes=[])
+        path = f"/tms/admin/orders/{order_id}"
+        body = self.get(self.staff, path).get_data(as_text=True)
+        for label in ("待提交代理", "提交代理下单", "TMS_DEMO", "1 Fictional Way", "Demo item", "未配置代理渠道代码"):
+            self.assertIn(label, body)
+        self.assertNotIn(TOKEN, body)
+        with patch.dict(app.config, TMS_NEXTSLS_CREATE_ENABLED=True), patch(
+            "carrier_http.post", return_value=success({"services": []}),
+        ) as request:
+            self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 400)
+            request.assert_not_called()
+            profile.service_codes = ["TMS_DEMO"]
+            db.session.commit()
+            self.assertEqual(self.action(order_id, "create", confirm="yes", revision=1).status_code, 400)
+            request.assert_not_called()
+            response = self.action(order_id, "create", confirm="yes")
+            self.assertIn("所选渠道不在该账号的可用服务列表", response.get_data(as_text=True))
+            self.assertEqual(request.call_count, 1)
+        self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
+
+    def test_snapshot_billing_needs_matching_unit_and_changes_require_review(self):
+        order_id = self.approve(unit="cbm")
+        self.profile()
+        self.assign_supplier_number(order_id)
+        payload = snapshot()
+        payload["shipment"]["chargeable_weight"] = "1.125"
+        with patch.dict(app.config, TMS_NEXTSLS_READ_ENABLED=True), patch("carrier_http.post", return_value=success(payload)):
+            self.assertEqual(self.action(order_id, "sync").status_code, 302)
+            def latest_id():
+                return str(TmsSupplierEvent.query.filter_by(kind="snapshot").order_by(TmsSupplierEvent.id.desc()).first().id)
+            def settle_snapshot():
+                return self.settle(order_id, settlement_unit="cbm", settlement_source="snapshot",
+                                   settlement_quantity="999", settlement_snapshot=latest_id())
+            self.assertEqual(settle_snapshot().status_code, 400)
+            self.assertEqual(self.action(order_id, "measurement_review", snapshot_id=latest_id(),
+                                         unit_chargeable_weight="kg", reason="单位核实").status_code, 302)
+            self.assertEqual(settle_snapshot().status_code, 400)
+            self.assertEqual(self.action(order_id, "measurement_review", snapshot_id=latest_id(),
+                                         unit_chargeable_weight="m³", reason="体积计费凭证").status_code, 302)
+            self.assertEqual(settle_snapshot().status_code, 302)
+            charge = db.session.get(TmsReceivable, order_id)
+            self.assertEqual(str(charge.final_total), "13.50")
+            self.assertEqual(charge.details["quantity"], "1.125")
+            self.assertEqual(self.action(order_id, "sync").status_code, 302)
+            self.assertEqual(str(charge.final_total), "13.50")
+            payload["shipment"]["chargeable_weight"] = "1.75"
+            self.assertEqual(self.action(order_id, "sync").status_code, 302)
+            db.session.expire_all()
+            self.assertIsNone(charge.final_total)
+            self.assertEqual(str(charge.total), "13.50")
+            self.assertIn("计费待复核", self.get(self.staff, "/finance").get_data(as_text=True))
+
+    def test_unsubmitted_legacy_channel_can_be_corrected_without_sending(self):
+        order_id = self.pending_order()
+        self.assertEqual(self.decision(order_id, 2, decision="approve", **self.pricing(
+            agent_service="虚构销售服务")).status_code, 302)
+        self.profile()
+        form = {"revision": 3, "channel_code": "TMS_DEMO", "channel_reason": "按代理服务清单更正"}
+        self.assertEqual(self.action(order_id, "channel", **(form | {"channel_code": "OTHER"})).status_code, 400)
+        self.assertEqual(self.action(order_id, "channel", **form).status_code, 302)
+        db.session.expire_all()
+        order = db.session.get(TmsOrder, order_id)
+        self.assertEqual(order.agent_service, "TMS_DEMO")
+        self.assertEqual(order.invoice["supplier_channel_reviews"][0]["from"], "虚构销售服务")
+        self.assertEqual(db.session.get(TmsReceivable, order_id).agent_service, "TMS_DEMO")
+        self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
+        self.carrier_post.assert_not_called()
+        self.assertNotIn("TMS_DEMO", self.get(self.alice, f"/tms/customer/orders/{order_id}").get_data(as_text=True))
+        self.assign_supplier_number(order_id)
+        self.assertEqual(self.action(order_id, "channel", **(form | {"revision": 4})).status_code, 400)
+
     def assign_supplier_number(self, order_id):
         receivable = db.session.get(TmsReceivable, order_id)
         shipment = db.session.get(Shipment, receivable.shipment_id)
@@ -338,6 +417,10 @@ class NextSLSTests(unittest.TestCase):
             self.assertEqual(shipment.weight, weight)
             self.assertEqual(db.session.get(TmsAgentApi, self.agent.id).verified, {})
             self.assertEqual(self.save_cost(order_id).status_code, 302)
+            pending_report = load_workbook(BytesIO(self.post(self.staff, "/finance", {"profit_export": "1"}, "/login").data))
+            self.assertIsNone(pending_report.active["I2"].value)
+            pending_report.close()
+            self.assertEqual(self.settle(order_id).status_code, 302)
             response = self.post(self.staff, "/finance", {"profit_export": "1"}, "/login")
             report = load_workbook(BytesIO(response.data))
             self.assertEqual(report.active["I2"].value, 1097.6)
@@ -438,6 +521,7 @@ class NextSLSTests(unittest.TestCase):
         self.assertEqual(self.get(self.bob, customer_path + "/measurements.xlsx").status_code, 404)
         self.assertEqual(self.get(self.alice, staff_path + "/supplier/measurements.xlsx").status_code, 302)
 
+        self.assertEqual(self.settle(order_id).status_code, 302)
         response = self.post(self.staff, "/finance", {"export": "1"}, "/login")
         self.assertEqual(response.status_code, 200)
         book = load_workbook(BytesIO(response.data), read_only=True)
@@ -476,6 +560,7 @@ class NextSLSTests(unittest.TestCase):
 
     def test_cost_needs_ownership_basis_and_dated_fx_before_profit(self):
         order_id = self.approve()
+        self.assertEqual(self.settle(order_id).status_code, 302)
         self.assertEqual(self.save_cost(order_id, rate_date="").status_code, 400)
         self.assertEqual(self.save_cost(order_id, rate_date="2999-01-01").status_code, 400)
         self.assertEqual(self.save_cost(order_id, cost_basis="estimated", settlement="settled").status_code, 400)

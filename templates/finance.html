@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}财务模块{% endblock %}
 {% block content %}
-<div class="heading"><div><p class="kicker">客户结算</p><h1>财务模块</h1><p>新运单按审核收费计入，历史运单沿用原费用。</p></div></div>
+<div class="heading"><div><p class="kicker">客户结算</p><h1>财务模块</h1><p>TMS 订单确认最终应收后计入合计和账单导出。旧系统运单沿用原费用。</p></div></div>
 <section class="panel order-search">
 <form method="post" action="{{ url_for('views.finance') }}" class="search-form">
   <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -25,12 +25,12 @@
   <tr><td><a href="{{ url_for('views.shipment_detail', shipment_id=shipment.id) }}">{{ shipment.tracking_number }}</a></td>
   <td>{{ shipment.customer.name if shipment.customer else '—' }}</td><td>{{ shipment.agent.name if shipment.agent else '—' }}</td><td>{{ shipment.created_at.strftime('%Y-%m-%d') if shipment.created_at else '—' }}</td>
   {% if charge %}
-  {% for key in ['base', 'surcharge', 'operation', 'high_value'] %}<td>{{ charge.details[key] }}</td>{% endfor %}
+  {% for key in ['base', 'surcharge', 'operation', 'high_value'] %}<td>{{ charge.billing_label if key == 'base' and charge.final_total is none else charge.details[key] }}</td>{% endfor %}
   <td>{% if charge.details.other %}<details><summary>{{ charge.details.other_total }}</summary>
   {% for item in charge.details.other %}<small class="cell-note">{{ item.name }} · {{ item.amount }}</small>{% endfor %}
   </details>{% else %}{{ charge.details.other_total }}{% endif %}</td>
   {% else %}<td colspan="5" class="muted">历史费用 · 无拆分明细</td>{% endif %}
-  <td>{{ "%.2f"|format(charge.total if charge else (shipment.fee or 0)) }} {{ charge.currency if charge else 'CNY' }}</td>
+  <td>{% if charge and charge.final_total is none %}{{ charge.billing_label }}{% else %}{{ "%.2f"|format(charge.final_total if charge else (shipment.fee or 0)) }} {{ charge.currency if charge else 'CNY' }}{% endif %}</td>
   <td><span class="badge">未记录</span></td>
   {% if current_user.is_admin %}
   {% set entry = internal_costs.get(charge.order_id, {}) if charge else {} %}

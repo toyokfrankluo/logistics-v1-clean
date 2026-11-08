@@ -52,17 +52,21 @@ class TmsAudit(db.Model, TimestampMixin):
     action = db.Column(db.String(20), nullable=False)
 
 
+RECEIVABLE_CHECK = (
+    "(shipment_id IS NULL AND confirmed_by IS NULL AND confirmed_at IS NULL "
+    "AND total IS NULL AND currency IS NULL) OR "
+    "(shipment_id IS NOT NULL AND agent_id IS NOT NULL AND agent_service IS NOT NULL AND currency IS NOT NULL AND "
+    "((total IS NULL AND confirmed_by IS NULL AND confirmed_at IS NULL) OR "
+    "(total IS NOT NULL AND total >= 0 AND confirmed_by IS NOT NULL AND confirmed_at IS NOT NULL)))"
+)
+RECEIVABLE_CHECK_NAME = "ck_tms_receivable_confirmation_v2"
+
+
 class TmsReceivable(db.Model, TimestampMixin):
-    """One pricing draft or confirmed receivable per order, linked to one legacy shipment."""
+    """Draft sales terms, approved sales terms, or a reviewed customer charge."""
     __tablename__ = "tms_receivable"
     __table_args__ = (
-        db.CheckConstraint(
-            "(shipment_id IS NULL AND confirmed_by IS NULL AND confirmed_at IS NULL "
-            "AND total IS NULL AND currency IS NULL) OR "
-            "(shipment_id IS NOT NULL AND confirmed_by IS NOT NULL AND confirmed_at IS NOT NULL "
-            "AND agent_id IS NOT NULL AND agent_service IS NOT NULL AND total IS NOT NULL AND total >= 0 "
-            "AND currency IS NOT NULL)",
-            name="ck_tms_receivable_confirmation"),
+        db.CheckConstraint(RECEIVABLE_CHECK, name=RECEIVABLE_CHECK_NAME),
     )
     order_id = db.Column(db.Integer, db.ForeignKey("tms_order.id", ondelete="RESTRICT"), primary_key=True)
     shipment_id = db.Column(db.Integer, db.ForeignKey("shipment.id", ondelete="RESTRICT"), unique=True)
@@ -73,6 +77,18 @@ class TmsReceivable(db.Model, TimestampMixin):
     currency = db.Column(db.String(3))
     confirmed_by = db.Column(db.Integer)
     confirmed_at = db.Column(db.DateTime)
+
+    @property
+    def final_total(self):
+        return self.total if self.details.get("billing_state") == "confirmed" else None
+
+    @property
+    def billing_label(self):
+        if self.final_total is not None:
+            return "最终应收已确认"
+        if self.total is not None:
+            return "计费待复核" if self.details.get("billing_state") == "review" else "历史收费待复核"
+        return "待核算"
 
 
 class TmsChargeAdjustment(db.Model, TimestampMixin):

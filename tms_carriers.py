@@ -95,6 +95,18 @@ def available(profile, agent, key):
     return unavailable_reason(profile, agent, key) is None
 
 
+def create_blockers(profile, agent, code):
+    if not agent:
+        return ["未找到订单所选代理"]
+    reason = unavailable_reason(profile, agent, "create")
+    blockers = [reason] if reason else []
+    if profile and profile.provider == "nextsls" and profile.service_codes and code not in profile.service_codes:
+        blockers.append("审核所选渠道未列入代理的已确认渠道代码")
+    if not current_app.config.get("TMS_NEXTSLS_CREATE_ENABLED") and "系统未开放真实下单" not in blockers:
+        blockers.append("系统未开放真实下单")
+    return blockers
+
+
 def approved_shipment(order):
     if not carrier_schema() or order.status != "approved":
         raise nextsls.ProtocolError("请先完成迁移与订单审核。")
@@ -160,20 +172,26 @@ def attach_number(shipment, link, number):
 
 
 def send_order(order, actor_id, *, transport=None):
+    agent = db.session.get(CarrierAgent, order.agent_id) if order.agent_id else None
+    blockers = create_blockers(agent_profile(order.agent_id) if agent else None, agent, order.agent_service)
+    if blockers:
+        raise nextsls.ProtocolError("；".join(blockers) + "。")
     shipment, agent, profile, link = operation_context(order, "create")
     if shipment.shipment_id or (link and link.state != "new"):
         raise nextsls.ProtocolError("订单已有供应商单号或提交记录。请先对账，避免重复下单。")
     code = order.agent_service or ""
     if code not in profile.service_codes:
         raise nextsls.ProtocolError("审核选定的实际代理渠道尚未列入代理的已确认渠道代码。")
-    origin, token = profile.base_url, agent.app_token
+    origin, token, revision = profile.base_url, agent.app_token, order.revision
     info = nextsls.request_data(agent, origin, "/shipment/get_services", {"services": {"type": "all"}},
                                 transport=transport)
     service = nextsls.service_profile(info, code)
     db.session.expire_all()
+    db.session.refresh(order, with_for_update=True)
     shipment, agent, profile, link = operation_context(order, "create")
     db.session.refresh(shipment, with_for_update=True)
     if (profile.base_url != origin or agent.app_token != token or code not in profile.service_codes
+            or order.agent_service != code or order.revision != revision
             or shipment.shipment_id or (link and link.state != "new")):
         raise nextsls.ProtocolError("订单或代理配置已变化，请刷新后重新核对。")
     link = link or ensure_link(order)
@@ -184,18 +202,23 @@ def send_order(order, actor_id, *, transport=None):
 
     try:
         _, agent, profile, link = operation_context(order, "create")
-        if link.state != "sending" or profile.base_url != origin or agent.app_token != token or shipment.shipment_id:
+        if (link.state != "sending" or profile.base_url != origin or agent.app_token != token
+                or shipment.shipment_id or order.revision != revision or code not in profile.service_codes):
             raise nextsls.ProtocolError("提交预留已变化。")
         data = nextsls.request_data(agent, origin, "/shipment/create", payload, transport=transport)
         attach_number(shipment, link, nextsls.parse_supplier_number(data))
+        shipment.status = "代理已接单"
+        if transport is None and not current_app.config.get("ISOLATED_MODE"):
+            mark_verified(profile, {"create"})
         audit(link, "attempt", actor_id, {"state": "linked"})
         db.session.commit()
         return "linked"
-    except (nextsls.ProtocolError, IntegrityError):
+    except (nextsls.ProtocolError, IntegrityError) as error:
         db.session.rollback()
         link = db.session.get(TmsSupplierOrder, order.id)
         transition(link, "sending", "uncertain")
-        audit(link, "attempt", actor_id, {"state": "uncertain"})
+        reason = str(error) if isinstance(error, nextsls.ProtocolError) else "供应商结果未能关联，请先对账。"
+        audit(link, "attempt", actor_id, {"state": "uncertain", "reason": reason})
         db.session.commit()
         return "uncertain"
 
@@ -220,6 +243,7 @@ def reconcile_order(order, actor_id, *, transport=None):
         transition(link, link.state, "not_found")
     else:
         attach_number(shipment, link, number)
+        shipment.status = "代理已接单"
     audit(link, "reconcile", actor_id, {"state": "linked" if number else "not_found"})
     if transport is None and not current_app.config.get("ISOLATED_MODE"):
         mark_verified(profile, {"reconcile"})
@@ -277,6 +301,7 @@ def sync_snapshot(order, actor_id, *, transport=None):
     data = nextsls.request_data(agent, origin, "/shipment/get_info",
                                 {"shipment": {"shipment_id": supplier_number}}, transport=transport)
     db.session.expire_all()
+    db.session.refresh(order, with_for_update=True)
     shipment, agent, profile, link = operation_context(order, "details")
     reference_now = link.client_reference if link and link.attempt_at else shipment.tracking_number
     if (shipment.shipment_id != supplier_number or reference_now != known_reference
@@ -304,12 +329,14 @@ def sync_snapshot(order, actor_id, *, transport=None):
     link.tenant_origin = profile.base_url
     previous = latest_event(order.id, "snapshot")
     prior = previous.details if previous else {}
+    measurement_changed = not measurements.same_measurements(prior, snapshot) or prior.get("channel") != snapshot["channel"]
     prior_revision = prior.get("charge_revision")
     snapshot["charge_revision"] = (prior_revision if prior_revision and prior.get("charges") == snapshot["charges"]
                                    and prior.get("channel") == snapshot["channel"] else uuid4().hex)
-    if (prior.get("measurement_review") and prior.get("channel") == snapshot["channel"]
-            and measurements.same_measurements(prior, snapshot)):
+    if prior.get("measurement_review") and not measurement_changed:
         snapshot["measurement_review"] = prior["measurement_review"]
+    if measurement_changed and (measurements.has_measurements(prior) or measurements.has_measurements(snapshot)):
+        flag_billing_review(order)
     link.synced_at = datetime.utcnow()
     if previous is None or previous.details != snapshot:
         audit(link, "snapshot", actor_id, snapshot)
@@ -337,6 +364,7 @@ def verified_snapshot(order, shipment):
 
 
 def review_measurements(order, actor_id, form):
+    db.session.refresh(order, with_for_update=True)
     shipment, _ = approved_shipment(order)
     link, _ = verified_snapshot(order, shipment)
     if link is None:
@@ -362,8 +390,16 @@ def review_measurements(order, actor_id, form):
         "units": units, "reason": reason, "actor_id": actor_id,
         "confirmed_at": datetime.utcnow().isoformat(timespec="seconds"),
     }}
+    if units != snapshot.details.get("measurement_review", {}).get("units", {}):
+        flag_billing_review(order)
     audit(link, "snapshot", actor_id, details)
     db.session.commit()
+
+
+def flag_billing_review(order):
+    receivable = db.session.get(TmsReceivable, order.id, populate_existing=True)
+    if receivable and receivable.final_total is not None and receivable.details.get("unit") in {"kg", "cbm"}:
+        receivable.details = dict(receivable.details, billing_state="review")
 
 
 def exchange_date(value, *, required):
@@ -434,13 +470,14 @@ def cost_status(receivable, cost, snapshot):
 
 
 def profit(receivable, cost, snapshot):
-    if cost_status(receivable, cost, snapshot) != "实际成本已确认":
+    total = receivable.final_total
+    if total is None or cost_status(receivable, cost, snapshot) != "实际成本已确认":
         return None
     values = cost.details
     converted = (Decimal(values["payable"]) * Decimal(values["rate"])).quantize(CENT, rounding=ROUND_HALF_UP)
-    gross = receivable.total - converted - Decimal(values["other"])
+    gross = total - converted - Decimal(values["other"])
     return {"converted": converted, "gross": gross, "margin": (
-        (gross / receivable.total * 100).quantize(CENT, rounding=ROUND_HALF_UP) if receivable.total else None)}
+        (gross / total * 100).quantize(CENT, rounding=ROUND_HALF_UP) if total else None)}
 
 
 def finance_costs(rows):
@@ -538,7 +575,7 @@ def profit_export(rows, costs):
         entry = costs.get(receivable.order_id, {})
         cost, result = entry.get("cost"), entry.get("profit")
         details = cost.details if cost else {}
-        values.append((shipment.tracking_number, shipment.shipment_id, receivable.total, receivable.currency,
+        values.append((shipment.tracking_number, shipment.shipment_id, receivable.final_total, receivable.currency,
                        decimal_or_none(details.get("payable")), details.get("currency"),
                        decimal_or_none(details.get("rate")), decimal_or_none(details.get("other")),
                        result["gross"] if result else None, result["margin"] if result else None,

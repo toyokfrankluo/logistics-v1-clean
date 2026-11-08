@@ -89,14 +89,6 @@ function formatCents(cents, currency) {
 function pricingPreview(form) {
   const field = name => form.elements.namedItem(name).value;
   const currency = field("currency");
-  const quantity = scaled(field("quantity"), 3);
-  const rate = scaled(field("rate"), 4);
-  const validQuantity = quantity !== null && quantity > 0n && quantity <= 1000000000n &&
-    (field("unit") !== "shipment" || quantity === 1000n) &&
-    (field("unit") !== "box" || quantity % 1000n === 0n);
-  const base = validQuantity && rate !== null && rate <= 10000000000n ?
-    (quantity * rate + 50000n) / 100000n : null;
-  const fixed = ["surcharge", "operation", "high_value"].map(name => scaled(field(name), 2));
   const rows = [...form.querySelectorAll("[data-fee-row]")];
   const amounts = rows.map(row => scaled(row.querySelector('[name="other_amount"]').value, 2));
   const validAmounts = entries => entries.every(amount => amount !== null && amount <= 10000000000n);
@@ -106,11 +98,7 @@ function pricingPreview(form) {
       row.querySelector('[name="other_name"]').value.trim() &&
       row.querySelector('[name="other_currency"]').value === currency))
     ? amounts.reduce((sum, amount) => sum + amount, 0n) : null;
-  form.querySelector("[data-base]").textContent = base === null ? "—" : formatCents(base, currency);
   form.querySelector("[data-other-total]").textContent = other === null ? "—" : formatCents(other, currency);
-  const total = base !== null && other !== null && currency && field("unit") && validAmounts(fixed) ?
-    formatCents(base + other + fixed.reduce((sum, amount) => sum + amount, 0n), currency) : "填写完整后计算";
-  form.querySelector("[data-total]").textContent = total;
   form.querySelector("[data-add-fee]").disabled = rows.length >= 200;
 }
 document.addEventListener("input", event => {

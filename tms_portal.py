@@ -15,7 +15,8 @@ from flask import (
     Blueprint, abort, current_app, flash, g, redirect, render_template, request,
     send_file, session, url_for,
 )
-from flask_login import current_user, logout_user
+from flask_login import current_user
+from itsdangerous import BadData, URLSafeTimedSerializer
 from sqlalchemy import func, inspect, or_, select, text, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -25,9 +26,13 @@ from tms_invoice import (
     IDENTIFIER, REQUIRED_ADDRESS, InvoiceError, MAX_UPLOAD_BYTES, SERVICES, address_values,
     blank_invoice, comparable_address, parse_invoice, validated_catalogue,
 )
-from tms_models import TmsAccount, TmsAddressBook, TmsAudit, TmsOrder, TmsReceivable, TmsChargeAdjustment
+from tms_models import (
+    RECEIVABLE_CHECK, RECEIVABLE_CHECK_NAME, TmsAccount, TmsAddressBook, TmsAudit, TmsOrder,
+    TmsReceivable, TmsChargeAdjustment,
+)
 from tms_billing import (
-    CURRENCIES, FIXED, SOURCES, UNITS, billing_available, confirm_price, price_form, valid_draft,
+    CURRENCIES, FIXED, SETTLEMENT_SOURCES, UNITS, billing_available, confirm_sales_terms, price_form,
+    settle_charge, valid_draft,
 )
 from tms_xlsx_images import MEDIA_PART, image_type
 import nextsls
@@ -38,13 +43,16 @@ from tms_models import TmsAgentApi, TmsSupplierEvent, TmsSupplierOrder
 client = Blueprint("tms_client", __name__, url_prefix="/tms/customer")
 staff = Blueprint("tms_staff", __name__, url_prefix="/tms/admin")
 SESSION_KEY = "xingrui_customer"
+CUSTOMER_COOKIE = "xingrui_customer_session"
 CLIENT_POSTS = frozenset(f"tms_client.{name}" for name in ("sign_in", "sign_out", "upload", "confirm"))
 SESSION_TTL = timedelta(hours=8)
 DUMMY_HASH = generate_password_hash(token_hex(32))
 STATUS_LABELS = {"draft": "待确认", "pending": "待审核", "approved": "审核通过", "rejected": "审核驳回"}
 AUDIT_LABELS = {
     "upload": "上传发票", "replace": "更正发票", "confirm": "提交审核",
-    "approve": "审核通过", "reject": "审核驳回", "pricing_draft": "保存收费草稿", "adjust": "调整费用",
+    "approve": "审核通过", "reject": "审核驳回", "pricing_draft": "保存收费草稿", "adjust": "调整销售条款",
+    "settle": "确认最终应收",
+    "supplier_channel": "更正未提交的代理渠道",
 }
 BUSINESS_TIME = timezone(timedelta(hours=8))
 ORDER_FILTERS = {
@@ -109,6 +117,30 @@ def init_tms(app):
         create_tms_schema()
         click.echo("TMS 表已就绪。")
 
+    @app.cli.command("tms-upgrade-billing")
+    @click.option("--confirm", is_flag=True, help="Enable approved pricing without a final total.")
+    def upgrade_billing(confirm):
+        if not confirm:
+            raise click.UsageError("请先核对数据库目标并备份，再明确使用 --confirm。")
+        with db.engine.begin() as connection:
+            if connection.dialect.name != "postgresql":
+                raise click.ClickException("此约束迁移仅适用于 PostgreSQL。")
+            connection.execute(text("SET LOCAL lock_timeout = '5s'"))
+            connection.execute(text("SELECT pg_advisory_xact_lock(651360348)"))
+            constraints = {item["name"] for item in inspect(connection).get_check_constraints("tms_receivable")}
+            old = "ck_tms_receivable_confirmation"
+            if RECEIVABLE_CHECK_NAME not in constraints:
+                if old not in constraints:
+                    raise click.ClickException("未找到预期的旧计费约束，迁移已停止。")
+                connection.execute(text(
+                    f"ALTER TABLE tms_receivable ADD CONSTRAINT {RECEIVABLE_CHECK_NAME} "
+                    f"CHECK ({RECEIVABLE_CHECK}) NOT VALID"
+                ))
+            connection.execute(text(f"ALTER TABLE tms_receivable VALIDATE CONSTRAINT {RECEIVABLE_CHECK_NAME}"))
+            if old in constraints:
+                connection.execute(text(f"ALTER TABLE tms_receivable DROP CONSTRAINT {old}"))
+        click.echo("TMS 分阶段计费约束已就绪。")
+
 
 def create_tms_schema():
     with db.engine.begin() as connection:
@@ -123,13 +155,18 @@ def create_tms_schema():
 def customer_required():
     if request.endpoint == "tms_client.sign_in":
         return
-    identity = session.get(SESSION_KEY)
+    cookie = request.cookies.get(CUSTOMER_COOKIE)
+    identity = session.get(SESSION_KEY) if cookie is None else None
+    if cookie is not None:
+        try:
+            identity = customer_session_serializer().loads(cookie, max_age=int(SESSION_TTL.total_seconds()))
+        except BadData:
+            pass
     if isinstance(identity, dict) and identity.get("expiry", 0) > datetime.now().timestamp():
         account = db.session.get(TmsAccount, identity["account_id"])
         if account and account.active and account.customer_id == identity["customer_id"]:
             g.tms_account = account
             return
-    session.pop(SESSION_KEY, None)
     return redirect(url_for("tms_client.sign_in"))
 
 
@@ -148,6 +185,15 @@ def page(template, **context):
     )
 
 
+def customer_session_serializer():
+    return URLSafeTimedSerializer(current_app.secret_key, salt="xingrui.customer.session.v1")
+
+
+def customer_cookie_options():
+    return dict(path=client.url_prefix, httponly=True, samesite="Lax",
+                secure=current_app.config["SESSION_COOKIE_SECURE"])
+
+
 @client.route("/login", methods=["GET", "POST"])
 def sign_in():
     if request.method == "GET":
@@ -160,19 +206,23 @@ def sign_in():
     valid = check_password_hash(account.password_hash if account else DUMMY_HASH, password)
     if not valid or not account or not account.active:
         return page("login", error="账号或密码不正确。"), 401
-    session.clear()
-    logout_user()
-    session[SESSION_KEY] = {
+    session.pop(SESSION_KEY, None)
+    identity = {
         "account_id": account.id, "customer_id": account.customer_id,
         "expiry": (datetime.now() + SESSION_TTL).timestamp(),
     }
-    return redirect(url_for("tms_client.orders"))
+    response = redirect(url_for("tms_client.orders"))
+    response.set_cookie(CUSTOMER_COOKIE, customer_session_serializer().dumps(identity),
+                        **customer_cookie_options())
+    return response
 
 
 @client.post("/logout")
 def sign_out():
     session.pop(SESSION_KEY, None)
-    return redirect(url_for("tms_client.sign_in"))
+    response = redirect(url_for("tms_client.sign_in"))
+    response.delete_cookie(CUSTOMER_COOKIE, **customer_cookie_options())
+    return response
 
 
 def owned_orders():
@@ -433,7 +483,7 @@ def order_detail(order, **context):
             customer_view = customer_measurement_view(order, owned_shipment)
     return page(template, order=order, totals=invoice_totals(order.invoice), shipment=shipment, tracks=tracks,
                 business_date=business_date, events=events, receivable=receivable, customer_measurements=customer_view,
-                units=UNITS, sources=SOURCES, currencies=CURRENCIES, fixed=FIXED, **context)
+                units=UNITS, settlement_sources=SETTLEMENT_SOURCES, currencies=CURRENCIES, fixed=FIXED, **context)
 
 
 @client.get("/template")
@@ -648,7 +698,13 @@ def staff_detail(order, **context):
             cost = tms_carriers.latest_event(order.id, "cost")
             supplier = {
                 "link": link, "snapshot": snapshot, "cost": cost, "supplier_number": shipment.shipment_id,
-                "can_create": bool(agent and tms_carriers.available(profile, agent, "create")),
+                "last_attempt": (tms_carriers.latest_event(order.id, "attempt")
+                                 if link and link.state == "uncertain" else None),
+                "agent_name": agent.name if agent else "—",
+                "channel_choices": ([code for code in profile.service_codes if code != order.agent_service]
+                                    if profile and profile.provider == "nextsls" and not shipment.shipment_id
+                                    and (not link or (link.state == "new" and not link.attempt_at)) else []),
+                "create_blockers": tms_carriers.create_blockers(profile, agent, order.agent_service),
                 "can_reconcile": bool(agent and tms_carriers.available(profile, agent, "reconcile")),
                 "can_sync": bool(agent and any(tms_carriers.available(profile, agent, key)
                                  for key in tms_carriers.DETAILS)),
@@ -684,15 +740,20 @@ def review(order_id):
 def supplier_action(order_id):
     order = reviewable_order(order_id)
     action = request.form.get("action")
-    if action not in {"create", "reconcile", "retry", "sync", "cost", "measurement_review"}:
+    if action not in {"create", "channel", "reconcile", "retry", "sync", "cost", "measurement_review"}:
         abort(400)
     try:
         if action == "create":
             if request.form.get("confirm") != "yes":
                 raise nextsls.ProtocolError("请确认本票供应商下单。")
+            if request.form.get("revision", type=int) != order.revision:
+                raise nextsls.ProtocolError("订单已经更新，请重新核对本票下单资料。")
             state = tms_carriers.send_order(order, current_user.id)
             message = ("已保存供应商运单号。" if state == "linked"
                        else "提交结果未确认。请先对账，系统不会自动重试。")
+        elif action == "channel":
+            correct_supplier_channel(order)
+            message = "已更正未提交的代理渠道。"
         elif action == "reconcile":
             state = tms_carriers.reconcile_order(order, current_user.id)
             message = ("已核对并保存供应商运单号。" if state == "linked"
@@ -721,6 +782,33 @@ def supplier_action(order_id):
     return redirect(url_for("tms_staff.review", order_id=order.id))
 
 
+def correct_supplier_channel(order):
+    db.session.refresh(order, with_for_update=True)
+    if request.form.get("revision", type=int) != order.revision:
+        raise nextsls.ProtocolError("订单已更新，请刷新后核对渠道。")
+    shipment, receivable = tms_carriers.approved_shipment(order)
+    link = db.session.get(TmsSupplierOrder, order.id)
+    if shipment.shipment_id or (link and (link.state != "new" or link.attempt_at)):
+        raise nextsls.ProtocolError("已提交或已关联代理的订单不能更改渠道。")
+    profile = tms_carriers.agent_profile(order.agent_id)
+    code = request.form.get("channel_code", "").strip()
+    if (not profile or profile.provider != "nextsls" or code == order.agent_service
+            or not nextsls.CODE.fullmatch(code) or code not in profile.service_codes):
+        raise nextsls.ProtocolError("请选择此代理已配置且不同于当前值的渠道代码。")
+    reason = nextsls.supplied_text(request.form.get("channel_reason"), 200)
+    review = {"from": order.agent_service, "to": code, "reason": reason,
+              "by": current_user.id, "at": datetime.now(timezone.utc).isoformat()}
+    invoice = dict(order.invoice, supplier_channel_reviews=[
+        *order.invoice.get("supplier_channel_reviews", []), review,
+    ])
+    update_order(order, {"agent_service": code, "invoice": invoice})
+    receivable.agent_service = code
+    if receivable.final_total is not None:
+        receivable.details = dict(receivable.details, billing_state="review")
+    history(order, "supplier_channel")
+    db.session.commit()
+
+
 @staff.get("/orders/<int:order_id>/supplier/measurements.xlsx")
 def supplier_measurements(order_id):
     order = reviewable_order(order_id)
@@ -739,9 +827,9 @@ def supplier_measurements(order_id):
 def decide(order_id):
     order = reviewable_order(order_id)
     decision = request.form.get("decision")
-    if decision not in {"approve", "reject", "draft", "adjust"}:
+    if decision not in {"approve", "reject", "draft", "adjust", "settle"}:
         abort(400)
-    required_status = "approved" if decision == "adjust" else "pending"
+    required_status = "approved" if decision in {"adjust", "settle"} else "pending"
     if order.status != required_status or request.form.get("revision", type=int) != order.revision:
         abort(409, "订单刚刚变更，请刷新后再审核。")
 
@@ -757,6 +845,9 @@ def decide(order_id):
         try:
             save_pricing(order, decision)
         except ValueError as error:
+            db.session.rollback()
+            if decision == "settle":
+                return staff_detail(order, settlement_error=str(error)), 400
             return staff_detail(order, pricing_error=str(error), posted=pricing_input()), 400
         except SQLAlchemyError:
             db.session.rollback()
@@ -810,6 +901,9 @@ def reviewed_invoice(invoice, form):
 
 def save_pricing(order, decision):
     form = request.form
+    if decision == "settle":
+        save_settlement(order, form)
+        return
     values = price_form(form)
     valid_draft(values)
     receivable = db.session.get(TmsReceivable, order.id)
@@ -819,13 +913,17 @@ def save_pricing(order, decision):
         reason = form.get("adjustment_reason", "").strip()
         if not 1 <= len(reason) <= 500:
             raise ValueError("请填写本次费用调整的原因。")
-        details = confirm_price(values, form)
+        details = confirm_sales_terms(values, form)
+        details.update(sales_by=current_user.id, sales_at=datetime.now(timezone.utc).isoformat())
+        if receivable.total is not None:
+            details["billing_state"] = "review"
+            details["previous_amount_currency"] = receivable.details.get("previous_amount_currency", receivable.currency)
         update_order(order, {})
         db.session.add(TmsChargeAdjustment(
             order_id=order.id, previous=receivable.details, revised=details,
             reason=reason, actor_id=current_user.id,
         ))
-        receivable.details, receivable.total, receivable.currency = details, Decimal(details["total"]), details["currency"]
+        receivable.details, receivable.currency = details, details["currency"]
         history(order, "adjust")
         return
 
@@ -842,7 +940,7 @@ def save_pricing(order, decision):
         profile = tms_carriers.agent_profile(agent.id)
         if profile and profile.provider == "nextsls" and profile.service_codes and service not in profile.service_codes:
             raise ValueError("请选择此 NextSLS 代理已配置的渠道代码。")
-    details = confirm_price(values, form) if decision == "approve" else values
+    details = confirm_sales_terms(values, form) if decision == "approve" else values
     if decision == "approve":
         invoice = order.invoice
         changes = {"status": "approved", "agent_id": agent.id, "agent_service": service}
@@ -857,7 +955,7 @@ def save_pricing(order, decision):
             tracking_number=invoice["customer_number"], customer_id=order.customer_id, agent_id=agent.id,
             destination=invoice["address"]["country"], channel=invoice["service"],
             pieces=len(invoice["boxes"]), weight=float(invoice_totals(invoice)["weight"]),
-            status="已创建",
+            status="待提交代理",
         )
         db.session.add(shipment)
         db.session.flush()
@@ -869,9 +967,56 @@ def save_pricing(order, decision):
     receivable.details, receivable.agent_id, receivable.agent_service = details, agent_id, service or None
     if decision == "approve":
         receivable.shipment_id = shipment.id
-        receivable.total, receivable.currency = Decimal(details["total"]), details["currency"]
-        receivable.confirmed_by, receivable.confirmed_at = current_user.id, datetime.now(timezone.utc).replace(tzinfo=None)
+        receivable.currency = details["currency"]
+        details.update(sales_by=current_user.id, sales_at=datetime.now(timezone.utc).isoformat())
     history(order, "approve" if decision == "approve" else "pricing_draft")
+
+
+def save_settlement(order, form):
+    update_order(order, {})  # Serialize against other settlements and supplier measurement updates.
+    receivable = db.session.get(TmsReceivable, order.id, populate_existing=True)
+    if not receivable or not receivable.shipment_id:
+        raise ValueError("未找到与运单关联的销售条款。")
+    if form.get("settlement_confirmed") != "yes":
+        raise ValueError("请明确确认最终应收。")
+    source = form.get("settlement_source")
+    note = form.get("settlement_note", "").strip()
+    if source not in SETTLEMENT_SOURCES or not 1 <= len(note) <= 200:
+        raise ValueError("请选择计费依据，并填写已核实的来源或凭证。")
+    old = receivable.details
+    unit = old["unit"]
+    shipment = db.session.get(Shipment, receivable.shipment_id)
+    if (not shipment or shipment.customer_id != order.customer_id
+            or shipment.tracking_number != order.invoice["customer_number"]
+            or shipment.agent_id != order.agent_id or receivable.agent_id != order.agent_id):
+        raise ValueError("订单、运单和代理关联不完整，请先人工核对。")
+    if form.get("settlement_unit") != unit:
+        raise ValueError("计费数量单位必须与审核销售条款一致。")
+    quantity = form.get("settlement_quantity", "").strip()
+    if source == "snapshot":
+        _, snapshot = tms_carriers.verified_snapshot(order, shipment)
+        if not snapshot or form.get("settlement_snapshot") != str(snapshot.id):
+            raise ValueError("没有当前代理测量，或数据刚刚更新，请刷新后复核。")
+        details = snapshot.details
+        expected = {"kg": "kg", "cbm": "m³"}.get(unit)
+        confirmed = details.get("measurement_review", {}).get("units", {}).get("chargeable_weight")
+        quantity = details.get("summary", {}).get("chargeable_weight")
+        if not details.get("identity_verified") or not expected or confirmed != expected or quantity is None:
+            raise ValueError("代理计费量尚未核对，或其单位与审核渠道的计费方式不同。")
+    revised = settle_charge(old, quantity, source, note)
+    revised.pop("previous_amount_currency", None)
+    if source == "snapshot":
+        revised["billing_snapshot_id"] = snapshot.id
+    else:
+        revised.pop("billing_snapshot_id", None)
+    revised.update(settled_by=current_user.id, settled_at=datetime.now(timezone.utc).isoformat())
+    db.session.add(TmsChargeAdjustment(order_id=order.id, previous=old, revised=revised,
+                                       reason=note, actor_id=current_user.id))
+    receivable.details = revised
+    receivable.total = Decimal(revised["total"])
+    receivable.confirmed_by = current_user.id
+    receivable.confirmed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    history(order, "settle")
 
 
 @staff.get("/orders/<int:order_id>/invoice")

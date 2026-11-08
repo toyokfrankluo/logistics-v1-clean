@@ -15,6 +15,9 @@
 {% if order.rejection_reason %}<p class="error">驳回原因：{{ order.rejection_reason }}</p>{% endif %}
 {% if staff %}
 <p class="notice">客户：{{ customer.name }}{% if order.agent_service %} · 代理服务：{{ order.agent_service }}{% endif %}</p>
+{% if supplier and not supplier.supplier_number and (not supplier.link or supplier.link.state == 'new') %}
+<a class="button" href="#supplier-order">待提交代理 · 核对下单</a>
+{% endif %}
 {% endif %}
 {% if staff and order.status == 'pending' %}
 <a class="button secondary review-jump" href="#review-pricing">跳到地址与收费审核</a>
@@ -112,8 +115,11 @@
   {% if receivable and receivable.shipment_id %}
     {% include "tms/charge_summary.html" %}
     {% if staff %}
-    <p class="muted">审核人 #{{ receivable.confirmed_by }} · {{ business_date(receivable.confirmed_at) }}（北京时间）</p>
-    <p>计费依据：{{ receivable.details.quantity }} {{ units[receivable.details.unit] }} × {{ receivable.details.rate }} {{ receivable.currency }} · {{ sources[receivable.details.quantity_source] }}{% if receivable.details.source_note %} · {{ receivable.details.source_note }}{% endif %}</p>
+    {% if receivable.final_total is not none %}
+    <p>应收确认人 #{{ receivable.confirmed_by }} · {{ business_date(receivable.confirmed_at) }}（北京时间）。计费依据：{{ settlement_sources.get(receivable.details.quantity_source, '人工核实') }} · {{ receivable.details.source_note }}</p>
+    {% elif receivable.total is not none %}
+    <p class="notice">留存原金额 {{ receivable.total }} {{ receivable.details.get('previous_amount_currency', receivable.currency) }}，仅供内部复核。旧流程填写的数量未标记为代理实测。</p>
+    {% endif %}
     {% if receivable.details.review_note %}<p>审核备注：{{ receivable.details.review_note }}</p>{% endif %}
     {% endif %}
   {% else %}<p class="muted">暂无已确认的收费记录。</p>{% endif %}
@@ -138,7 +144,7 @@
 </div>
 <aside>
 <section class="panel" id="review-pricing"><h2>收费设置</h2>
-<p class="muted">审核确认后生成一票运单及客户应收。代理运输渠道与客户所选星睿服务分别保存。</p>
+<p class="muted">审核后保存内部运单和销售条款。最终应收待确认计费数量，代理下单需另行提交。</p>
 {% include "tms/pricing_form.html" %}
 </section>
 <section class="panel">
@@ -154,8 +160,26 @@
 </aside></div>
 {% elif staff and order.status == 'approved' and receivable and receivable.shipment_id %}
 {% if supplier %}{% include "tms/supplier.html" %}{% endif %}
+<details class="panel"{% if settlement_error or receivable.final_total is none %} open{% endif %}>
+<summary>确认最终应收</summary>
+{% if settlement_error %}<p class="error" role="alert">{{ settlement_error }}</p>{% endif %}
+<form method="post" action="{{ url_for('tms_staff.decide', order_id=order.id) }}" class="pricing-form">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <input type="hidden" name="revision" value="{{ order.revision }}">
+  <input type="hidden" name="settlement_unit" value="{{ receivable.details.unit }}">
+  {% if supplier.snapshot %}<input type="hidden" name="settlement_snapshot" value="{{ supplier.snapshot.id }}">{% endif %}
+  <label>计费依据<select name="settlement_source" required><option value="">请选择已核实的依据</option>
+    {% if supplier.snapshot and receivable.details.unit in ['kg','cbm'] %}<option value="snapshot">代理接口已核对计费量</option>{% endif %}
+    <option value="manual">人工核实凭证</option>
+  </select></label>
+  <label>人工核实数量（{{ units[receivable.details.unit] }}）<input name="settlement_quantity" inputmode="decimal" maxlength="24" placeholder="使用代理接口计费量时留空"></label>
+  <label>计费依据说明<input name="settlement_note" maxlength="200" required placeholder="填写渠道规则、核对凭证或箱票依据"></label>
+  <label class="check-label"><input type="checkbox" name="settlement_confirmed" value="yes" required>我已核实计费依据和数量，确认最终应收</label>
+  <button name="decision" value="settle">确认最终应收</button>
+</form>
+</details>
 <details class="panel"{% if pricing_error %} open{% endif %}>
-<summary>调整已审核费用</summary>
+<summary>调整销售条款</summary>
 {% include "tms/pricing_form.html" %}
 </details>
 {% if adjustments %}

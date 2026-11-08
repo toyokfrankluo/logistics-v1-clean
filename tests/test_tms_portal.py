@@ -291,9 +291,15 @@ class PortalTests(unittest.TestCase):
 
     def pricing(self, **changes):
         return dict(agent_id=self.agent.id, agent_service="虚构代理渠道",
-                    unit="kg", quantity="100", quantity_source="declared", rate="12",
+                    unit="kg", rate="12",
                     surcharge="0", operation="0", high_value="0", currency="CNY",
                     other_mode="none", confirmed="yes", destination_confirmed="yes") | changes
+
+    def settle(self, order_id, **changes):
+        revision = db.session.get(TmsOrder, order_id).revision
+        fields = dict(settlement_unit="kg", settlement_source="manual", settlement_quantity="100",
+                      settlement_note="虚构已核实凭证", settlement_confirmed="yes")
+        return self.decision(order_id, revision, decision="settle", **(fields | changes))
 
     def pending_order(self):
         order_id = self.get_order()
@@ -347,11 +353,43 @@ class PortalTests(unittest.TestCase):
         self.assertNotIn("内部代理服务代码", self.get(self.alice, f"/tms/customer/orders/{order_id}").get_data(as_text=True))
         self.assertEqual(Shipment.query.count(), 1)
         charge = db.session.get(TmsReceivable, order_id)
-        self.assertEqual(charge.total, Decimal("1200.00"))
+        self.assertIsNone(charge.total)
+        self.assertIsNone(charge.confirmed_at)
+        self.assertEqual(charge.details["rate"], "12")
+        self.assertIn("待代理实测", self.get(self.alice, f"/tms/customer/orders/{order_id}").get_data(as_text=True))
         shipment = db.session.get(Shipment, charge.shipment_id)
         self.assertEqual((shipment.customer_id, shipment.agent_id), (self.customer_a.id, self.agent.id))
         self.assertIsNone(shipment.shipment_id)
         self.assertIsNone(shipment.third_party_tracking_number)
+
+    def test_two_logins_and_independent_logout_in_one_browser(self):
+        other_order = self.get_order()
+        browser = self.staff
+        self.assertEqual(self.staff_login().status_code, 302)
+        self.assertEqual(self.sign_in(browser, "customer-b").status_code, 302)
+        self.assertEqual(self.get(browser, "/tms/admin/").status_code, 200)
+        self.assertEqual(self.get(browser, "/tms/customer/").status_code, 200)
+        self.assertEqual(self.get(browser, f"/tms/customer/orders/{other_order}").status_code, 404)
+        self.assertEqual(self.post(browser, "/logout", {}, "/login").status_code, 302)
+        self.assertEqual(self.get(browser, "/tms/admin/").status_code, 302)
+        self.assertEqual(self.get(browser, "/tms/customer/").status_code, 200)
+        self.assertEqual(self.staff_login().status_code, 302)
+        self.assertEqual(self.get(browser, "/tms/customer/").status_code, 200)
+        self.assertEqual(self.post(browser, "/tms/customer/logout", {}).status_code, 302)
+        self.assertEqual(self.get(browser, "/tms/customer/").status_code, 302)
+        self.assertEqual(self.get(browser, "/tms/admin/").status_code, 200)
+
+    def test_customer_cookie_expiry_and_revocation_keep_admin_login(self):
+        self.staff_login()
+        self.sign_in(self.staff, "customer-b")
+        from itsdangerous.timed import TimestampSigner
+        with patch.object(TimestampSigner, "get_timestamp", return_value=TimestampSigner("fixture").get_timestamp() + 28801):
+            self.assertEqual(self.get(self.staff, "/tms/customer/").status_code, 302)
+            self.assertEqual(self.get(self.staff, "/tms/admin/").status_code, 200)
+        TmsAccount.query.filter_by(username="customer-b").one().active = False
+        db.session.commit()
+        self.assertEqual(self.get(self.staff, "/tms/customer/").status_code, 302)
+        self.assertEqual(self.get(self.staff, "/tms/admin/").status_code, 200)
 
     def test_reject_and_replace(self):
         order_id = self.get_order()
@@ -547,6 +585,9 @@ class PortalTests(unittest.TestCase):
                            destination_reason="虚构人工复核")
             self.assertEqual(self.decision(order_id, 2, decision="approve", **charges).status_code, 302)
             receivable = db.session.get(TmsReceivable, order_id)
+            self.assertIsNone(receivable.total)
+            self.assertEqual(self.settle(order_id).status_code, 302)
+            db.session.expire_all()
             self.assertEqual(receivable.total, Decimal("1218.00"))
             self.assertEqual(db.session.get(Shipment, receivable.shipment_id).destination, "CA")
             self.assertEqual(TmsSupplierOrder.query.count(), 0)
@@ -615,8 +656,7 @@ class PortalTests(unittest.TestCase):
     def test_required_pricing_fields_and_explicit_zero(self):
         order_id = self.pending_order()
         cases = (("agent_id", "", "启用的实际物流代理"), ("agent_service", "", "实际代理运输渠道"),
-                 ("rate", "", "计费单价"), ("quantity", "0", "计费数量"),
-                 ("quantity", "NaN", "计费数量"), ("quantity_source", "", "计费数量来源"),
+                 ("rate", "", "计费单价"),
                  ("operation", "", "操作费"), ("surcharge", "", "附加费"),
                  ("high_value", "-1", "超值费"), ("other_mode", "", "无其他费用"),
                  ("confirmed", "", "请确认收费"))
@@ -649,6 +689,12 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(self.decision(order_id, 3, decision="approve", **values).status_code, 409)
         db.session.expire_all()
         row = db.session.get(TmsReceivable, order_id)
+        self.assertIsNone(row.final_total)
+        self.assertNotIn("1217.10 USD", self.get(self.staff, "/finance").get_data(as_text=True))
+        pending_export = self.post(self.staff, "/finance", {"export": "1", "tracking_number": "0000123"}, "/login")
+        self.assertEqual(pending_export.status_code, 400)
+        self.assertEqual(self.settle(order_id).status_code, 302)
+        db.session.expire_all()
         self.assertEqual(row.total, Decimal("1217.10"))
         self.assertEqual(len(row.details["other"]), 1)
         self.assertEqual(Shipment.query.count(), 2)
@@ -673,16 +719,19 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(self.decision(order_id, 2, decision="approve", **self.pricing()).status_code, 302)
         receivable = db.session.get(TmsReceivable, order_id)
         shipment_id = receivable.shipment_id
-        self.assertEqual(self.decision(order_id, 3, decision="adjust", **self.pricing(rate="13")).status_code, 400)
-        response = self.decision(order_id, 3, decision="adjust", **self.pricing(
-            rate="13", adjustment_reason="虚构实测更正", review_note="仅管理端备注", quantity_source="warehouse"))
+        self.assertEqual(self.settle(order_id).status_code, 302)
+        self.assertEqual(self.decision(order_id, 4, decision="adjust", **self.pricing(rate="13")).status_code, 400)
+        response = self.decision(order_id, 4, decision="adjust", **self.pricing(
+            rate="13", adjustment_reason="虚构实测更正", review_note="仅管理端备注"))
         self.assertEqual(response.status_code, 302)
         db.session.expire_all()
-        history = TmsChargeAdjustment.query.one()
-        self.assertEqual((history.previous["total"], history.revised["total"]), ("1200.00", "1300.00"))
+        history = TmsChargeAdjustment.query.order_by(TmsChargeAdjustment.id.desc()).first()
+        self.assertEqual((history.previous["total"], history.revised["rate"]), ("1200.00", "13"))
+        self.assertIsNone(receivable.final_total)
         self.assertEqual(history.reason, "虚构实测更正")
         self.assertIsNotNone(history.actor_id)
         self.assertIsNotNone(history.created_at)
+        self.assertEqual(self.settle(order_id).status_code, 302)
         for url in (f"/shipments/edit/{shipment_id}", f"/shipments/{shipment_id}/edit"):
             self.assertEqual(self.post(self.staff, url, {"fee": "1"}, "/login").status_code, 409)
         self.assertEqual(self.post(self.staff, f"/shipments/delete/{shipment_id}", {}, "/login").status_code, 409)
@@ -691,6 +740,23 @@ class PortalTests(unittest.TestCase):
         self.assertNotIn("仅管理端备注", customer_view)
         self.assertNotIn("虚构实测更正", customer_view)
         self.assertIn("1300.00 CNY", self.get(self.staff, "/finance").get_data(as_text=True))
+
+    def test_legacy_amount_stays_in_storage_but_requires_review_and_box_settles(self):
+        order_id = self.pending_order()
+        self.assertEqual(self.decision(order_id, 2, decision="approve", **self.pricing(unit="box")).status_code, 302)
+        self.assertEqual(self.settle(order_id, settlement_unit="box", settlement_quantity="1.5").status_code, 400)
+        self.assertEqual(self.settle(order_id, settlement_unit="box", settlement_quantity="2").status_code, 302)
+        charge = db.session.get(TmsReceivable, order_id)
+        charge.details = {key: value for key, value in charge.details.items() if key != "billing_state"}
+        charge.details = dict(charge.details, quantity_source="manual", total="800.00")
+        charge.total = Decimal("800.00")
+        db.session.commit()
+        self.assertIn("留存原金额 800.00 CNY", self.get(self.staff, f"/tms/admin/orders/{order_id}").get_data(as_text=True))
+        customer = self.get(self.alice, f"/tms/customer/orders/{order_id}").get_data(as_text=True)
+        self.assertIn("历史收费待复核", customer)
+        self.assertNotIn("800.00", customer)
+        self.assertNotIn("800.00", self.get(self.staff, "/finance").get_data(as_text=True))
+        self.assertEqual(charge.total, Decimal("800.00"))
 
     def test_duplicate_legacy_reference_and_commit_failure_do_not_approve(self):
         order_id = self.pending_order()
