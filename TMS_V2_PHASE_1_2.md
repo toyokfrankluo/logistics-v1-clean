@@ -57,7 +57,7 @@ NextSLS 的创建计划以客户单号映射 `client_reference`、星睿渠道�
 受控发布顺序：
 
 1. 在隔离的 PostgreSQL 恢复副本中核对现有表、备份与恢复，再用 `FLASK_SKIP_DOTENV=1 python -m flask --app app tms-upgrade-v1 --confirm` 应用三张增量表。启动时不会执行该命令。当前仅在隔离 SQLite 执行了迁移验证。
-2. 为每个客户配置独立、经人工审批的地址库 `<Customer.id>.xlsx`。由服务端从 `TMS_ADDRESS_BOOK_DIR` 读取。可配置 `TMS_INVOICE_TEMPLATE_PATH` 复用公司工作簿的发票版式，只复制格式。发布前提供受控、持久的地址库来源，勿依赖 Render 实例临时磁盘。
+2. 地址库版本用同一条增量命令创建 `tms_address_book`。进入「客户账号 → 维护地址库」，按客户上传含「地址库」工作表的 Excel。只保存校验过的地址字段，上传会替换该客户的地址库，已保存订单保留原地址快照。客户只能下载自己的地址库，上传发票中的地址表不作为授权来源。数据库地址库优先；`TMS_ADDRESS_BOOK_DIR` 仅用于兼容已有的本地地址库配置，Render 无需设置。可选的 `TMS_INVOICE_TEMPLATE_PATH` 仍仅复制版式。
 3. 核验 HTTPS、会话、CSRF、账号登录限速、客户隔离、数据库和文件保留策略。通过后设置 `TMS_ENABLED=1`，再将独立官网的 `PUBLIC_TMS_CUSTOMER_URL` 指向批准的客户入口。默认关闭 TMS。
 4. 回退时先关闭 TMS 并撤下官网跳转。保留增量表和已提交订单，待核对后再处理，避免回退时丢失业务数据。
 

@@ -21,7 +21,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from app import app, User
 from models import BankAccount, CarrierAgent, Customer, Shipment, db
 from tms_invoice import InvoiceError, SERVICES, blank_invoice, parse_invoice
-from tms_models import (TmsAccount, TmsAgentApi, TmsAudit, TmsChargeAdjustment, TmsOrder, TmsReceivable,
+from tms_models import (TmsAccount, TmsAddressBook, TmsAgentApi, TmsAudit, TmsChargeAdjustment, TmsOrder, TmsReceivable,
                         TmsSupplierEvent, TmsSupplierOrder)
 from tms_xlsx_images import XLSX_NS
 
@@ -463,6 +463,59 @@ class PortalTests(unittest.TestCase):
         self.assertIsNone(sheet["D4"].value)
         self.assertIsNone(sheet["O23"].value)
 
+    def test_database_catalogue_workflow_without_filesystem(self):
+        path = f"/tms/admin/accounts/{self.customer_a.id}/address-book"
+        self.assertEqual(self.staff_login().status_code, 302)
+        with patch.dict(app.config, TMS_ADDRESS_BOOK_DIR=None):
+            self.assertEqual(self.get(self.staff, path).status_code, 200)
+            saved = self.post(self.staff, path, {
+                "catalogue": (io.BytesIO(workbook_bytes(recipient="虚构授权地址")), "catalogue.xlsx"),
+            }, "/login")
+            self.assertEqual(saved.status_code, 302)
+            db.session.expire_all()
+            self.assertEqual(len(db.session.get(TmsAddressBook, self.customer_a.id).rows), 1)
+            self.assertEqual(self.sign_in(self.alice, "customer-a").status_code, 302)
+            downloaded = self.get(self.alice, "/tms/customer/template")
+            book = load_workbook(io.BytesIO(downloaded.data))
+            self.addCleanup(book.close)
+            self.assertEqual(book["地址库"]["E2"].value, "虚构授权地址")
+            self.assertIn("地址库!", book["星睿发票"]["L7"].value)
+            response = self.upload(self.alice, workbook_bytes(recipient="伪造上传地址"))
+            self.assertEqual(response.status_code, 302)
+            order_id = int(response.location.rsplit("/", 1)[1])
+            self.assertIn("虚构授权地址", self.get(self.alice, response.location).get_data(as_text=True))
+            self.sign_in(self.bob, "customer-b")
+            self.assertEqual(self.get(self.bob, "/tms/customer/template").status_code, 400)
+            self.assertEqual(self.upload(self.bob, workbook_bytes()).status_code, 400)
+            self.assertEqual(self.get(self.bob, response.location).status_code, 404)
+            self.assertEqual(self.post(self.alice, f"/tms/customer/orders/{order_id}/confirm",
+                                       {"revision": 1}).status_code, 302)
+            self.assertEqual(self.decision(order_id, 2, decision="approve", **self.pricing(confirmed="")).status_code, 400)
+            charges = self.pricing(surcharge="3", operation="4", high_value="5", other_mode="items",
+                                   other_name=["虚构附加项目"], other_amount=["6"], other_currency=["CNY"], other_note=[""])
+            self.assertEqual(self.decision(order_id, 2, decision="approve", **charges).status_code, 302)
+            self.assertEqual(db.session.get(TmsReceivable, order_id).total, Decimal("1218.00"))
+            self.assertEqual(TmsSupplierOrder.query.count(), 0)
+
+    def test_address_book_admin_csrf_and_atomic_replacement(self):
+        path = f"/tms/admin/accounts/{self.customer_a.id}/address-book"
+        self.assertEqual(self.get(self.staff, path).status_code, 302)
+        self.staff_login("tms-test-reader")
+        self.assertEqual(self.get(self.staff, path).status_code, 403)
+        self.staff_login()
+        self.assertEqual(self.staff.post(path, data={"catalogue": (io.BytesIO(workbook_bytes()), "book.xlsx")}).status_code, 400)
+        def submit(raw):
+            return self.post(self.staff, path, {"catalogue": (io.BytesIO(raw), "book.xlsx")}, "/login")
+        self.assertEqual(submit(workbook_bytes()).status_code, 302)
+        def duplicate(book):
+            book["地址库"].append([cell.value for cell in book["地址库"][2]])
+        self.assertEqual(submit(workbook_bytes(change=duplicate)).status_code, 400)
+        self.assertEqual(db.session.get(TmsAddressBook, self.customer_a.id).rows[0][1], "DEMO-A")
+        self.assertEqual(submit(workbook_bytes(code="DEMO-C")).status_code, 302)
+        self.sign_in(self.alice, "customer-a")
+        self.assertEqual(self.upload(self.alice).status_code, 400)
+        self.assertEqual(self.upload(self.alice, workbook_bytes(code="DEMO-C")).status_code, 302)
+
     def test_validation_stops_preview_and_creates_no_order(self):
         self.sign_in(self.alice, "customer-a")
         raw = workbook_bytes(change=lambda book: book["星睿发票"].__setitem__("D9", None))
@@ -634,7 +687,7 @@ class PortalTests(unittest.TestCase):
         db.session.remove()
         with db.engine.begin() as connection:
             for model in (TmsSupplierEvent, TmsSupplierOrder, TmsAgentApi, TmsChargeAdjustment,
-                          TmsReceivable, TmsAudit, TmsOrder, TmsAccount):
+                          TmsReceivable, TmsAudit, TmsOrder, TmsAccount, TmsAddressBook):
                 model.__table__.drop(connection)
         runner = app.test_cli_runner()
         self.assertNotEqual(runner.invoke(args=["tms-upgrade-v1"]).exit_code, 0)
@@ -642,3 +695,4 @@ class PortalTests(unittest.TestCase):
             self.assertEqual(runner.invoke(args=["tms-upgrade-v1", "--confirm"]).exit_code, 0)
         self.assertIsNotNone(db.session.get(Customer, existing))
         self.assertEqual(TmsOrder.query.count(), 0)
+        self.assertEqual(TmsAddressBook.query.count(), 0)

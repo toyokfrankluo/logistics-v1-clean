@@ -1,0 +1,23 @@
+{% extends "tms/layout.html" %}
+{% block title %}维护客户地址库{% endblock %}
+{% block content %}
+<div class="heading">
+  <div><p class="kicker">星睿管理端</p><h1>维护客户地址库</h1></div>
+  <a class="button secondary" href="{{ url_for('tms_staff.accounts') }}">返回客户账号</a>
+</div>
+<section class="panel">
+  <h2>{{ customer.name }}</h2>
+  {% if saved %}<p>已保存 {{ saved.rows|length }} 条地址。</p>{% else %}<p>尚未保存到数据库。</p>{% endif %}
+  {% if error %}<p class="field-error" role="alert">{{ error }}</p>{% endif %}
+  <p>只读取工作簿中的「地址库」表。上传前请核对客户和每个地址编码，编码、邮编与电话请填写为文本。</p>
+  <p>保存后会替换本客户的整份地址库，已经保存的订单地址不会变化。</p>
+  <p><a href="{{ url_for('tms_staff.address_book', customer_id=customer.id, download=1) }}">
+    {{ '下载当前地址库' if saved else '下载空模板' }}
+  </a></p>
+  <form method="post" enctype="multipart/form-data">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label>客户地址库 Excel<input type="file" name="catalogue" accept=".xlsx" required></label>
+    <button>保存客户地址库</button>
+  </form>
+</section>
+{% endblock %}

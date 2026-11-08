@@ -21,8 +21,8 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from models import CarrierAgent, Customer, ManualTrack, Shipment, db
-from tms_invoice import InvoiceError, MAX_UPLOAD_BYTES, SERVICES, blank_invoice, parse_invoice
-from tms_models import TmsAccount, TmsAudit, TmsOrder, TmsReceivable, TmsChargeAdjustment
+from tms_invoice import InvoiceError, MAX_UPLOAD_BYTES, SERVICES, blank_invoice, parse_invoice, validated_catalogue
+from tms_models import TmsAccount, TmsAddressBook, TmsAudit, TmsOrder, TmsReceivable, TmsChargeAdjustment
 from tms_billing import (
     CURRENCIES, FIXED, SOURCES, UNITS, billing_available, confirm_price, price_form, valid_draft,
 )
@@ -79,7 +79,7 @@ def init_tms(app):
             return
         if not app.config["TMS_ENABLED"]:
             abort(404)
-        if request.endpoint == "tms_client.upload" and request.method == "POST":
+        if request.endpoint in {"tms_client.upload", "tms_staff.address_book"} and request.method == "POST":
             if request.content_length is None or request.content_length > MAX_UPLOAD_BYTES + 64 * 1024:
                 abort(413, "每份 Excel 文件上限为 2 MiB。")
 
@@ -105,7 +105,7 @@ def create_tms_schema():
     with db.engine.begin() as connection:
         if connection.dialect.name == "postgresql":
             connection.execute(text("SELECT pg_advisory_xact_lock(651360348)"))
-        for model in (TmsAccount, TmsOrder, TmsAudit, TmsReceivable, TmsChargeAdjustment,
+        for model in (TmsAccount, TmsAddressBook, TmsOrder, TmsAudit, TmsReceivable, TmsChargeAdjustment,
                       TmsAgentApi, TmsSupplierOrder, TmsSupplierEvent):
             model.__table__.create(connection, checkfirst=True)
 
@@ -296,6 +296,9 @@ def read_configured_workbook(path):
 
 
 def customer_catalogue(customer_id):
+    address_book = db.session.get(TmsAddressBook, customer_id)
+    if address_book is not None:
+        return address_book.rows
     config = current_app.config
     local_catalogue = config.get("TMS_LOCAL_CATALOGUE")
     if config.get("ISOLATED_MODE") and local_catalogue and local_catalogue[0] == customer_id:
@@ -426,17 +429,21 @@ def order_detail(order, **context):
 
 @client.get("/template")
 def template_file():
-    layout_path = current_app.config.get("TMS_INVOICE_TEMPLATE_PATH")
-    result = BytesIO()
     try:
-        layout = read_configured_workbook(layout_path) if layout_path else None
-        workbook = blank_invoice(customer_catalogue(g.tms_account.customer_id), layout=layout)
-        try:
-            workbook.save(result)
-        finally:
-            workbook.close()
+        return download_invoice_template(customer_catalogue(g.tms_account.customer_id))
     except InvoiceError as error:
         return page("upload", error=str(error)), 400
+
+
+def download_invoice_template(catalogue):
+    layout_path = current_app.config.get("TMS_INVOICE_TEMPLATE_PATH")
+    layout = read_configured_workbook(layout_path) if layout_path else None
+    result = BytesIO()
+    workbook = blank_invoice(catalogue, layout=layout)
+    try:
+        workbook.save(result)
+    finally:
+        workbook.close()
     result.seek(0)
     return send_file(result, as_attachment=True, download_name="xingrui-invoice-template.xlsx",
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -527,6 +534,42 @@ def accounts_page(*, errors=None, customer_id=None, username=""):
                                  .order_by(TmsAccount.id.desc())).all()
     return page("accounts", customers=customers, accounts=accounts, errors=errors or {},
                 selected_customer=customer_id, username=username)
+
+
+@staff.route("/accounts/<int:customer_id>/address-book", methods=["GET", "POST"])
+def address_book(customer_id):
+    customer = db.get_or_404(Customer, customer_id)
+    if request.method == "POST":
+        files = request.files.getlist("catalogue")
+        try:
+            if len(files) != 1 or not (files[0].filename or "").lower().endswith(".xlsx"):
+                raise InvoiceError("请选择一份 .xlsx 地址库。")
+            rows = validated_catalogue(files[0].stream.read(MAX_UPLOAD_BYTES + 1))
+        except InvoiceError as error:
+            saved = db.session.get(TmsAddressBook, customer_id)
+            return page("address_book", customer=customer, saved=saved, error=str(error)), 400
+        # Serialize updates for the same customer, including their first upload.
+        if db.session.get(Customer, customer_id, with_for_update=True) is None:
+            abort(404)
+        saved = db.session.get(TmsAddressBook, customer_id)
+        if saved is None:
+            db.session.add(TmsAddressBook(customer_id=customer_id, rows=rows))
+        else:
+            saved.rows = rows
+        try:
+            db.session.commit()
+        except IntegrityError:
+            db.session.rollback()
+            abort(409, "地址库未保存，请刷新后再试。")
+        flash("客户地址库已保存。", "success")
+        return redirect(url_for("tms_staff.address_book", customer_id=customer_id))
+    saved = db.session.get(TmsAddressBook, customer_id)
+    if request.args.get("download") == "1":
+        try:
+            return download_invoice_template(saved.rows if saved else None)
+        except InvoiceError as error:
+            return page("address_book", customer=customer, saved=saved, error=str(error)), 400
+    return page("address_book", customer=customer, saved=saved)
 
 
 @staff.post("/accounts/<int:account_id>/availability")

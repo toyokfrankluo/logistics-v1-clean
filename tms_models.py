@@ -12,6 +12,12 @@ class TmsAccount(db.Model):
     active = db.Column(db.Boolean, nullable=False, default=True)
 
 
+class TmsAddressBook(db.Model, TimestampMixin):
+    __tablename__ = "tms_address_book"
+    customer_id = db.Column(db.Integer, db.ForeignKey("customer.id", ondelete="RESTRICT"), primary_key=True)
+    rows = db.Column(db.JSON, nullable=False)
+
+
 class TmsOrder(db.Model, TimestampMixin):
     __tablename__ = "tms_order"
     __table_args__ = (
