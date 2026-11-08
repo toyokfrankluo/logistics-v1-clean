@@ -1036,7 +1036,7 @@ def finance():
 
     internal_costs = {}
     if current_user.is_admin:
-        internal_costs = tms_carriers.finance_costs([charge for _, charge in rows if charge])
+        internal_costs = tms_carriers.finance_costs(rows)
     if form.get("profit_export"):
         if not current_user.is_admin:
             abort(403)
@@ -1059,14 +1059,14 @@ def finance():
             details = receivable.details if receivable else None
             orders.append({
                 "date": shipment.created_at.strftime("%Y-%m-%d") if shipment.created_at else "",
-                "order_no": shipment.tracking_number, "service_no": shipment.shipment_id or "",
+                "order_no": shipment.tracking_number,
                 "qty": shipment.pieces, "type": shipment.product_type or "",
                 "weight": (details["quantity"] if details and details["unit"] == "kg" else None)
                           if details else shipment.weight,
                 "destination": shipment.destination or "", "channel": shipment.channel or "",
                 "fee": receivable.total if receivable else shipment.fee,
                 "currency": receivable.currency if receivable else "CNY",
-                "summary": "TMS 审核应收" if receivable else shipment.note or "",
+                "summary": "TMS 审核应收" if receivable else "",
                 "pricing": details,
             })
         filename = export_invoice({"公司名称": "物流公司", "地址": ""}, customer_name, orders, [selected_account],

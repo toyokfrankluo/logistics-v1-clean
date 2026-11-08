@@ -29,6 +29,7 @@ from tms_billing import (
 from tms_xlsx_images import MEDIA_PART, image_type
 import nextsls
 import tms_carriers
+import tms_measurements as measurements
 from tms_models import TmsAgentApi, TmsSupplierEvent, TmsSupplierOrder
 
 client = Blueprint("tms_client", __name__, url_prefix="/tms/customer")
@@ -358,9 +359,41 @@ def upload():
     return redirect(url_for("tms_client.detail", order_id=order.id))
 
 
+def customer_shipment(order, receivable):
+    if order.status != "approved" or not receivable or not receivable.shipment_id:
+        return None
+    shipment = db.session.get(Shipment, receivable.shipment_id)
+    if (shipment and shipment.customer_id == order.customer_id
+            and shipment.tracking_number == order.invoice["customer_number"]
+            and shipment.agent_id == order.agent_id == receivable.agent_id):
+        return shipment
+    return None
+
+
+def customer_measurement_view(order, shipment):
+    link, snapshot = tms_carriers.verified_snapshot(order, shipment)
+    if not snapshot or not measurements.has_measurements(snapshot.details):
+        return None
+    view = measurements.measurement_view(order.invoice, snapshot.details)
+    if view:
+        return {**view, "synced_at": link.synced_at}
+    return None
+
+
 @client.get("/orders/<int:order_id>")
 def detail(order_id):
     return order_detail(customer_order(order_id))
+
+
+@client.get("/orders/<int:order_id>/measurements.xlsx")
+def customer_measurements(order_id):
+    order = customer_order(order_id)
+    receivable = db.session.get(TmsReceivable, order.id) if billing_available() else None
+    view = customer_measurement_view(order, customer_shipment(order, receivable))
+    if not view or not (view["summary"] or view["boxes"]):
+        abort(404)
+    report = tms_carriers.customer_measurement_export(order.invoice, view, business_date(view["synced_at"]))
+    return send_file(report, download_name="measurements.xlsx", as_attachment=True)
 
 
 def order_detail(order, **context):
@@ -371,12 +404,23 @@ def order_detail(order, **context):
     events = [(AUDIT_LABELS[action], business_date(timestamp)) for action, timestamp in audit
               if action in AUDIT_LABELS and timestamp]
     receivable = db.session.get(TmsReceivable, order.id) if billing_available() else None
-    shipment = (db.session.get(Shipment, receivable.shipment_id)
-                if request.blueprint == staff.name and receivable and receivable.shipment_id else None)
-    tracks = (db.session.scalars(select(ManualTrack).where(ManualTrack.shipment_id == shipment.id)
-                                 .order_by(ManualTrack.happen_time.desc())).all() if shipment else [])
+    shipment, tracks, customer_view = None, [], None
+    if request.blueprint == staff.name:
+        if receivable and receivable.shipment_id:
+            shipment = db.session.get(Shipment, receivable.shipment_id)
+            tracks = db.session.scalars(select(ManualTrack).where(ManualTrack.shipment_id == shipment.id)
+                                        .order_by(ManualTrack.happen_time.desc())).all() if shipment else []
+    else:
+        owned_shipment = customer_shipment(order, receivable)
+        if owned_shipment:
+            # Manual descriptions and locations can contain private supplier notes or numbers.
+            times = db.session.scalars(select(ManualTrack.happen_time).where(
+                ManualTrack.shipment_id == owned_shipment.id,
+            ).order_by(ManualTrack.happen_time.desc())).all()
+            tracks = [{"happen_time": when, "description": "物流轨迹已更新"} for when in times]
+            customer_view = customer_measurement_view(order, owned_shipment)
     return page(template, order=order, totals=invoice_totals(order.invoice), shipment=shipment, tracks=tracks,
-                business_date=business_date, events=events, receivable=receivable,
+                business_date=business_date, events=events, receivable=receivable, customer_measurements=customer_view,
                 units=UNITS, sources=SOURCES, currencies=CURRENCIES, fixed=FIXED, **context)
 
 
@@ -522,6 +566,8 @@ def staff_detail(order, **context):
             profile = db.session.get(TmsAgentApi, order.agent_id)
             link = db.session.get(TmsSupplierOrder, order.id)
             snapshot = tms_carriers.latest_event(order.id, "snapshot")
+            if not tms_carriers.snapshot_matches(link, shipment, snapshot, order.agent_service):
+                snapshot = None
             cost = tms_carriers.latest_event(order.id, "cost")
             supplier = {
                 "link": link, "snapshot": snapshot, "cost": cost, "supplier_number": shipment.shipment_id,
@@ -530,8 +576,14 @@ def staff_detail(order, **context):
                 "can_sync": bool(agent and any(tms_carriers.available(profile, agent, key)
                                  for key in tms_carriers.DETAILS)),
                 "profit": tms_carriers.profit(receivable, cost, snapshot),
-                "settlements": tms_carriers.SETTLEMENTS,
-                "summary_fields": tms_carriers.SUMMARY_FIELDS, "parcel_fields": tms_carriers.PARCEL_FIELDS,
+                "cost_status": tms_carriers.cost_status(receivable, cost, snapshot),
+                "settlements": tms_carriers.SETTLEMENTS, "cost_bases": tms_carriers.COST_BASES,
+                "cost_ownership": tms_carriers.COST_OWNERSHIP,
+                "measurements": measurements.measurement_view(order.invoice, snapshot.details, internal=True)
+                                if snapshot and measurements.has_measurements(snapshot.details) else None,
+                "unit_choices": measurements.available_unit_choices(snapshot.details) if snapshot else {},
+                "parcel_labels": measurements.PARCEL_FIELDS,
+                "source": measurements.SOURCE,
                 "history": db.session.scalars(select(TmsSupplierEvent).where(
                     TmsSupplierEvent.order_id == order.id, TmsSupplierEvent.kind.in_(("cost", "snapshot")),
                 ).order_by(TmsSupplierEvent.id.desc()).limit(15)).all(),
@@ -549,7 +601,7 @@ def review(order_id):
 def supplier_action(order_id):
     order = reviewable_order(order_id)
     action = request.form.get("action")
-    if action not in {"create", "reconcile", "retry", "sync", "cost"}:
+    if action not in {"create", "reconcile", "retry", "sync", "cost", "measurement_review"}:
         abort(400)
     try:
         if action == "create":
@@ -570,6 +622,9 @@ def supplier_action(order_id):
         elif action == "sync":
             tms_carriers.sync_snapshot(order, current_user.id)
             message = "已保存本票可用的代理数据。"
+        elif action == "measurement_review":
+            tms_carriers.review_measurements(order, current_user.id, request.form)
+            message = "已记录本票测量单位的核对结果。"
         else:
             tms_carriers.record_cost(order, current_user.id, request.form)
             message = "已保存人工确认的采购成本。"
@@ -586,11 +641,12 @@ def supplier_action(order_id):
 @staff.get("/orders/<int:order_id>/supplier/measurements.xlsx")
 def supplier_measurements(order_id):
     order = reviewable_order(order_id)
-    if not tms_carriers.carrier_schema():
+    try:
+        shipment, _ = tms_carriers.approved_shipment(order)
+    except nextsls.ProtocolError:
         abort(404)
-    link = db.session.get(TmsSupplierOrder, order.id)
-    snapshot = tms_carriers.latest_event(order.id, "snapshot") if link else None
-    if not snapshot:
+    link, snapshot = tms_carriers.verified_snapshot(order, shipment)
+    if not snapshot or not measurements.has_measurements(snapshot.details):
         abort(404)
     report = tms_carriers.measurement_export(order, link, snapshot, business_date(link.synced_at))
     return send_file(report, download_name="supplier-measurements.xlsx", as_attachment=True)

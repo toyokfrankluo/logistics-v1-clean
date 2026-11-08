@@ -263,7 +263,9 @@ class StabilityTests(unittest.TestCase):
         response = self.post("/finance", data={"export": "1"})
         self.assertEqual(response.status_code, 200)
         wb = load_workbook(io.BytesIO(response.data))
-        self.assertEqual(wb.active.cell(5, 4).value, "PROVIDER-FICTIONAL-001")
+        self.assertEqual(wb.active.cell(5, 3).value, "FICTIONAL-001")
+        self.assertIsNone(wb.active.cell(5, 4).value)
+        self.assertNotIn("PROVIDER-FICTIONAL-001", [cell.value for row in wb.active.iter_rows() for cell in row])
         self.assertEqual(wb.active.cell(5, 10).value, 32)
         self.assertIn("账号：00001234", [cell.value for row in wb.active.iter_rows() for cell in row])
 

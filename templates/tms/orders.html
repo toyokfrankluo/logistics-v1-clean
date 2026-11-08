@@ -51,9 +51,9 @@
         {% set link = url_for('tms_staff.review' if staff else 'tms_client.detail', order_id=order.id) %}
         {% set totals = invoice_totals(order.invoice) %}
         <tr>
-          <td><a class="shipment-number" href="{{ link }}" data-order-drawer>{{ order.invoice.customer_number }}</a><small class="cell-note">XR-{{ order.id }}</small></td>
+          <td><a class="shipment-number" href="{{ link }}" data-order-drawer>{{ order.invoice.customer_number }}</a>{% if staff %}<small class="cell-note">XR-{{ order.id }}</small>{% endif %}</td>
           <td>{{ order.invoice.service }}</td><td>{{ order.invoice.address.recipient }}</td>
-          <td>{{ order.invoice.address.country }}<small class="cell-note">{{ order.invoice.address.postal_code }}</small></td>
+          <td>{{ order.invoice.address.country }}<small class="cell-note">{{ order.invoice.address.postal_code }}{% if order.invoice.address.warehouse_code %} · 仓库 {{ order.invoice.address.warehouse_code }}{% endif %}</small></td>
           <td>{{ order.invoice.boxes|length }}</td><td>{{ totals.value }} <small>USD</small></td>
           <td>{{ totals.weight }} <small>kg</small></td><td><span class="badge {{ order.status }}">{{ status_labels[order.status] }}</span></td>
           <td>{{ business_date(order.created_at) }}</td>

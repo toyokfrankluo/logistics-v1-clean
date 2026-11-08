@@ -22,6 +22,7 @@ CAPABILITIES = {
 WIRED = {"create", "reconcile", "measurement", "parcels", "charges"}
 PATHS = {path for _, path, _ in CAPABILITIES.values() if path} | {"/shipment/get_services"}
 CODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,49}\Z")
+FBA_BOX_CODE = re.compile(r"FBA[A-Za-z0-9]{6,47}\Z", re.I)
 CURRENCY = re.compile(r"[A-Z]{3}\Z")
 ADDRESS = {
     "name": "recipient", "company": "company", "tel": "phone", "mobile": "mobile",
@@ -193,7 +194,7 @@ def create_payload(invoice, code, reference, profile, sender):
         if any(value <= 0 for value in dimensions.values()):
             raise ProtocolError("货箱重量尺寸须为正数。")
         # Numeric sequences are documented. Preserve the original customer box ID in reference.
-        box_code = number if re.fullmatch(r"FBA[A-Za-z0-9]{6,47}", number, re.I) else str(len(parcels) + 1)
+        box_code = number if FBA_BOX_CODE.fullmatch(number) else str(len(parcels) + 1)
         parcels[number] = {"number": box_code, "reference": number, **dimensions, "declarations": []}
     if not parcels:
         raise ProtocolError("没有可提交的箱货数据。")
@@ -234,44 +235,68 @@ def lookup_created(data, reference):
     return parse_supplier_number({"shipment": record})
 
 
+SUMMARY_NUMBERS = (
+    "parcel_count", "picked_count", "actual_volume", "actual_weight", "received_weight",
+    "chargeable_weight", "volume_weight", "volume",
+)
+PARCEL_NUMBERS = (
+    "actual_weight", "chargeable_weight", "chargeable_length", "chargeable_width", "chargeable_height",
+)
+PARCEL_IDENTIFIERS = ("number", "ext_number", "reference", "tracking_number")
+FEE_NUMBERS = ("charge", "unit_price", "exchange_rate", "invoice_time")
+FEE_METADATA = ("status", "settlement_status", "updated_at", "update_time")
+
+
+def source_fields(row, fields):
+    """Store only known scalar fields, including nulls and original JSON types."""
+    return {key: row[key] for key in fields
+            if key in row and type(row[key]) in (int, float, str, type(None))}
+
+
 def normalize_snapshot(data, supplier_number, *, reference=None):
     shipment = object_value(data.get("shipment"))
     if parse_supplier_number(data) != supplier_number or (reference is not None and shipment.get("client_reference") != reference):
         raise ProtocolError("NextSLS 返回的运单身份不匹配。")
-    summary = decimals(shipment, ("picked_count", "chargeable_weight", "volume_weight", "volume"))
-    if "picked_count" in summary and Decimal(summary["picked_count"]) % 1:
-        raise ProtocolError("已收货箱数应为整数。")
+    summary = decimals(shipment, SUMMARY_NUMBERS)
+    if any(Decimal(summary[key]) % 1 for key in ("parcel_count", "picked_count") if key in summary):
+        raise ProtocolError("供应商箱数应为整数。")
+    raw = {"shipment": source_fields(shipment, SUMMARY_NUMBERS), "parcels": None, "charges": None}
     parcels = None
     if shipment.get("parcels") is not None:
-        parcels = {}
+        parcels, raw["parcels"] = {}, {}
         for item in bounded_list(shipment["parcels"], 500):
             box = object_value(item)
             number = supplied_text(box.get("number"), 80)
             if number in parcels:
                 raise ProtocolError("同一批次出现重复系统箱号。")
-            parcels[number] = {"number": number, **decimals(box, (
-                "chargeable_weight", "chargeable_length", "chargeable_width", "chargeable_height",
-            ))}
-            for key in ("ext_number", "tracking_number"):
+            parcels[number] = {"number": number, **decimals(box, PARCEL_NUMBERS)}
+            for key in PARCEL_IDENTIFIERS[1:]:
                 if box.get(key):
                     parcels[number][key] = supplied_text(box[key], 80)
+            raw["parcels"][number] = source_fields(box, (*PARCEL_IDENTIFIERS, *PARCEL_NUMBERS))
     charges = None
     if shipment.get("charge_list") is not None:
-        charges = []
+        charges, raw["charges"] = [], []
         for item in bounded_list(shipment["charge_list"], 500):
             charge = object_value(item)
             currency = supplied_text(charge.get("currency"), 3)
             if not CURRENCY.fullmatch(currency):
                 raise ProtocolError("代理费用币种无效。")
-            amounts = decimals(charge, ("charge", "unit_price", "exchange_rate", "invoice_time"), signed=("charge", "unit_price"))
+            amounts = decimals(charge, FEE_NUMBERS, signed=("charge", "unit_price"))
             if "charge" not in amounts:
                 raise ProtocolError("代理费用缺少金额。")
-            charges.append({"charge_type": supplied_text(charge.get("charge_type")), "currency": currency,
-                            **amounts, "unit": supplied_text(charge["unit"], 40) if charge.get("unit") else ""})
+            record = {"charge_type": supplied_text(charge.get("charge_type")), "currency": currency,
+                      **amounts, "unit": supplied_text(charge["unit"], 40) if charge.get("unit") else ""}
+            metadata = source_fields(charge, FEE_METADATA)
+            for key, value in metadata.items():
+                if value not in (None, ""):
+                    record[key] = supplied_text(str(value))
+            charges.append(record)
+            raw["charges"].append(source_fields(charge, ("charge_type", "currency", "unit", *FEE_NUMBERS)) | metadata)
         charges.sort(key=lambda row: tuple(sorted(row.items())))
-    # actual_volume is described as weight by the guide but its name contradicts that description.
-    return {"summary": summary, "parcels": parcels, "charges": charges,
-            "unconfirmed_actual_volume": decimals(shipment, ("actual_volume",)).get("actual_volume")}
+        raw["charges"].sort(key=lambda row: tuple(sorted((key, type(value).__name__, str(value))
+                                                       for key, value in row.items())))
+    return {"summary": summary, "parcels": parcels, "charges": charges, "raw": raw}
 
 
 def decimals(data, fields, signed=()):

@@ -1,5 +1,5 @@
 """Carrier configuration, audited supplier operations, and internal reports."""
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from io import BytesIO
 from uuid import uuid4
@@ -13,6 +13,7 @@ from sqlalchemy.exc import IntegrityError
 
 from models import CarrierAgent, Shipment, db
 import nextsls
+import tms_measurements as measurements
 from tms_models import TmsAgentApi, TmsReceivable, TmsSupplierEvent, TmsSupplierOrder
 
 
@@ -20,6 +21,8 @@ PROVIDERS = {"nextsls": "NextSLS V5", "rtb56": "RTB56", "other": "其他"}
 DETAILS = {"measurement", "parcels", "charges"}
 CENT = Decimal("0.01")
 SETTLEMENTS = {"pending": "待结算", "settled": "已结算（人工确认）"}
+COST_BASES = {"estimated": "预估费用", "actual": "实际费用"}
+COST_OWNERSHIP = {"payable": "属于星睿应付", "not_payable": "已确认无星睿应付"}
 
 
 def carrier_schema():
@@ -68,6 +71,7 @@ def approved_shipment(order):
     charge = db.session.get(TmsReceivable, order.id)
     shipment = db.session.get(Shipment, charge.shipment_id) if charge and charge.shipment_id else None
     if (not shipment or shipment.customer_id != order.customer_id
+            or shipment.tracking_number != order.invoice["customer_number"]
             or not order.agent_id or order.agent_id != shipment.agent_id or charge.agent_id != order.agent_id):
         raise nextsls.ProtocolError("订单、运单和代理关联不完整，请先人工核对。")
     return shipment, charge
@@ -220,23 +224,26 @@ def sync_snapshot(order, actor_id, *, transport=None):
         raise nextsls.ProtocolError("请先核对并保存供应商系统单号。")
     if link and (link.state not in {"new", "linked"} or (link.supplier_number and link.supplier_number != supplier_number)):
         raise nextsls.ProtocolError("运单关联正在对账或供应商单号不一致。")
-    known_reference = link.client_reference if link and link.attempt_at else None
+    known_reference = link.client_reference if link and link.attempt_at else shipment.tracking_number
     origin, token = profile.base_url, agent.app_token
     started_at = datetime.utcnow()
     data = nextsls.request_data(agent, origin, "/shipment/get_info",
                                 {"shipment": {"shipment_id": supplier_number}}, transport=transport)
     db.session.expire_all()
     shipment, agent, profile, link = operation_context(order, "details")
-    if shipment.shipment_id != supplier_number or profile.base_url != origin or agent.app_token != token:
+    reference_now = link.client_reference if link and link.attempt_at else shipment.tracking_number
+    if (shipment.shipment_id != supplier_number or reference_now != known_reference
+            or profile.base_url != origin or agent.app_token != token):
         raise nextsls.ProtocolError("同步期间供应商单号发生变化，请刷新后重试。")
     snapshot = nextsls.normalize_snapshot(data, supplier_number, reference=known_reference)
+    snapshot["identity_verified"] = True
+    snapshot["channel"] = order.agent_service
     if "measurement" not in profile.enabled:
         snapshot["summary"] = {}
-        snapshot["unconfirmed_actual_volume"] = None
-    if "parcels" not in profile.enabled:
-        snapshot["parcels"] = None
-    if "charges" not in profile.enabled:
-        snapshot["charges"] = None
+        snapshot["raw"]["shipment"] = {}
+    for capability, key in (("parcels", "parcels"), ("charges", "charges")):
+        if capability not in profile.enabled:
+            snapshot[key] = snapshot["raw"][key] = None
     if not snapshot["summary"] and not snapshot["parcels"] and not snapshot["charges"]:
         raise nextsls.ProtocolError("此账号或订单没有返回可用的计费或费用数据。")
     link = link or ensure_link(order)
@@ -249,6 +256,13 @@ def sync_snapshot(order, actor_id, *, transport=None):
         raise nextsls.ProtocolError("同步期间供应商关联发生变化。")
     link.tenant_origin = profile.base_url
     previous = latest_event(order.id, "snapshot")
+    prior = previous.details if previous else {}
+    prior_revision = prior.get("charge_revision")
+    snapshot["charge_revision"] = (prior_revision if prior_revision and prior.get("charges") == snapshot["charges"]
+                                   and prior.get("channel") == snapshot["channel"] else uuid4().hex)
+    if (prior.get("measurement_review") and prior.get("channel") == snapshot["channel"]
+            and measurements.same_measurements(prior, snapshot)):
+        snapshot["measurement_review"] = prior["measurement_review"]
     link.synced_at = datetime.utcnow()
     if previous is None or previous.details != snapshot:
         audit(link, "snapshot", actor_id, snapshot)
@@ -260,62 +274,151 @@ def sync_snapshot(order, actor_id, *, transport=None):
     return snapshot
 
 
+def snapshot_matches(link, shipment, snapshot, channel):
+    return bool(link and shipment and snapshot and link.state == "linked" and link.synced_at
+                and link.agent_id == shipment.agent_id and link.supplier_number == shipment.shipment_id
+                and snapshot.details.get("channel", channel) == channel)
+
+
+def verified_snapshot(order, shipment):
+    """Resolve a snapshot through the approved order's verified, current supplier link."""
+    if not carrier_schema() or not shipment:
+        return None, None
+    link = db.session.get(TmsSupplierOrder, order.id)
+    snapshot = latest_event(order.id, "snapshot") if link else None
+    return (link, snapshot) if snapshot_matches(link, shipment, snapshot, order.agent_service) else (None, None)
+
+
+def review_measurements(order, actor_id, form):
+    shipment, _ = approved_shipment(order)
+    link, _ = verified_snapshot(order, shipment)
+    if link is None:
+        raise nextsls.ProtocolError("请先完成供应商测量同步。")
+    db.session.refresh(link, with_for_update=True)
+    snapshot = latest_event(order.id, "snapshot")
+    if (not snapshot_matches(link, shipment, snapshot, order.agent_service)
+            or not snapshot.details.get("identity_verified")):
+        raise nextsls.ProtocolError("请先重新同步并核对运单身份。")
+    if form.get("snapshot_id") != str(snapshot.id):
+        raise nextsls.ProtocolError("测量数据已更新，请刷新后再确认。")
+    units = {}
+    for key, (_, choices) in measurements.available_unit_choices(snapshot.details).items():
+        value = form.get("unit_" + key, "")
+        if value:
+            if value not in choices:
+                raise nextsls.ProtocolError("测量单位不在可确认范围。")
+            units[key] = value
+    if "actual_volume" in units and "actual_weight" in units:
+        raise nextsls.ProtocolError("本票运单实重只能确认一个来源字段。")
+    reason = nextsls.supplied_text(form.get("reason"), 500)
+    details = {**snapshot.details, "measurement_review": {
+        "units": units, "reason": reason, "actor_id": actor_id,
+        "confirmed_at": datetime.utcnow().isoformat(timespec="seconds"),
+    }}
+    audit(link, "snapshot", actor_id, details)
+    db.session.commit()
+
+
+def exchange_date(value, *, required):
+    if not value and not required:
+        return None
+    try:
+        parsed = date.fromisoformat(value)
+        if parsed.isoformat() != value or parsed > (datetime.utcnow() + timedelta(hours=8)).date():
+            raise ValueError
+    except (ValueError, TypeError):
+        raise nextsls.ProtocolError("请填写有效且不晚于今天的汇率日期（YYYY-MM-DD）。") from None
+    return parsed.isoformat()
+
+
 def record_cost(order, actor_id, form):
-    _, receivable = approved_shipment(order)
+    shipment, receivable = approved_shipment(order)
     currency = form.get("currency", "").strip().upper()
     if not nextsls.CURRENCY.fullmatch(currency):
         raise nextsls.ProtocolError("请填写有效的三字母采购币种。")
     rate = nextsls.numeric(form.get("rate"))
     if rate <= 0 or rate > 100000 or (currency == receivable.currency and rate != 1):
         raise nextsls.ProtocolError("汇率须大于零，同币种须填 1。")
+    rate_date = exchange_date(form.get("rate_date", ""), required=currency != receivable.currency)
     raw_amount = nextsls.numeric(form.get("payable"))
     raw_other = nextsls.numeric(form.get("other"))
     if raw_amount != raw_amount.quantize(CENT) or raw_other != raw_other.quantize(CENT):
         raise nextsls.ProtocolError("金额最多允许两位小数。")
-    settlement = form.get("settlement")
-    if settlement not in SETTLEMENTS:
-        raise nextsls.ProtocolError("请选择已经核对的结算状态。")
+    basis, ownership, settlement = (form.get(key) for key in ("cost_basis", "ownership", "settlement"))
+    if basis not in COST_BASES or ownership not in COST_OWNERSHIP or settlement not in SETTLEMENTS:
+        raise nextsls.ProtocolError("请选择费用归属、成本性质和结算状态。")
+    if settlement == "settled" and basis != "actual":
+        raise nextsls.ProtocolError("预估费用不能标记为已结算。")
+    if ownership == "not_payable" and (raw_amount != 0 or basis != "actual"):
+        raise nextsls.ProtocolError("确认无星睿应付时，请选择实际费用并填写零应付金额。")
     link = ensure_link(order)
     db.session.refresh(link, with_for_update=True)
-    snapshot = latest_event(order.id, "snapshot")
+    snapshot, previous = (latest_event(order.id, kind) for kind in ("snapshot", "cost"))
+    if snapshot and (not snapshot_matches(link, shipment, snapshot, order.agent_service)
+                     or not snapshot.details.get("identity_verified")):
+        raise nextsls.ProtocolError("请先重新同步供应商数据并核对归属，再确认费用。")
+    if (form.get("snapshot_id", "") != (str(snapshot.id) if snapshot else "")
+            or form.get("cost_id", "") != (str(previous.id) if previous else "")):
+        raise nextsls.ProtocolError("费用记录已更新，请刷新后重新核对。")
     audit(link, "cost", actor_id, {
         "payable": str(raw_amount.quantize(CENT)), "currency": currency, "rate": str(rate),
+        "rate_date": rate_date, "ownership": ownership, "cost_basis": basis,
         "other": str(raw_other.quantize(CENT)), "base_currency": receivable.currency, "settlement": settlement,
         "note": nextsls.supplied_text(form.get("note"), 500),
-        "source_charges": snapshot.details["charges"] if snapshot else None,
+        "source_charges": snapshot.details.get("charges") if snapshot else None,
+        "charge_revision": snapshot.details.get("charge_revision") if snapshot else None,
     })
     db.session.commit()
 
 
-def profit(receivable, cost, snapshot):
+def cost_status(receivable, cost, snapshot):
     if not cost:
-        return None
+        return "供应商费用待确认" if snapshot and snapshot.details.get("charges") else "成本未同步"
     values = cost.details
     if (values["base_currency"] != receivable.currency
-            or (snapshot and snapshot.details["charges"] != values["source_charges"])):
+            or (values["currency"] != receivable.currency and not values.get("rate_date"))
+            or values.get("ownership") not in COST_OWNERSHIP or values.get("cost_basis") not in COST_BASES
+            or (snapshot.details.get("charges") if snapshot else None) != values.get("source_charges")
+            or (snapshot.details.get("charge_revision") if snapshot else None) != values.get("charge_revision")):
+        return "成本或币种待复核"
+    if values["cost_basis"] == "estimated":
+        return "预估费用 · 待确认实际成本"
+    return "实际成本已确认"
+
+
+def profit(receivable, cost, snapshot):
+    if cost_status(receivable, cost, snapshot) != "实际成本已确认":
         return None
+    values = cost.details
     converted = (Decimal(values["payable"]) * Decimal(values["rate"])).quantize(CENT, rounding=ROUND_HALF_UP)
     gross = receivable.total - converted - Decimal(values["other"])
     return {"converted": converted, "gross": gross, "margin": (
         (gross / receivable.total * 100).quantize(CENT, rounding=ROUND_HALF_UP) if receivable.total else None)}
 
 
-def finance_costs(receivables):
-    order_ids = [item.order_id for item in receivables]
+def finance_costs(rows):
+    pairs = [(shipment, item) for shipment, item in rows if item]
+    order_ids = [item.order_id for _, item in pairs]
     if not order_ids or not carrier_schema():
         return {}
-    records = {}
+    records, links = {}, {}
     for offset in range(0, len(order_ids), 500):
+        batch = order_ids[offset:offset + 500]
+        links.update((link.order_id, link) for link in db.session.scalars(
+            select(TmsSupplierOrder).where(TmsSupplierOrder.order_id.in_(batch))))
         latest = select(func.max(TmsSupplierEvent.id)).where(
-            TmsSupplierEvent.order_id.in_(order_ids[offset:offset + 500]),
+            TmsSupplierEvent.order_id.in_(batch),
             TmsSupplierEvent.kind.in_(("cost", "snapshot")),
         ).group_by(TmsSupplierEvent.order_id, TmsSupplierEvent.kind)
         for event in db.session.scalars(select(TmsSupplierEvent).where(TmsSupplierEvent.id.in_(latest))):
             records[event.order_id, event.kind] = event
     result = {}
-    for item in receivables:
+    for shipment, item in pairs:
         cost, snapshot = (records.get((item.order_id, key)) for key in ("cost", "snapshot"))
-        result[item.order_id] = {"cost": cost, "profit": profit(item, cost, snapshot)}
+        if not snapshot_matches(links.get(item.order_id), shipment, snapshot, item.agent_service):
+            snapshot = None
+        result[item.order_id] = {"cost": cost, "profit": profit(item, cost, snapshot),
+                                 "status": cost_status(item, cost, snapshot)}
     return result
 
 
@@ -347,30 +450,41 @@ def xlsx(sheet_names_and_rows):
     return buffer
 
 
-SUMMARY_FIELDS = {"picked_count": "已收货箱数", "chargeable_weight": "计费重",
-                  "volume_weight": "材积重", "volume": "体积"}
-PARCEL_FIELDS = {"number": "系统箱号", "ext_number": "扩展箱号", "tracking_number": "承运单号",
-                 "chargeable_weight": "计费重", "chargeable_length": "计费长",
-                 "chargeable_width": "计费宽", "chargeable_height": "计费高"}
-
-
 def measurement_export(order, link, snapshot, display_time):
-    values = snapshot.details
-    summary = [("项目", "数值"), ("客户单号", order.invoice["customer_number"]),
-               ("供应商运单号", link.supplier_number), ("最后同步", display_time),
-               ("仓库实重", "未确认"), ("收货重", "未确认"), ("仓库逐箱扫描数据", "未确认")]
-    summary.extend((label, decimal_or_none(values["summary"].get(key))) for key, label in SUMMARY_FIELDS.items())
-    parcels = [list(PARCEL_FIELDS.values())]
-    for row in (values["parcels"] or {}).values():
-        parcels.append([decimal_or_none(row.get(key)) if key.startswith("chargeable_") else row.get(key)
-                        for key in PARCEL_FIELDS])
+    details = snapshot.details
+    view = measurements.measurement_view(order.invoice, details, internal=True)
+    summary = [("项目", "数值", "单位", "状态", "API 原字段"),
+               ("客户单号", order.invoice["customer_number"]), ("供应商运单号", link.supplier_number),
+               ("数据来源", measurements.SOURCE), ("最后同步", display_time)]
+    summary.extend((row["label"], row["value"], row["unit"], row["status"], row["field"]) for row in view["summary"])
+    columns = ("系统箱号", "扩展箱号", "客户箱号", "申报重量 kg", "申报长 cm", "申报宽 cm", "申报高 cm")
+    labels = tuple(measurements.PARCEL_FIELDS.values())
+    parcels = [(*columns, *(title for label, _ in labels for title in (label, "单位 / 状态")))]
+    for box in view["boxes"]:
+        declared = box["declared"] or {}
+        row = [box["number"], box["ext_number"], box["customer_box"],
+               *(decimal_or_none(declared.get(key)) for key in ("weight_kg", "length_cm", "width_cm", "height_cm"))]
+        for field in box["fields"]:
+            row.extend((field["value"], field["unit"] or field["status"]))
+        parcels.append(row)
     return xlsx([("运单汇总", summary), ("逐箱计费明细", parcels)])
 
+
+def customer_measurement_export(invoice, view, display_time):
+    summary = [("项目", "数值", "单位"), ("客户运单号", invoice["customer_number"]),
+               ("星睿销售服务", invoice["service"]), ("目的地", invoice["address"]["country"]),
+               ("仓库编码", invoice["address"].get("warehouse_code")), ("数据来源", "供应商测量，经星睿核对"),
+               ("最后同步", display_time)]
+    summary.extend((row["label"], row["value"], row["unit"]) for row in view["summary"])
+    parcels = [("客户箱号", "项目", "数值", "单位")]
+    for box in view["boxes"]:
+        parcels.extend((box["customer_box"], row["label"], row["value"], row["unit"]) for row in box["fields"])
+    return xlsx([("运单汇总", summary), ("客户箱明细", parcels)])
 
 
 def profit_export(rows, costs):
     values = [("客户单号", "代理运单号", "应收", "应收币种", "代理应付", "采购币种", "汇率",
-               "其他成本（应收币种）", "毛利润", "毛利率 %", "结算状态", "成本确认时间 UTC")]
+               "其他成本（应收币种）", "毛利润", "毛利率 %", "结算状态", "成本确认时间 UTC", "汇率日期", "费用归属", "成本性质", "复核状态")]
     for shipment, receivable in rows:
         if not receivable:
             continue
@@ -381,9 +495,10 @@ def profit_export(rows, costs):
                        decimal_or_none(details.get("payable")), details.get("currency"),
                        decimal_or_none(details.get("rate")), decimal_or_none(details.get("other")),
                        result["gross"] if result else None, result["margin"] if result else None,
-                       SETTLEMENTS.get(details.get("settlement"), "成本未同步") if result else
-                       ("成本待复核" if cost else "成本未同步"),
-                       cost.created_at.isoformat(timespec="seconds") if cost else None))
+                       SETTLEMENTS.get(details.get("settlement")),
+                       cost.created_at.isoformat(timespec="seconds") if cost else None,
+                       details.get("rate_date"), COST_OWNERSHIP.get(details.get("ownership")),
+                       COST_BASES.get(details.get("cost_basis")), entry.get("status", "成本未同步")))
     return xlsx([("内部单票利润", values)])
 
 

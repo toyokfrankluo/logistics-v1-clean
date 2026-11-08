@@ -35,7 +35,7 @@
   {% if current_user.is_admin %}
   {% set entry = internal_costs.get(charge.order_id, {}) if charge else {} %}
   <td>{% if entry.cost %}{{ entry.cost.details.payable }} {{ entry.cost.details.currency }}{% else %}成本未同步{% endif %}</td>
-  <td>{% if entry.profit %}{{ entry.profit.gross }} {{ charge.currency }}{% elif entry.cost %}待复核{% else %}—{% endif %}</td>
+  <td>{% if entry.profit %}{{ entry.profit.gross }} {{ charge.currency }}{% elif entry.status %}{{ entry.status }}{% else %}—{% endif %}</td>
   {% endif %}</tr>
   {% else %}<tr><td colspan="{{ 13 if current_user.is_admin else 11 }}" class="empty">没有符合条件的运单。</td></tr>{% endfor %}</tbody></table>
   </div>

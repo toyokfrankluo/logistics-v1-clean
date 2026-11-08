@@ -10,7 +10,7 @@ import carrier_http
 import nextsls
 import test_tms_portal as fixture
 from app import app
-from models import CarrierAgent, Shipment, db
+from models import BankAccount, CarrierAgent, ManualTrack, Shipment, db
 from tms_models import TmsAgentApi, TmsOrder, TmsReceivable, TmsSupplierEvent, TmsSupplierOrder
 
 
@@ -30,7 +30,8 @@ def success(data):
 
 def snapshot(number=SUPPLIER_NUMBER, charge="13.20"):
     return {"shipment": {
-        "shipment_id": number, "chargeable_weight": "12", "picked_count": 2,
+        "shipment_id": number, "client_reference": "0000123",
+        "chargeable_weight": "12", "picked_count": 2,
         "actual_volume": "30.5", "volume_weight": 7, "volume": "1.02",
         "parcels": [{"number": "TEST-BOX", "ext_number": "BOX-EXT", "client_weight": 20,
                      "chargeable_weight": 12, "chargeable_length": 20}],
@@ -109,6 +110,15 @@ class NextSLSTests(unittest.TestCase):
         self.staff_login("tms-test-reader")
         self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 403)
         self.assertEqual(self.get(self.alice, f"/tms/admin/orders/{order_id}/supplier/measurements.xlsx").status_code, 302)
+
+    def test_approval_cannot_call_create_even_when_feature_is_enabled(self):
+        self.profile()
+        with patch.dict(app.config, TMS_NEXTSLS_CREATE_ENABLED=True), patch("carrier_http.post") as transport:
+            order_id = self.approve()
+            transport.assert_not_called()
+        self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
+        receivable = db.session.get(TmsReceivable, order_id)
+        self.assertIsNone(db.session.get(Shipment, receivable.shipment_id).shipment_id)
 
     def test_approved_excel_creates_once_and_keeps_distinct_identifiers(self):
         order_id = self.approve()
@@ -201,6 +211,22 @@ class NextSLSTests(unittest.TestCase):
         self.assertEqual(request.call_count, 1)
         self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
 
+    def assign_supplier_number(self, order_id):
+        receivable = db.session.get(TmsReceivable, order_id)
+        shipment = db.session.get(Shipment, receivable.shipment_id)
+        shipment.shipment_id = SUPPLIER_NUMBER
+        db.session.commit()
+        return shipment
+
+    def save_cost(self, order_id, **changes):
+        snapshot_event = TmsSupplierEvent.query.filter_by(order_id=order_id, kind="snapshot").order_by(TmsSupplierEvent.id.desc()).first()
+        cost = TmsSupplierEvent.query.filter_by(order_id=order_id, kind="cost").order_by(TmsSupplierEvent.id.desc()).first()
+        values = {"currency": "USD", "payable": "13.20", "rate": "7", "rate_date": "2025-06-20",
+                  "other": "10", "settlement": "pending", "cost_basis": "actual", "ownership": "payable",
+                  "note": "fixture", "snapshot_id": str(snapshot_event.id) if snapshot_event else "",
+                  "cost_id": str(cost.id) if cost else ""}
+        return self.action(order_id, "cost", **(values | changes))
+
     def test_sync_cost_revision_and_internal_exports(self):
         order_id = self.approve()
         self.profile()
@@ -211,7 +237,8 @@ class NextSLSTests(unittest.TestCase):
         db.session.commit()
         with patch.dict(app.config, TMS_NEXTSLS_READ_ENABLED=True), patch(
             "carrier_http.post", side_effect=[success(snapshot()), success(snapshot()),
-                                              success(snapshot(charge="15.2")), success(snapshot(number="WRONG"))],
+                                              success(snapshot(charge="15.2")), success(snapshot()),
+                                              success(snapshot(number="WRONG"))],
         ):
             self.assertEqual(self.action(order_id, "sync").status_code, 302)
             self.assertEqual(self.action(order_id, "sync").status_code, 302)
@@ -222,15 +249,16 @@ class NextSLSTests(unittest.TestCase):
             self.assertNotIn("client_weight", event.details["parcels"]["TEST-BOX"])
             self.assertEqual(shipment.weight, weight)
             self.assertEqual(db.session.get(TmsAgentApi, self.agent.id).verified, {})
-            self.assertEqual(self.action(order_id, "cost", currency="USD", payable="13.20", rate="7",
-                                         other="10", settlement="pending", note="fixture").status_code, 302)
+            self.assertEqual(self.save_cost(order_id).status_code, 302)
             response = self.post(self.staff, "/finance", {"profit_export": "1"}, "/login")
             report = load_workbook(BytesIO(response.data))
             self.assertEqual(report.active["I2"].value, 1097.6)
             report.close()
             self.assertEqual(self.action(order_id, "sync").status_code, 302)
+            self.assertIn("成本或币种待复核", self.get(self.staff, f"/tms/admin/orders/{order_id}").get_data(as_text=True))
+            self.assertEqual(self.action(order_id, "sync").status_code, 302)
             self.assertEqual(self.action(order_id, "sync").status_code, 400)
-        self.assertEqual(TmsSupplierEvent.query.filter_by(kind="snapshot").count(), 2)
+        self.assertEqual(TmsSupplierEvent.query.filter_by(kind="snapshot").count(), 3)
         self.assertIn("成本或币种待复核", self.get(self.staff, f"/tms/admin/orders/{order_id}").get_data(as_text=True))
         report = self.get(self.staff, f"/tms/admin/orders/{order_id}/supplier/measurements.xlsx")
         self.assertEqual(report.status_code, 200)
@@ -243,6 +271,139 @@ class NextSLSTests(unittest.TestCase):
         self.staff_login("tms-test-reader")
         self.assertEqual(self.post(self.staff, "/finance", {"profit_export": "1"}, "/login").status_code, 403)
         self.assertNotIn("代理应付", self.get(self.staff, "/finance").get_data(as_text=True))
+
+
+    def test_live_shape_measurements_are_audited_and_exports_are_role_scoped(self):
+        order_id = self.approve()
+        self.profile()
+        shipment = self.assign_supplier_number(order_id)
+        original_invoice = db.session.get(TmsOrder, order_id).invoice
+        original_weight = shipment.weight
+        db.session.add(ManualTrack(shipment_id=shipment.id, location=SUPPLIER_NUMBER,
+                                   description="private supplier tracking note"))
+        db.session.add(BankAccount(bank_name="Synthetic bank", account_name="Synthetic payee",
+                                   account_no="TEST-ACCOUNT", is_default=True))
+        db.session.commit()
+        payload = snapshot()
+        info = payload["shipment"]
+        info.update(parcel_count=21, picked_count=21, actual_volume=123.45, volume_weight=0,
+                    chargeable_weight=2.6, volume=2.55)
+        info["parcels"] = [{"number": f"SUPPLIER-BOX-{index:02}", "actual_weight": "1.250",
+                            "chargeable_weight": "1.4", "chargeable_length": "51",
+                            "ext_number": "0001" if index == 1 else f"OTHER-{index:02}"}
+                           for index in range(1, 22)]
+        info["parcels"][1]["actual_weight"] = None
+        with patch.dict(app.config, TMS_NEXTSLS_READ_ENABLED=True), patch("carrier_http.post", return_value=success(payload)):
+            self.assertEqual(self.action(order_id, "sync").status_code, 302)
+        event = TmsSupplierEvent.query.filter_by(kind="snapshot").one()
+        raw = event.details["raw"]
+        self.assertEqual(raw["shipment"]["actual_volume"], 123.45)
+        self.assertEqual(raw["parcels"]["SUPPLIER-BOX-01"]["actual_weight"], "1.250")
+        self.assertEqual(event.details["parcels"]["SUPPLIER-BOX-01"]["actual_weight"], "1.25")
+        self.assertEqual(len(event.details["parcels"]), 21)
+        self.assertEqual(shipment.weight, original_weight)
+        self.assertEqual(db.session.get(TmsOrder, order_id).invoice, original_invoice)
+
+        staff_path = f"/tms/admin/orders/{order_id}"
+        before = self.get(self.staff, staff_path).get_data(as_text=True)
+        self.assertIn("逐箱测量（21 箱）", before)
+        self.assertIn("供应商费用待确认", before)
+        self.assertIn("零值含义待确认", before)
+        self.assertNotIn("2.6 kg", before)
+        self.assertEqual(self.action(order_id, "measurement_review", snapshot_id=str(event.id),
+                                     unit_chargeable_weight="m³", unit_volume_weight="kg",
+                                     unit_parcel_actual_weight="kg", reason="供应商计费单核对").status_code, 302)
+        self.assertEqual(self.action(order_id, "measurement_review", snapshot_id=str(event.id),
+                                     unit_chargeable_weight="kg", reason="过期提交").status_code, 400)
+
+        internal = self.get(self.staff, staff_path + "/supplier/measurements.xlsx")
+        self.assertEqual(internal.status_code, 200)
+        book = load_workbook(BytesIO(internal.data), read_only=True)
+        detail_rows = list(book["逐箱计费明细"].values)
+        self.assertEqual(len(detail_rows), 22)
+        self.assertEqual(detail_rows[1][:9], ("SUPPLIER-BOX-01", "0001", "0001", 1.5, 20, 10, 8, 1.25, "kg"))
+        self.assertIsNone(detail_rows[2][7])
+        self.assertIn(("计费体积", 2.6, "m³", "已确认", "chargeable_weight"), list(book["运单汇总"].values))
+        book.close()
+
+        customer_path = f"/tms/customer/orders/{order_id}"
+        customer_page = self.get(self.alice, customer_path).get_data(as_text=True)
+        self.assertIn("物流轨迹已更新", customer_page)
+        self.assertIn("计费体积", customer_page)
+        self.assertNotIn("private supplier tracking note", customer_page)
+        self.assertNotIn(SUPPLIER_NUMBER, customer_page)
+        self.assertNotIn(f"XR-{order_id}", customer_page)
+        self.assertNotIn(f"XR-{order_id}", self.get(self.alice, "/tms/customer/").get_data(as_text=True))
+        self.assertNotIn("成本与利润", customer_page)
+        self.assertNotIn("123.45", customer_page)
+        self.assertNotIn("材积重", customer_page)
+        export = self.get(self.alice, customer_path + "/measurements.xlsx")
+        self.assertEqual(export.status_code, 200)
+        self.assertIn("no-store", export.headers["Cache-Control"])
+        book = load_workbook(BytesIO(export.data), read_only=True)
+        self.assertEqual(list(book["客户箱明细"].values)[1:], [("0001", "逐箱实重", 1.25, "kg")])
+        text = str([list(sheet.values) for sheet in book.worksheets])
+        for forbidden in (SUPPLIER_NUMBER, "SUPPLIER-BOX", "虚构代理", "13.20", "利润", "采购"):
+            self.assertNotIn(forbidden, text)
+        book.close()
+        self.assertEqual(self.sign_in(self.bob, "customer-b").status_code, 302)
+        self.assertEqual(self.get(self.bob, customer_path + "/measurements.xlsx").status_code, 404)
+        self.assertEqual(self.get(self.alice, staff_path + "/supplier/measurements.xlsx").status_code, 302)
+
+        response = self.post(self.staff, "/finance", {"export": "1"}, "/login")
+        self.assertEqual(response.status_code, 200)
+        book = load_workbook(BytesIO(response.data), read_only=True)
+        self.assertNotIn(SUPPLIER_NUMBER, str([list(sheet.values) for sheet in book.worksheets]))
+        book.close()
+
+        info["chargeable_weight"] = 3.1
+        with patch.dict(app.config, TMS_NEXTSLS_READ_ENABLED=True), patch("carrier_http.post", return_value=success(payload)):
+            self.assertEqual(self.action(order_id, "sync").status_code, 302)
+        customer_page = self.get(self.alice, customer_path).get_data(as_text=True)
+        self.assertNotIn("计费体积", customer_page)
+        self.assertNotIn("3.1", customer_page)
+
+        self.assertEqual(self.save_cost(order_id).status_code, 302)
+        shipment.shipment_id = "DIFFERENT-FICTIONAL-SUPPLIER"
+        db.session.commit()
+        self.assertEqual(self.get(self.staff, staff_path + "/supplier/measurements.xlsx").status_code, 404)
+        self.assertEqual(self.get(self.alice, customer_path + "/measurements.xlsx").status_code, 404)
+        self.assertEqual(self.save_cost(order_id).status_code, 400)
+        response = self.post(self.staff, "/finance", {"profit_export": "1"}, "/login")
+        with BytesIO(response.data) as content:
+            book = load_workbook(content)
+            self.assertIsNone(book.active["I2"].value)
+            self.assertEqual(book.active["P2"].value, "成本或币种待复核")
+            book.close()
+
+    def test_manual_supplier_link_rejects_different_customer_reference(self):
+        order_id = self.approve()
+        self.profile()
+        self.assign_supplier_number(order_id)
+        payload = snapshot()
+        payload["shipment"]["client_reference"] = "SOMEONE-ELSE"
+        with patch.dict(app.config, TMS_NEXTSLS_READ_ENABLED=True), patch("carrier_http.post", return_value=success(payload)):
+            self.assertEqual(self.action(order_id, "sync").status_code, 400)
+        self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
+
+    def test_cost_needs_ownership_basis_and_dated_fx_before_profit(self):
+        order_id = self.approve()
+        self.assertEqual(self.save_cost(order_id, rate_date="").status_code, 400)
+        self.assertEqual(self.save_cost(order_id, rate_date="2999-01-01").status_code, 400)
+        self.assertEqual(self.save_cost(order_id, cost_basis="estimated", settlement="settled").status_code, 400)
+        self.assertEqual(self.save_cost(order_id, ownership="not_payable").status_code, 400)
+        self.assertEqual(self.save_cost(order_id, cost_basis="estimated").status_code, 302)
+        staff_path = f"/tms/admin/orders/{order_id}"
+        view = self.get(self.staff, staff_path).get_data(as_text=True)
+        self.assertIn("待确认实际成本", view)
+        self.assertNotIn("1097.60", view)
+        self.assertEqual(self.save_cost(order_id, cost_id="").status_code, 400)
+        self.assertEqual(self.save_cost(order_id, settlement="settled").status_code, 302)
+        costs = TmsSupplierEvent.query.filter_by(kind="cost").order_by(TmsSupplierEvent.id).all()
+        self.assertEqual([event.details["cost_basis"] for event in costs], ["estimated", "actual"])
+        self.assertTrue(all(event.actor_id and event.created_at for event in costs))
+        self.assertEqual(costs[-1].details["rate_date"], "2025-06-20")
+        self.assertIn("1097.60", self.get(self.staff, staff_path).get_data(as_text=True))
 
 
 class NextSLSProtocolTests(unittest.TestCase):
@@ -268,6 +429,26 @@ class NextSLSProtocolTests(unittest.TestCase):
         self.assertEqual(invoice["address_code"], "DEMO-A")
         payload = nextsls.create_payload(invoice, "TMS_DEMO", "XR-DEMO", SERVICE, {})
         self.assertEqual(payload["shipment"]["to_warehouse_code"], "FBA-DEMO-WAREHOUSE")
+
+    def test_weight_based_billing_is_labeled_only_after_unit_review(self):
+        import tms_measurements
+        details = nextsls.normalize_snapshot(snapshot(), SUPPLIER_NUMBER)
+        details["identity_verified"] = True
+        invoice = {"boxes": []}
+        self.assertNotIn("计费重量", [row["label"] for row in tms_measurements.measurement_view(invoice, details)["summary"]])
+        details["measurement_review"] = {"units": {"chargeable_weight": "kg"}}
+        summary = tms_measurements.measurement_view(invoice, details)["summary"]
+        self.assertIn(("计费重量", "kg"), [(row["label"], row["unit"]) for row in summary])
+
+    def test_box_matching_ignores_internal_ordinals_and_conflicting_mappings(self):
+        from tms_measurements import matched_boxes
+        invoice = {"boxes": [{"box_number": code} for code in ("1", "C-02", "FBA000001")]}
+        boxes = {"1": {"number": "1"},
+                 "internal-2": {"ext_number": "C-02", "reference": "1"},
+                 "internal-3": {"ext_number": "C-02"},
+                 "internal-4": {"reference": "C-02"},
+                 "FBA000001": {"number": "FBA000001"}}
+        self.assertEqual(set(matched_boxes(invoice, boxes)), {"FBA000001"})
 
     def test_reconciliation_demands_exact_unique_reference(self):
         row = {"shipment_id": SUPPLIER_NUMBER, "client_reference": "XR-DEMO"}

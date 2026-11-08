@@ -98,7 +98,7 @@ def export_invoice(company_info, customer_name, orders, bank_accounts,
     # ===== 写订单数据 =====
     start_data_row = header_row + 1
     currency_totals = {}
-    total_weight = 0.0
+    total_weight = None
     for idx, order in enumerate(orders, start=1):
         r = start_data_row + (idx - 1)
         ws.cell(row=r, column=1, value=idx).alignment = align_center
@@ -107,7 +107,7 @@ def export_invoice(company_info, customer_name, orders, bank_accounts,
         ws.cell(row=r, column=4, value=order.get("service_no", "")).alignment = align_left
         ws.cell(row=r, column=5, value=order.get("qty", "")).alignment = align_center
         ws.cell(row=r, column=6, value=order.get("type", "")).alignment = align_center
-        w = order.get("weight", 0) or 0
+        w = order.get("weight")
         ws.cell(row=r, column=7, value=w).alignment = align_center
         ws.cell(row=r, column=8, value=order.get("destination", "")).alignment = align_center
         ws.cell(row=r, column=9, value=order.get("channel", "")).alignment = align_center
@@ -122,7 +122,8 @@ def export_invoice(company_info, customer_name, orders, bank_accounts,
             ws.cell(row=r, column=col_idx).border = thin_border
 
         currency_totals[currency] = currency_totals.get(currency, Decimal("0.00")) + fee_val
-        total_weight += float(w)
+        if w not in (None, ""):
+            total_weight = (total_weight or Decimal(0)) + Decimal(str(w))
 
     after_data_row = start_data_row + max(0, len(orders)) + 1
 
@@ -131,7 +132,8 @@ def export_invoice(company_info, customer_name, orders, bank_accounts,
     ws.cell(row=after_data_row, column=2, value=len(orders)).alignment = align_left
 
     ws.cell(row=after_data_row + 1, column=1, value="总重量:").alignment = align_left
-    ws.cell(row=after_data_row + 1, column=2, value=f"{total_weight:.3f} Kg").alignment = align_left
+    if total_weight is not None:
+        ws.cell(row=after_data_row + 1, column=2, value=f"{total_weight:.3f} Kg").alignment = align_left
 
     for index, (currency, total) in enumerate(sorted((currency_totals or {"CNY": Decimal("0.00")}).items())):
         row = after_data_row + 2 + index

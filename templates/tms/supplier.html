@@ -4,8 +4,8 @@
 {% if supplier_error %}<p class="error" role="alert">{{ supplier_error }}</p>{% endif %}
 <section class="panel">
   <h2>供应商下单</h2>
-  {% set states = {'new':'未提交', 'sending':'已预留，等待对账', 'uncertain':'提交结果未确认', 'not_found':'列表无匹配，待人工核实', 'linked':'已关联'} %}
-  <p><span class="badge">{{ states[link.state] if link else ('已录入供应商单号' if supplier.supplier_number else '未提交') }}</span>
+  {% set states = {'new':'待供应商下单', 'sending':'已预留，等待对账', 'uncertain':'提交结果未确认', 'not_found':'列表无匹配，待人工核实', 'linked':'已关联'} %}
+  <p><span class="badge">{{ states[link.state] if link else ('已录入供应商单号' if supplier.supplier_number else '待供应商下单') }}</span>
     {% if supplier.supplier_number %} · {{ supplier.supplier_number }}{% endif %}
     {% if link %} · 对账参考号 <code>{{ link.client_reference }}</code>{% endif %}</p>
   {% if supplier.can_create and not supplier.supplier_number and (not link or link.state == 'new') %}
@@ -32,57 +32,97 @@
   {% endif %}
 </section>
 <section class="panel">
-  <h2>实际重量体积</h2>
-  <p class="muted">客户申报值见上方。这里展示供应商返回的计费数据；仓库实重、收货重、计泡系数和逐箱扫描记录暂无确认接口。</p>
+  <h2>供应商重量体积</h2>
+  <p class="muted">上方为客户原始申报。以下只显示接口返回值。请按当前代理渠道和供应商依据确认单位。</p>
   <div class="inline-actions">
   {% if supplier.can_sync and supplier.supplier_number %}
   <form method="post" action="{{ url_for('tms_staff.supplier_action', order_id=order.id) }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="secondary" name="action" value="sync">同步重量体积和费用</button>
   </form>{% endif %}
-  {% if snapshot %}<a class="button secondary" href="{{ url_for('tms_staff.supplier_measurements', order_id=order.id) }}">导出 Excel</a>{% endif %}
+  {% if supplier.measurements %}<a class="button secondary" href="{{ url_for('tms_staff.supplier_measurements', order_id=order.id) }}">导出内部测量 Excel</a>{% endif %}
   </div>
-  {% if snapshot %}
-  <p>最后同步 {{ business_date(link.synced_at) }}（北京时间）</p>
-  <dl class="fields">{% for key, label in supplier.summary_fields.items() %}
-    <div><dt>{{ label }}</dt><dd>{{ snapshot.details.summary.get(key, '未返回') }}</dd></div>
+  {% if supplier.measurements %}
+  <p>数据来源：{{ supplier.source }} · 最后同步 {{ business_date(link.synced_at) }}（北京时间）</p>
+  <dl class="fields">{% for row in supplier.measurements.summary %}
+    <div><dt>{{ row.label }} <code>{{ row.field }}</code></dt>
+      <dd>{{ row.value if row.value is not none else '—' }} {{ row.unit }} <small>{{ row.status }}</small></dd></div>
   {% endfor %}</dl>
-  {% if snapshot.details.parcels %}
-  <details><summary>逐箱计费明细（{{ snapshot.details.parcels|length }} 箱）</summary>
-    <div class="table-wrap"><table><thead><tr>{% for label in supplier.parcel_fields.values() %}<th>{{ label }}</th>{% endfor %}</tr></thead>
-      <tbody>{% for row in snapshot.details.parcels.values() %}<tr>{% for key in supplier.parcel_fields %}<td>{{ row.get(key, '—') }}</td>{% endfor %}</tr>{% endfor %}</tbody>
+  {% if supplier.measurements.boxes %}
+  <details><summary>逐箱测量（{{ supplier.measurements.boxes|length }} 箱）</summary>
+    {% if supplier.measurements.unmatched_boxes %}<p class="muted">{{ supplier.measurements.unmatched_boxes }} 箱未匹配到客户箱号。</p>{% endif %}
+    <div class="table-wrap"><table><thead><tr><th>系统箱号</th><th>扩展箱号</th><th>客户箱号</th><th>申报重（kg）</th><th>申报长 × 宽 × 高（cm）</th>
+      {% for label, _ in supplier.parcel_labels.values() %}<th>{{ label }}</th>{% endfor %}</tr></thead>
+      <tbody>{% for box in supplier.measurements.boxes %}<tr>
+        <td>{{ box.number }}</td><td>{{ box.ext_number or '—' }}</td><td>{{ box.customer_box or '—' }}</td>
+        <td>{{ box.declared.weight_kg if box.declared else '—' }}</td>
+        <td>{% if box.declared %}{{ box.declared.length_cm }} × {{ box.declared.width_cm }} × {{ box.declared.height_cm }}{% else %}—{% endif %}</td>
+        {% for row in box.fields %}<td>{{ row.value if row.value is not none else '—' }} {{ row.unit }}<small class="cell-note">{{ row.status }}</small></td>{% endfor %}
+      </tr>{% endfor %}</tbody>
     </table></div>
   </details>
   {% endif %}
-  {% else %}<p class="muted">暂无已同步的代理数据。</p>{% endif %}
+  {% set review = snapshot.details.get('measurement_review', {}) %}
+  {% if review %}<p class="muted">单位核对 · #{{ review.actor_id }} · {{ review.confirmed_at }} UTC · {{ review.reason }}</p>{% endif %}
+  {% if supplier.unit_choices and snapshot.details.get('identity_verified') %}
+  <details><summary>按本票代理渠道确认单位</summary>
+    <p>当前渠道 {{ order.agent_service }}。实重、体积和计费量分别确认，空选项保留待确认状态。</p>
+    <form class="carrier-editor" method="post" action="{{ url_for('tms_staff.supplier_action', order_id=order.id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="snapshot_id" value="{{ snapshot.id }}">
+      <div class="carrier-fields">
+        {% for key, (label, choices) in supplier.unit_choices.items() %}
+        <label>{{ label }}<select name="unit_{{ key }}"><option value="">待确认</option>
+        {% for unit in choices %}<option value="{{ unit }}"{% if review.get('units', {}).get(key) == unit %} selected{% endif %}>{{ unit }}</option>{% endfor %}
+        </select></label>
+        {% endfor %}
+        <label>核对依据<input name="reason" maxlength="500" required></label>
+      </div>
+      <button class="secondary" name="action" value="measurement_review">保存本票单位确认</button>
+    </form>
+  </details>
+  {% elif not snapshot.details.get('identity_verified') %}
+  <p class="muted">历史快照需要重新同步并验证身份后才能确认单位及供客户下载。</p>
+  {% endif %}
+  {% else %}<p class="muted">暂无已同步的测量数据。</p>{% endif %}
 </section>
 <section class="panel">
   <h2>成本与利润 <span class="badge">内部</span></h2>
+  <p><span class="badge">{{ supplier.cost_status }}</span></p>
   <dl class="fields">
     <div><dt>客户应收</dt><dd>{{ receivable.total }} {{ receivable.currency }}</dd></div>
     <div><dt>代理应付</dt><dd>{% if cost %}{{ cost.details.payable }} {{ cost.details.currency }}{% else %}成本未同步{% endif %}</dd></div>
     {% if cost %}
-    <div><dt>汇率（采购币种 → 应收币种）</dt><dd>{{ cost.details.rate }}</dd></div>
+    <div><dt>费用归属</dt><dd>{{ supplier.cost_ownership.get(cost.details.get('ownership'), '待复核') }}</dd></div>
+    <div><dt>成本性质</dt><dd>{{ supplier.cost_bases.get(cost.details.get('cost_basis'), '待复核') }}</dd></div>
+    <div><dt>汇率（采购币种 → 应收币种）</dt><dd>{{ cost.details.rate }} · {{ cost.details.rate_date or '—' }}</dd></div>
     <div><dt>其他成本</dt><dd>{{ cost.details.other }} {{ cost.details.base_currency }}</dd></div>
     <div><dt>结算状态</dt><dd>{{ supplier.settlements[cost.details.settlement] }}</dd></div>
-    <div><dt>成本确认时间</dt><dd>{{ business_date(cost.created_at) }}（北京时间）</dd></div>
+    <div><dt>成本确认时间</dt><dd>#{{ cost.actor_id }} · {{ business_date(cost.created_at) }}（北京时间）</dd></div>
     {% endif %}
-    <div><dt>毛利润</dt><dd>{{ (supplier.profit.gross|string ~ ' ' ~ receivable.currency) if supplier.profit else ('成本或币种待复核' if cost else '成本未同步') }}</dd></div>
+    <div><dt>毛利润</dt><dd>{{ (supplier.profit.gross|string ~ ' ' ~ receivable.currency) if supplier.profit else supplier.cost_status }}</dd></div>
     <div><dt>毛利率</dt><dd>{% if supplier.profit and supplier.profit.margin is not none %}{{ supplier.profit.margin }}%{% else %}—{% endif %}</dd></div>
   </dl>
   {% if snapshot and snapshot.details.charges %}
-  <details><summary>代理返回费用（待核对采购归属和结算状态）</summary>
-    <div class="table-wrap"><table><thead><tr><th>费用项</th><th>金额</th><th>币种</th><th>代理汇率原值</th><th>业务时间戳</th></tr></thead><tbody>
-    {% for fee in snapshot.details.charges %}<tr><td>{{ fee.charge_type }}</td><td>{{ fee.charge }}</td><td>{{ fee.currency }}</td><td>{{ fee.exchange_rate or '—' }}</td><td>{{ fee.invoice_time or '—' }}</td></tr>{% endfor %}
+  <details><summary>供应商费用明细 · {{ supplier.cost_status }}</summary>
+    <p class="muted">数据来源：{{ supplier.source }} · charge_list。结算状态以核对记录为准。</p>
+    <div class="table-wrap"><table><thead><tr><th>费用项</th><th>金额</th><th>币种</th><th>单价</th><th>计费单位</th><th>代理汇率原值</th><th>业务时间（供应商时间戳）</th></tr></thead><tbody>
+    {% for fee in snapshot.details.charges %}<tr><td>{{ fee.charge_type }}</td><td>{{ fee.charge }}</td><td>{{ fee.currency }}</td>
+      <td>{{ fee.unit_price or '—' }}</td><td>{{ fee.unit or '—' }}</td><td>{{ fee.exchange_rate or '—' }}</td><td>{{ fee.invoice_time or '—' }}</td></tr>{% endfor %}
     </tbody></table></div>
   </details>
   {% endif %}
   <details{% if supplier_error %} open{% endif %}><summary>录入或更新已核对采购成本</summary>
     <form class="carrier-editor" method="post" action="{{ url_for('tms_staff.supplier_action', order_id=order.id) }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="snapshot_id" value="{{ snapshot.id if snapshot else '' }}">
+      <input type="hidden" name="cost_id" value="{{ cost.id if cost else '' }}">
       <div class="carrier-fields">
+        <label>费用归属<select name="ownership" required><option value="">请选择</option>{% for key, label in supplier.cost_ownership.items() %}<option value="{{ key }}">{{ label }}</option>{% endfor %}</select></label>
+        <label>成本性质<select name="cost_basis" required><option value="">请选择</option>{% for key, label in supplier.cost_bases.items() %}<option value="{{ key }}">{{ label }}</option>{% endfor %}</select></label>
         <label>代理应付<input name="payable" inputmode="decimal" required value="{{ cost.details.payable if cost else '' }}"></label>
         <label>采购币种<input name="currency" maxlength="3" required value="{{ cost.details.currency if cost else receivable.currency }}"></label>
         <label>折算至 {{ receivable.currency }} 的汇率<input name="rate" inputmode="decimal" required value="{{ cost.details.rate if cost else '' }}" placeholder="同币种填 1"></label>
+        <label>汇率日期（跨币种必填）<input name="rate_date" type="date" value="{{ cost.details.rate_date if cost and cost.details.rate_date else '' }}"></label>
         <label>其他成本（{{ receivable.currency }}）<input name="other" inputmode="decimal" required value="{{ cost.details.other if cost else '' }}"></label>
         <label>结算状态<select name="settlement" required><option value="">请选择</option>{% for key, label in supplier.settlements.items() %}<option value="{{ key }}">{{ label }}</option>{% endfor %}</select></label>
         <label>核对依据<input name="note" maxlength="500" required></label>
@@ -92,6 +132,6 @@
   </details>
   {% if supplier.history %}<details><summary>最近的同步及费用变动</summary>
   {% for entry in supplier.history %}
-    <p>{{ business_date(entry.created_at) }} · {% if entry.kind == 'cost' %}确认应付 {{ entry.details.payable }} {{ entry.details.currency }}；{{ entry.details.note }}{% else %}代理快照 · {{ entry.details.charges|length if entry.details.charges else 0 }} 项费用{% for fee in entry.details.charges or [] %}；{{ fee.charge_type }} {{ fee.charge }} {{ fee.currency }}{% endfor %}{% endif %}</p>
+    <p>{{ business_date(entry.created_at) }} · {% if entry.kind == 'cost' %}#{{ entry.actor_id }} · {{ supplier.cost_bases.get(entry.details.get('cost_basis'), '历史成本') }} · 应付 {{ entry.details.payable }} {{ entry.details.currency }} · 其他成本 {{ entry.details.other }} {{ entry.details.base_currency }} · {{ entry.details.note }}{% else %}代理快照 · {{ entry.details.charges|length if entry.details.charges else 0 }} 项费用{% for fee in entry.details.charges or [] %}；{{ fee.charge_type }} {{ fee.charge }} {{ fee.currency }}{% endfor %}{% endif %}</p>
   {% endfor %}</details>{% endif %}
 </section>

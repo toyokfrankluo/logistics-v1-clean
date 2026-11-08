@@ -1,6 +1,6 @@
 {% set invoice = order.invoice %}
 <article class="order-detail" data-order-detail>
-<div class="heading"><div><p class="kicker">{{ '导入预览' if order.status == 'draft' else '运单详情' }} · XR-{{ order.id }}</p>
+<div class="heading"><div><p class="kicker">{{ '导入预览' if order.status == 'draft' else '运单详情' }}{% if staff %} · XR-{{ order.id }}{% endif %}</p>
 <h1>{{ invoice.customer_number }}</h1><p>{{ business_date(order.created_at) }}（北京时间）</p></div>
 <a class="button secondary" href="{{ url_for('tms_staff.staff_download' if staff else 'tms_client.download', order_id=order.id) }}">下载原始发票</a></div>
 <dl class="order-metrics">
@@ -24,7 +24,7 @@
   <summary>基础信息和收件地址</summary>
   <dl class="fields">
     {% for label, value in (
-      ('地址编码', invoice.address_code), ('收件人', invoice.address.recipient),
+      ('地址编码', invoice.address_code), ('仓库编码', invoice.address.warehouse_code), ('收件人', invoice.address.recipient),
       ('公司', invoice.address.company), ('收件地址', [invoice.address.street, invoice.address.street2, invoice.address.street3]|select|join('，')),
       ('城市 / 州省', [invoice.address.city, invoice.address.region]|select|join(' / ')),
       ('邮编', invoice.address.postal_code), ('联系电话', invoice.address.phone),
@@ -61,10 +61,28 @@
 </div>
 <details class="panel" open>
   <summary>货箱信息</summary>
-  <div class="table-wrap"><table><thead><tr><th>箱号</th><th>客户申报重量（kg）</th><th>客户申报长 × 宽 × 高（cm）</th><th>仓库实测</th></tr></thead><tbody>
-  {% for box in invoice.boxes %}<tr><td>{{ box.box_number }}</td><td>{{ box.weight_kg }}</td><td>{{ box.length_cm }} × {{ box.width_cm }} × {{ box.height_cm }}</td><td class="muted">—</td></tr>{% endfor %}
+  <div class="table-wrap"><table><thead><tr><th>箱号</th><th>客户申报重量（kg）</th><th>客户申报长 × 宽 × 高（cm）</th></tr></thead><tbody>
+  {% for box in invoice.boxes %}<tr><td>{{ box.box_number }}</td><td>{{ box.weight_kg }}</td><td>{{ box.length_cm }} × {{ box.width_cm }} × {{ box.height_cm }}</td></tr>{% endfor %}
   </tbody></table></div>
 </details>
+{% if customer_measurements and (customer_measurements.summary or customer_measurements.boxes) %}
+<section class="panel">
+  <h2>已确认重量体积</h2>
+  <p class="muted">来源：供应商测量，经星睿核对 · 同步于 {{ business_date(customer_measurements.synced_at) }}（北京时间）</p>
+  <dl class="fields">{% for row in customer_measurements.summary %}
+    <div><dt>{{ row.label }}</dt><dd>{{ row.value }} {{ row.unit }}</dd></div>
+  {% endfor %}</dl>
+  {% if customer_measurements.boxes %}
+  <details><summary>已匹配的客户箱明细</summary>
+  <div class="table-wrap"><table><thead><tr><th>客户箱号</th><th>项目</th><th>数值</th></tr></thead><tbody>
+    {% for box in customer_measurements.boxes %}{% for row in box.fields %}
+    <tr><td>{{ box.customer_box }}</td><td>{{ row.label }}</td><td>{{ row.value }} {{ row.unit }}</td></tr>
+    {% endfor %}{% endfor %}
+  </tbody></table></div></details>
+  {% endif %}
+  <a class="button secondary" href="{{ url_for('tms_client.customer_measurements', order_id=order.id) }}">下载重量体积 Excel</a>
+</section>
+{% endif %}
 <details class="panel" open>
   <summary>产品申报</summary>
   <div class="table-wrap"><table><thead><tr><th>箱号</th><th>品名（中 / 英）</th><th>材质 / 用途</th><th>HS Code</th><th>单价（USD）</th><th>数量</th><th>金额（USD）</th><th>带电</th><th>产品图片 / 说明</th></tr></thead><tbody>
