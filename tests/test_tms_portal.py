@@ -82,8 +82,8 @@ def with_wps_photo(raw):
 
 class InvoiceParsingTests(unittest.TestCase):
     def test_group_boxes_and_compute_without_formula_cache(self):
-        raw = workbook_bytes(recipient="上传文件中伪造的地址")
-        invoice = parse_invoice(raw, workbook_bytes())
+        raw = workbook_bytes()
+        invoice = parse_invoice(raw)
         self.assertEqual(invoice["customer_number"], "0000123")
         self.assertEqual(invoice["address"]["recipient"], "虚构地址甲")
         self.assertEqual(invoice["address"]["postal_code"], "00001")
@@ -93,45 +93,86 @@ class InvoiceParsingTests(unittest.TestCase):
         self.assertEqual(len(SERVICES), 13)
 
     def test_unknown_catalogue_and_duplicate_address_code(self):
-        with self.assertRaisesRegex(InvoiceError, "不存在或重复"):
-            parse_invoice(workbook_bytes(), workbook_bytes(code="DEMO-B"))
+        with self.assertRaisesRegex(InvoiceError, "不存在"):
+            parse_invoice(workbook_bytes(change=lambda book: book["星睿发票"].__setitem__("L4", "DEMO-B")))
         def duplicate(book):
             sheet = book["地址库"]
-            sheet.append([cell.value for cell in sheet[2]])
-        with self.assertRaisesRegex(InvoiceError, "不存在或重复"):
-            parse_invoice(workbook_bytes(), workbook_bytes(change=duplicate))
+            row = [cell.value for cell in sheet[2]]
+            row[1] = " demo-a "
+            sheet.append(row)
+        with self.assertRaisesRegex(InvoiceError, "重复编码"):
+            parse_invoice(workbook_bytes(change=duplicate))
+
+    def test_all_thirteen_services_with_product_rows(self):
+        for service in SERVICES:
+            with self.subTest(service=service):
+                raw = workbook_bytes(change=lambda book: book["星睿发票"].__setitem__("D5", service))
+                invoice = parse_invoice(raw)
+                self.assertEqual(invoice["service"], service)
+                self.assertEqual(len(invoice["declarations"]), 3)
+
+    def test_three_sheets_address_columns_and_country_format(self):
+        for change, message in (
+            (lambda book: book.remove(book["服务选项"]), "三工作表"),
+            (lambda book: book["地址库"].__setitem__("N1", "其他"), "地址库表头"),
+            (lambda book: book["地址库"].__setitem__("N2", "USA"), "两位字母"),
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(InvoiceError, message):
+                parse_invoice(workbook_bytes(change=change))
+
+    def test_conflicting_literal_or_cached_recipient_is_rejected(self):
+        with self.assertRaisesRegex(InvoiceError, "L7.*冲突"):
+            parse_invoice(workbook_bytes(change=lambda book: book["星睿发票"].__setitem__("L7", "Different street")))
+        for shown, conflict in ((" 1  FICTIONAL Way ", False), ("Different street", True)):
+            with self.subTest(conflict=conflict):
+                output = io.BytesIO()
+                with ZipFile(io.BytesIO(workbook_bytes())) as source, ZipFile(output, "w") as archive:
+                    for entry in source.infolist():
+                        data = source.read(entry)
+                        if entry.filename == "xl/worksheets/sheet1.xml":
+                            xml = fromstring(data)
+                            cell = xml.find(f".//{XLSX_NS}c[@r='L7']")
+                            cell.set("t", "str")
+                            cell.find(XLSX_NS + "v").text = shown
+                            data = tostring(xml)
+                        archive.writestr(entry, data)
+                if conflict:
+                    with self.assertRaisesRegex(InvoiceError, "L7.*冲突"):
+                        parse_invoice(output.getvalue())
+                else:
+                    self.assertEqual(parse_invoice(output.getvalue())["address"]["street"], "1 Fictional Way")
 
     def test_bad_types_and_format(self):
         for cell, value in (("D4", 123), ("D5", "无效服务"), ("G23", "=1+1"),
                             ("N23", "也许"), ("D15", 3), ("J23", -1)):
             with self.subTest(cell=cell), self.assertRaises(InvoiceError):
                 raw = workbook_bytes(change=lambda book: book["星睿发票"].__setitem__(cell, value))
-                parse_invoice(raw, workbook_bytes())
+                parse_invoice(raw)
         with self.assertRaises(InvoiceError):
-            parse_invoice(b"not an xlsx", workbook_bytes())
+            parse_invoice(b"not an xlsx")
 
     def test_missing_starred_fields_report_cell_coordinates(self):
         def blanks(book):
             for cell in ("D9", "D11", "D14", "D15", "B23", "C23", "D23", "E23", "F23", "J24"):
                 book["星睿发票"][cell] = None
         with self.assertRaises(InvoiceError) as raised:
-            parse_invoice(workbook_bytes(change=blanks, pictures=(24, 25)), workbook_bytes())
+            parse_invoice(workbook_bytes(change=blanks, pictures=(24, 25)))
         for cell in ("D9", "D11", "D14", "D15", "B23", "C23", "D23", "E23", "F23", "J24", "O23"):
             self.assertIn(f"{cell}（", str(raised.exception))
         self.assertNotIn("O26", str(raised.exception))
 
-    def test_missing_recipient_field_comes_from_assigned_catalogue(self):
+    def test_missing_recipient_field_comes_from_embedded_catalogue(self):
         def no_region(book):
             book["地址库"]["M2"] = None
         with self.assertRaisesRegex(InvoiceError, "L11（省份 / 州）"):
-            parse_invoice(workbook_bytes(), workbook_bytes(change=no_region))
+            parse_invoice(workbook_bytes(change=no_region))
 
     def test_wps_photo_and_number_formatted_hs_code(self):
         def format_code(book):
             cell = book["星睿发票"]["F23"]
             cell.value = 1234
             cell.number_format = "000000"
-        invoice = parse_invoice(workbook_bytes(change=format_code), workbook_bytes())
+        invoice = parse_invoice(workbook_bytes(change=format_code))
         self.assertEqual(invoice["declarations"][0]["hs_code"], "001234")
         self.assertEqual(invoice["declarations"][0]["image_part"], "xl/media/demo.png")
 
@@ -158,14 +199,14 @@ class InvoiceParsingTests(unittest.TestCase):
                 </xdr:oneCellAnchor>""" for row in (22, 23, 24))
             archive.writestr("xl/drawings/drawing1.xml",
                              f'<xdr:wsDr xmlns:xdr="{DRAWING_NS}" xmlns:a="{ART_NS}" xmlns:r="{REL_NS}">{anchors}</xdr:wsDr>')
-        invoice = parse_invoice(output.getvalue(), raw)
+        invoice = parse_invoice(output.getvalue())
         self.assertEqual([item["image_part"] for item in invoice["declarations"]], ["xl/media/demo.png"] * 3)
 
     def test_declared_total_rounds_like_invoice(self):
         def fractions(book):
             book["星睿发票"]["G23"] = 1.005
             book["星睿发票"]["H23"] = 1
-        self.assertEqual(parse_invoice(workbook_bytes(change=fractions), workbook_bytes())
+        self.assertEqual(parse_invoice(workbook_bytes(change=fractions))
                          ["declarations"][0]["total_usd"], "1.01")
 
     def test_wps_photo_must_reference_internal_image_from_product_cell(self):
@@ -175,8 +216,7 @@ class InvoiceParsingTests(unittest.TestCase):
             ("B23", '=_xlfn.DISPIMG("ID_DEMO",1)', "公式函数"),
         ):
             with self.subTest(cell=cell, formula=formula), self.assertRaises(InvoiceError) as raised:
-                parse_invoice(workbook_bytes(change=lambda book: book["星睿发票"].__setitem__(cell, formula)),
-                              workbook_bytes())
+                parse_invoice(workbook_bytes(change=lambda book: book["星睿发票"].__setitem__(cell, formula)))
             self.assertIn(message, str(raised.exception))
 
     def test_active_formula_and_conflicting_box_measurements_rejected(self):
@@ -186,9 +226,9 @@ class InvoiceParsingTests(unittest.TestCase):
             for cell, value in {"J24": 4, "K24": 20, "L24": 10, "M24": 8}.items():
                 book["星睿发票"][cell] = value
         with self.assertRaisesRegex(InvoiceError, "公式函数"):
-            parse_invoice(workbook_bytes(change=formula), workbook_bytes())
+            parse_invoice(workbook_bytes(change=formula))
         with self.assertRaisesRegex(InvoiceError, "重复箱号"):
-            parse_invoice(workbook_bytes(change=conflict), workbook_bytes())
+            parse_invoice(workbook_bytes(change=conflict))
 
 
 class PortalTests(unittest.TestCase):
@@ -253,7 +293,7 @@ class PortalTests(unittest.TestCase):
         return dict(agent_id=self.agent.id, agent_service="虚构代理渠道",
                     unit="kg", quantity="100", quantity_source="declared", rate="12",
                     surcharge="0", operation="0", high_value="0", currency="CNY",
-                    other_mode="none", confirmed="yes") | changes
+                    other_mode="none", confirmed="yes", destination_confirmed="yes") | changes
 
     def pending_order(self):
         order_id = self.get_order()
@@ -480,22 +520,51 @@ class PortalTests(unittest.TestCase):
             self.addCleanup(book.close)
             self.assertEqual(book["地址库"]["E2"].value, "虚构授权地址")
             self.assertIn("地址库!", book["星睿发票"]["L7"].value)
-            response = self.upload(self.alice, workbook_bytes(recipient="伪造上传地址"))
+            response = self.upload(self.alice, workbook_bytes(recipient="虚构客户申报"))
             self.assertEqual(response.status_code, 302)
             order_id = int(response.location.rsplit("/", 1)[1])
-            self.assertIn("虚构授权地址", self.get(self.alice, response.location).get_data(as_text=True))
+            preview = self.get(self.alice, response.location).get_data(as_text=True)
+            self.assertIn("虚构客户申报", preview)
+            self.assertNotIn("虚构授权地址", preview)
             self.sign_in(self.bob, "customer-b")
             self.assertEqual(self.get(self.bob, "/tms/customer/template").status_code, 400)
-            self.assertEqual(self.upload(self.bob, workbook_bytes()).status_code, 400)
+            self.assertEqual(self.upload(self.bob).status_code, 302)
             self.assertEqual(self.get(self.bob, response.location).status_code, 404)
             self.assertEqual(self.post(self.alice, f"/tms/customer/orders/{order_id}/confirm",
                                        {"revision": 1}).status_code, 302)
+            review = self.get(self.staff, f"/tms/admin/orders/{order_id}").get_data(as_text=True)
+            self.assertIn("公司参考地址库与客户申报不一致", review)
+            self.assertIn("公司参考 虚构授权地址", review)
             self.assertEqual(self.decision(order_id, 2, decision="approve", **self.pricing(confirmed="")).status_code, 400)
+            self.assertEqual(self.decision(order_id, 2, decision="approve", **self.pricing(destination_confirmed="")).status_code, 400)
             charges = self.pricing(surcharge="3", operation="4", high_value="5", other_mode="items",
                                    other_name=["虚构附加项目"], other_amount=["6"], other_currency=["CNY"], other_note=[""])
+            self.assertEqual(self.decision(order_id, 2, decision="approve",
+                                           **(charges | {"destination_recipient": "虚构更正"})).status_code, 400)
+            self.assertEqual(self.decision(order_id, 2, decision="approve",
+                                           **(charges | {"destination_country": "USA"})).status_code, 400)
+            charges.update(destination_recipient="虚构更正", destination_country="CA",
+                           destination_reason="虚构人工复核")
             self.assertEqual(self.decision(order_id, 2, decision="approve", **charges).status_code, 302)
-            self.assertEqual(db.session.get(TmsReceivable, order_id).total, Decimal("1218.00"))
+            receivable = db.session.get(TmsReceivable, order_id)
+            self.assertEqual(receivable.total, Decimal("1218.00"))
+            self.assertEqual(db.session.get(Shipment, receivable.shipment_id).destination, "CA")
             self.assertEqual(TmsSupplierOrder.query.count(), 0)
+            self.carrier_post.assert_not_called()
+            order = db.session.get(TmsOrder, order_id)
+            self.assertEqual(order.invoice["submitted_destination"]["address"]["recipient"], "虚构客户申报")
+            self.assertTrue(order.invoice["destination_review"]["changed"])
+            self.assertEqual(order.invoice["destination_review"]["reason"], "虚构人工复核")
+            replacement = self.post(self.staff, path, {
+                "catalogue": (io.BytesIO(workbook_bytes(recipient="更新后公司参考地址")), "catalogue.xlsx"),
+            }, "/login")
+            self.assertEqual(replacement.status_code, 302)
+            db.session.expire_all()
+            self.assertEqual(order.invoice["address"]["recipient"], "虚构更正")
+            customer_view = self.get(self.alice, response.location).get_data(as_text=True)
+            self.assertIn("虚构更正", customer_view)
+            self.assertNotIn("虚构人工复核", customer_view)
+            self.assertNotIn("更新后公司参考地址", customer_view)
 
     def test_address_book_admin_csrf_and_atomic_replacement(self):
         path = f"/tms/admin/accounts/{self.customer_a.id}/address-book"
@@ -513,8 +582,8 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(db.session.get(TmsAddressBook, self.customer_a.id).rows[0][1], "DEMO-A")
         self.assertEqual(submit(workbook_bytes(code="DEMO-C")).status_code, 302)
         self.sign_in(self.alice, "customer-a")
-        self.assertEqual(self.upload(self.alice).status_code, 400)
-        self.assertEqual(self.upload(self.alice, workbook_bytes(code="DEMO-C")).status_code, 302)
+        self.assertEqual(self.upload(self.alice).status_code, 302)
+        self.assertEqual(self.upload(self.alice, workbook_bytes("SECOND-DEMO", code="DEMO-C")).status_code, 302)
 
     def test_validation_stops_preview_and_creates_no_order(self):
         self.sign_in(self.alice, "customer-a")

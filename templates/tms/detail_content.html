@@ -17,11 +17,23 @@
 <p class="notice">客户：{{ customer.name }}{% if order.agent_service %} · 代理服务：{{ order.agent_service }}{% endif %}</p>
 {% endif %}
 {% if staff and order.status == 'pending' %}
-<a class="button secondary review-jump" href="#review-pricing">跳到收费设置</a>
+<a class="button secondary review-jump" href="#review-pricing">跳到地址与收费审核</a>
 <div class="review-workspace"><div>{% endif %}
 <div class="detail-top-grid">
 <details class="panel" open>
   <summary>基础信息和收件地址</summary>
+  {% if invoice.destination_review %}
+  <p class="notice">{{ '收件地址已由星睿核对并更正。' if invoice.destination_review.changed else '收件地址已由星睿核对。' }}</p>
+  {% if staff and invoice.destination_review.changed %}
+  <details><summary>查看原申报地址与更正原因</summary>
+    <p>{{ invoice.destination_review.reason }}</p>
+    <p>地址编码：{{ invoice.submitted_destination.address_code }}</p>
+    <p>{{ [invoice.submitted_destination.address.recipient, invoice.submitted_destination.address.company, invoice.submitted_destination.address.street, invoice.submitted_destination.address.street2, invoice.submitted_destination.address.street3, invoice.submitted_destination.address.city, invoice.submitted_destination.address.region, invoice.submitted_destination.address.postal_code, invoice.submitted_destination.address.country]|select|join(' · ') }}</p>
+  </details>
+  {% endif %}
+  {% elif invoice.address_source == 'workbook' %}
+  <p class="notice">收件资料来自上传发票内置地址库，待星睿审核。</p>
+  {% endif %}
   <dl class="fields">
     {% for label, value in (
       ('地址编码', invoice.address_code), ('仓库编码', invoice.address.warehouse_code), ('收件人', invoice.address.recipient),

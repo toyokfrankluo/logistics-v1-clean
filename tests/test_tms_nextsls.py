@@ -513,7 +513,7 @@ class NextSLSProtocolTests(unittest.TestCase):
     def test_warehouse_code_is_distinct_from_address_lookup_key(self):
         def add_code(book):
             book["地址库"]["D2"] = "FBA-DEMO-WAREHOUSE"
-        invoice = fixture.parse_invoice(fixture.workbook_bytes(), fixture.workbook_bytes(change=add_code))
+        invoice = fixture.parse_invoice(fixture.workbook_bytes(change=add_code))
         self.assertEqual(invoice["address_code"], "DEMO-A")
         payload = nextsls.create_payload(invoice, "TMS_DEMO", "XR-DEMO", SERVICE, {})
         self.assertEqual(payload["shipment"]["to_warehouse_code"], "FBA-DEMO-WAREHOUSE")

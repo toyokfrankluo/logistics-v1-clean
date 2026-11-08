@@ -1,10 +1,11 @@
 """Server-side reader for the Xingrui 11.6 single-order invoice."""
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from copy import copy
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from io import BytesIO
 from itertools import islice
 import re
+from unicodedata import normalize
 from zipfile import BadZipFile, ZipFile
 from zlib import error as CompressionError
 
@@ -35,6 +36,10 @@ ADDRESS_COLUMNS = {
     "street2": 10, "street3": 11, "city": 12, "region": 13,
     "country": 14, "postal_code": 15,
 }
+ADDRESS_HEADERS = (
+    "地址简称*", "地址编码*", "映射代码", "FBA仓库代码", "联系人*", "公司名",
+    "联系电话", "联系手机", "地址一*", "地址二", "地址三", "城市*", "省/洲", "国家*", "邮编*",
+)
 ADDRESS_LOOKUPS = {
     5: "recipient", 6: "company", 7: "street", 8: "street2", 9: "street3",
     10: "city", 11: "region", 12: "postal_code", 13: "country", 14: "phone", 15: "mobile",
@@ -194,16 +199,16 @@ def missing_value(cell):
 
 def catalogue_rows(book):
     if "地址库" not in book:
-        raise InvoiceError("客户地址库缺少「地址库」工作表。")
+        raise InvoiceError("工作簿缺少「地址库」工作表。")
     sheet = book["地址库"]
     sheet.reset_dimensions()
     rows = sheet.iter_rows(max_col=15)
     header = next(rows, None)
-    if header is None or header[1].value != "地址编码*":
-        raise InvoiceError("客户地址库表头与星睿模板不符。")
+    if header is None or tuple(cell.value for cell in header) != ADDRESS_HEADERS:
+        raise InvoiceError("地址库表头与星睿模板不符。")
     for index, row in enumerate(rows, start=2):
         if index > 5000:
-            raise InvoiceError("客户地址库超出 5,000 行。")
+            raise InvoiceError("地址库超出 5,000 行。")
         if not missing_value(row[1]):
             yield row
 
@@ -211,7 +216,7 @@ def catalogue_rows(book):
 def validate_address_row(row):
     missing = [label for key, label in REQUIRED_ADDRESS.items() if missing_value(row[ADDRESS_COLUMNS[key] - 1])]
     if missing:
-        raise InvoiceError("分配的地址库缺少必填资料，请联系星睿补齐：" + "、".join(missing) + "。")
+        raise InvoiceError("地址库匹配行缺少必填资料：" + "、".join(missing) + "。")
     warehouse = cell_text(row[3], "地址库 FBA 仓库代码", required=False, limit=50)
     values = ["", "", "", warehouse] + [cell_text(cell, "地址库收件资料", required=False) for cell in row[4:]]
     values[13] = values[13].upper()
@@ -238,20 +243,50 @@ def validated_catalogue(raw):
     return addresses
 
 
-def resolve_address(catalogue, code):
-    """Resolve only against the catalogue assigned to this customer by Xingrui."""
-    if isinstance(catalogue, bytes):
-        # Compatibility for existing, operator-managed local catalogues.
-        with workbook_from_bytes(catalogue) as (book, _photos):
-            matches = [row for row in catalogue_rows(book) if row[1].data_type == "s"
-                       and row[1].value.strip().casefold() == code.casefold()]
-            values = [validate_address_row(matches[0])] if len(matches) == 1 else []
-    else:
-        values = [row for row in catalogue if row[1].casefold() == code.casefold()]
-    if len(values) != 1:
-        raise InvoiceError("此地址编码在分配给本客户的地址库中不存在或重复。")
-    row = values[0]
+def address_values(row):
     return {**{key: row[col - 1] for key, col in ADDRESS_COLUMNS.items()}, "warehouse_code": row[3]}
+
+
+def workbook_address(book, code):
+    seen = set()
+    match = None
+    for row in catalogue_rows(book):
+        key = identifier(row[1], "地址库编码").casefold()
+        if key in seen:
+            raise InvoiceError("地址库含重复编码，请先核对。")
+        seen.add(key)
+        if key == code.casefold():
+            match = row
+    if match is None:
+        raise InvoiceError("L4 地址编码在此工作簿的「地址库」中不存在。")
+    return address_values(validate_address_row(match))
+
+
+def comparable_address(value):
+    return " ".join(normalize("NFC", value).split()).casefold()
+
+
+def check_displayed_address(raw, rows, address):
+    """Check visible values when present; never calculate or trust Excel formulas."""
+    expected = {line: address[field] for line, field in ADDRESS_LOOKUPS.items()}
+    expected[17] = "\n".join(filter(None, (
+        address["company"], address["street"], address["street2"], address["street3"],
+        f'{address["city"]}, {address["region"]} {address["postal_code"]}', address["country"],
+    )))
+    formulas = {line for line in expected if rows[line - 1][11].data_type == "f"}
+    cached = {}
+    if formulas:
+        # The package and all formula text have already passed workbook_from_bytes.
+        with closing(load_workbook(BytesIO(raw), read_only=True, data_only=True, keep_links=False)) as book:
+            cached = {line: row[0] for line, row in enumerate(
+                book["星睿发票"].iter_rows(min_row=5, max_row=17, min_col=12, max_col=12), start=5
+            ) if line in formulas and row[0].data_type != "e"}
+    for line, value in expected.items():
+        cell = cached.get(line) if line in formulas else rows[line - 1][11]
+        if cell is None or missing_value(cell):
+            continue
+        if comparable_address(cell_text(cell, f"L{line}（收件资料）", limit=1500)) != comparable_address(value):
+            raise InvoiceError(f"L{line} 的收件资料与本工作簿地址库冲突。请核对 L4 并重新保存发票。")
 
 
 def required_fields(rows, photos):
@@ -288,7 +323,7 @@ def hs_code(cell, line):
     return code
 
 
-def parse_invoice(raw, catalogue):
+def parse_invoice(raw):
     with workbook_from_bytes(raw) as (book, photos):
         if set(book.sheetnames) != SHEETS:
             raise InvoiceError("请上传星睿三工作表单票模板。")
@@ -312,7 +347,8 @@ def parse_invoice(raw, catalogue):
         if service not in SERVICES:
             raise InvoiceError("运输服务不在星睿的 13 种服务中。")
         address_code = identifier(rows[3][11], "地址库编码")
-        address = resolve_address(catalogue, address_code)
+        address = workbook_address(book, address_code)
+        check_displayed_address(raw, rows, address)
         address["email"] = cell_text(rows[15][11], "收件邮箱", required=False)
         flags = {name: yes_no(rows[index][3], label) for index, name, label in (
             (6, "battery", "是否带电"), (7, "magnet", "是否带磁"),
@@ -348,7 +384,7 @@ def parse_invoice(raw, catalogue):
             raise InvoiceError("发票箱数与不同箱号的数量不一致。")
         return {
             "customer_number": customer_number, "service": service,
-            "address_code": address_code, "address": address, "flags": flags,
+            "address_code": address_code, "address": address, "address_source": "workbook", "flags": flags,
             "metadata": metadata, "boxes": list(boxes.values()), "declarations": declarations,
         }
 
@@ -401,7 +437,7 @@ def blank_invoice(catalogue=None, *, layout=None):
         ("A3:H3", "01 发件人信息 / 订单资料"), ("I3:O3", "02 收件人信息 / 地址库自动填充"),
         ("A20:O20", "03 产品与货物申报资料 / CUSTOMS DECLARATION"),
         ("A21:O21", "在 L4 选择地址编码，在 D5 选择服务。每条产品明细填写所有星号字段，图片插入 O 列。"),
-        ("A54:E54", "合计"), ("A56:O56", "一份文件填写一票。收件资料以星睿分配给本客户的地址库为准。"),
+        ("A54:E54", "合计"), ("A56:O56", "一份文件填写一票。按工作簿内的地址库匹配收件资料，提交后由星睿审核。"),
     ):
         sheet.merge_cells(region)
         cell = sheet[region.split(":")[0]]
@@ -438,9 +474,7 @@ def blank_invoice(catalogue=None, *, layout=None):
     sheet.freeze_panes = "A4"
 
     addresses = book.create_sheet("地址库")
-    addresses.append(("地址简称*", "地址编码*", "映射代码", "FBA仓库代码", "联系人*",
-                      "公司名", "联系电话", "联系手机", "地址一*", "地址二", "地址三",
-                      "城市*", "省/洲", "国家*", "邮编*"))
+    addresses.append(ADDRESS_HEADERS)
     if isinstance(catalogue, bytes):
         with workbook_from_bytes(catalogue) as (source, _photos):
             rows = list(catalogue_rows(source))

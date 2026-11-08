@@ -16,12 +16,15 @@ from flask import (
     send_file, session, url_for,
 )
 from flask_login import current_user, logout_user
-from sqlalchemy import func, or_, select, text, update
+from sqlalchemy import func, inspect, or_, select, text, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from models import CarrierAgent, Customer, ManualTrack, Shipment, db
-from tms_invoice import InvoiceError, MAX_UPLOAD_BYTES, SERVICES, blank_invoice, parse_invoice, validated_catalogue
+from tms_invoice import (
+    IDENTIFIER, REQUIRED_ADDRESS, InvoiceError, MAX_UPLOAD_BYTES, SERVICES, address_values,
+    blank_invoice, comparable_address, parse_invoice, validated_catalogue,
+)
 from tms_models import TmsAccount, TmsAddressBook, TmsAudit, TmsOrder, TmsReceivable, TmsChargeAdjustment
 from tms_billing import (
     CURRENCIES, FIXED, SOURCES, UNITS, billing_available, confirm_price, price_form, valid_draft,
@@ -47,6 +50,12 @@ BUSINESS_TIME = timezone(timedelta(hours=8))
 ORDER_FILTERS = {
     "q": 300, "service": 60, "country": 2, "address": 50, "recipient": 100,
     "created_from": 10, "created_to": 10,
+}
+DESTINATION_FIELDS = {
+    "warehouse_code": "FBA 仓库代码", "recipient": "收件人", "company": "公司",
+    "street": "收件地址一", "street2": "收件地址二", "street3": "收件地址三",
+    "city": "城市", "region": "省份 / 州", "postal_code": "邮编", "country": "国家二字代码",
+    "phone": "电话", "mobile": "手机", "email": "邮箱",
 }
 
 
@@ -305,7 +314,7 @@ def customer_catalogue(customer_id):
         return read_configured_workbook(local_catalogue[1])
     directory = config.get("TMS_ADDRESS_BOOK_DIR")
     if not directory:
-        raise InvoiceError("请联系星睿开通本客户的地址库。")
+        raise InvoiceError("暂未提供在线下载的地址库模板。可直接上传已有的星睿三工作表发票。")
     return read_configured_workbook(Path(directory) / f"{customer_id}.xlsx")
 
 
@@ -330,7 +339,7 @@ def upload():
         return page("upload", error="每份 .xlsx 文件上限为 2 MiB。", replacement=order), 400
     customer_id = g.tms_account.customer_id
     try:
-        invoice = parse_invoice(raw, customer_catalogue(customer_id))
+        invoice = parse_invoice(raw)
     except InvoiceError as error:
         return page("upload", error=str(error), replacement=order), 400
     key = invoice["customer_number"].upper()
@@ -593,6 +602,25 @@ def reviewable_order(order_id):
     return TmsOrder.query.filter(TmsOrder.status != "draft", TmsOrder.id == order_id).first_or_404()
 
 
+def destination_reference(order):
+    """Compare only with this customer's optional, staff-maintained reference."""
+    if not inspect(db.session.connection()).has_table(TmsAddressBook.__tablename__):
+        return None
+    saved = db.session.get(TmsAddressBook, order.customer_id)
+    if saved is None:
+        return None
+    code = order.invoice["address_code"].casefold()
+    matches = [row for row in saved.rows if row[1].casefold() == code]
+    if len(matches) != 1:
+        return {"no_match": True}
+    reference = address_values(matches[0])
+    return {"differences": [
+        (DESTINATION_FIELDS[key], order.invoice["address"].get(key, ""), value)
+        for key, value in reference.items()
+        if comparable_address(order.invoice["address"].get(key, "")) != comparable_address(value)
+    ]}
+
+
 def staff_detail(order, **context):
     agents = CarrierAgent.query.filter_by(is_active=True).order_by(CarrierAgent.name).all()
     channels = {}
@@ -637,8 +665,14 @@ def staff_detail(order, **context):
                     TmsSupplierEvent.order_id == order.id, TmsSupplierEvent.kind.in_(("cost", "snapshot")),
                 ).order_by(TmsSupplierEvent.id.desc()).limit(15)).all(),
             }
+    destination = {}
+    if order.status == "pending" and order.invoice.get("address_source") == "workbook":
+        destination = {
+            "destination_fields": DESTINATION_FIELDS, "required_destination": REQUIRED_ADDRESS,
+            "destination_reference": destination_reference(order),
+        }
     return order_detail(order, agents=agents, agent_channels=channels, customer=db.session.get(Customer, order.customer_id),
-                        adjustments=adjustments, supplier=supplier, **context)
+                        adjustments=adjustments, supplier=supplier, **destination, **context)
 
 
 @staff.get("/orders/<int:order_id>")
@@ -746,6 +780,34 @@ def pricing_input():
     return fields
 
 
+def reviewed_invoice(invoice, form):
+    if form.get("destination_confirmed") != "yes":
+        raise ValueError("请先核对并确认本票收件地址。")
+    original = invoice["address"]
+    code = form.get("destination_code", invoice["address_code"]).strip()
+    if not IDENTIFIER.fullmatch(code):
+        raise ValueError("目的地地址编码格式不正确。")
+    address = {}
+    for key, label in DESTINATION_FIELDS.items():
+        value = form.get(f"destination_{key}", original.get(key, "")).strip()
+        if key in REQUIRED_ADDRESS and not value:
+            raise ValueError(f"收件地址的「{label}」不能为空。")
+        if len(value) > (50 if key == "warehouse_code" else 200) or any(ord(char) < 32 for char in value):
+            raise ValueError(f"收件地址的「{label}」格式或长度不正确。")
+        address[key] = value
+    address["country"] = address["country"].upper()
+    if not re.fullmatch(r"[A-Z]{2}", address["country"]):
+        raise ValueError("收件地址国家代码须为两位字母。")
+    changed = code != invoice["address_code"] or address != original
+    reason = form.get("destination_reason", "").strip()
+    if len(reason) > 500 or (changed and not reason):
+        raise ValueError("更正收件地址须填写原因，最多 500 字。")
+    return dict(invoice, address_code=code, address=address,
+                submitted_destination={"address_code": invoice["address_code"], "address": original},
+                destination_review={"by": current_user.id, "at": datetime.now(timezone.utc).isoformat(),
+                                    "changed": changed, "reason": reason})
+
+
 def save_pricing(order, decision):
     form = request.form
     values = price_form(form)
@@ -782,11 +844,15 @@ def save_pricing(order, decision):
             raise ValueError("请选择此 NextSLS 代理已配置的渠道代码。")
     details = confirm_price(values, form) if decision == "approve" else values
     if decision == "approve":
+        invoice = order.invoice
+        changes = {"status": "approved", "agent_id": agent.id, "agent_service": service}
+        if invoice.get("address_source") == "workbook":
+            invoice = reviewed_invoice(invoice, form)
+            changes["invoice"] = invoice
         db.session.get(Customer, order.customer_id, with_for_update=True)
         if legacy_duplicate(order.customer_id, order.number_key):
             abort(409, "本客户已存在同一单号的运单，请先人工核对。")
-        update_order(order, {"status": "approved", "agent_id": agent.id, "agent_service": service})
-        invoice = order.invoice
+        update_order(order, changes)
         shipment = Shipment(
             tracking_number=invoice["customer_number"], customer_id=order.customer_id, agent_id=agent.id,
             destination=invoice["address"]["country"], channel=invoice["service"],
