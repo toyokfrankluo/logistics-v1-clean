@@ -12,7 +12,7 @@
         </div>
 
         <div class="form-group mb-2">
-            <label for="api_url">原有轨迹 API 地址</label>
+            <label for="api_url">原有轨迹 API 地址（NextSLS V5 可留空）</label>
             <input type="text" class="form-control" id="api_url" name="api_url">
         </div>
 
@@ -28,9 +28,16 @@
 
         <div class="form-group mb-2">
             <label for="customer_code">客户代码</label>
-            <input type="text" class="form-control" id="customer_code" name="customer_code">
+            <input type="password" class="form-control" id="customer_code" name="customer_code" autocomplete="new-password">
         </div>
 
+        {% if integration_ready %}<details class="panel" open><summary>NextSLS 多接口配置</summary>
+            <div class="carrier-fields">{% include '_agent_api_fields.html' %}</div>
+            <p>选择 NextSLS V5 后，只需填写基础域名和 App Token，再勾选所需功能。</p>
+            <div class="carrier-fields">{% for key, (label, path, access) in capabilities.items() %}
+                <label class="check-label"><input type="checkbox" name="capability" value="{{ key }}">{{ label }}</label>
+            {% endfor %}</div>
+        </details>{% endif %}
         <button type="submit" class="btn btn-primary">添加代理</button>
     </form>
 
@@ -53,10 +60,10 @@
             <tr>
                 <td>{{ agent.id }}</td>
                 <td>{{ agent.name }}</td>
-                <td>{{ '已配置 · 在编辑页查看' if agent.api_url else '手工代理' }}</td>
+                <td>{{ '已保存 · 在编辑页查看' if agent.api_url else '未填写旧地址' }}</td>
                 <td>{{ "已配置" if agent.app_key else "未配置" }}</td>
                 <td>{{ "已配置" if agent.app_token else "未配置" }}</td>
-                <td><span class="badge {{ 'approved' if agent.is_active else '' }}">{{ '启用' if agent.is_active else '停用' }}</span>{% if profiles.get(agent.id) %}<small class="cell-note">{{ providers[profiles[agent.id].provider] }} · 已勾选 {{ profiles[agent.id].enabled|length }} 项</small>{% endif %}<small class="cell-note">{{ '已配置轨迹能力，连通性待验证' if agent.supports_api and agent.api_url else '手工轨迹' }}</small></td>
+                <td><span class="badge {{ 'approved' if agent.is_active else '' }}">{{ '启用' if agent.is_active else '停用' }}</span>{% set profile = profiles.get(agent.id) %}{% if profile and profile.provider == 'nextsls' %}<small class="cell-note">NextSLS V5 · 已勾选 {{ profile.enabled|length }} 项</small>{% else %}<small class="cell-note">{{ '使用原有轨迹地址' if agent.supports_api and agent.api_url else '手工轨迹' }}</small>{% endif %}</td>
                 <td>{{ shipment_counts.get(agent.id, 0) }}</td>
                 <td>
                     <a href="{{ url_for('views.edit_agent', agent_id=agent.id) }}" class="btn btn-sm btn-warning">编辑代理与功能接口</a>

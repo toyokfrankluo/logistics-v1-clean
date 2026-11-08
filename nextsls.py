@@ -19,7 +19,7 @@ CAPABILITIES = {
     "charges": ("查询代理费用", "/shipment/get_info", "只读"),
     "settlement": ("查询结算状态", None, "待确认"),
 }
-WIRED = {"create", "reconcile", "measurement", "parcels", "charges"}
+WIRED = {"create", "reconcile", "tracking", "measurement", "parcels", "charges"}
 PATHS = {path for _, path, _ in CAPABILITIES.values() if path} | {"/shipment/get_services"}
 CODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,49}\Z")
 FBA_BOX_CODE = re.compile(r"FBA[A-Za-z0-9]{6,47}\Z", re.I)
@@ -56,19 +56,36 @@ def base_url(value, provider):
         raise ProtocolError("请填写不含路径或凭据的 HTTPS 基础域名。NextSLS 须使用其 nextsls.com 租户域名。") from None
 
 
+def tenant_host(value):
+    try:
+        host = (urlsplit(value or "").hostname or "").rstrip(".")
+    except ValueError:
+        return None
+    return host if host.endswith(".nextsls.com") else None
+
+
+def legacy_tenant_matches(legacy_url, origin):
+    try:
+        urlsplit(legacy_url or "").hostname
+    except ValueError:
+        return False
+    host = tenant_host(legacy_url)
+    return not host or host == urlsplit(origin).hostname
+
+
+def endpoint(origin, path):
+    return origin + "/api/v5" + path
+
+
 def request_data(agent, origin, path, payload, *, transport=None):
     if path not in PATHS or not origin or base_url(origin, "nextsls") != origin:
         raise ProtocolError("未配置 NextSLS 租户或接口未获支持。")
     if not agent.is_active or not agent.supports_api or not agent.app_token:
         raise ProtocolError("代理已停用、未启用 API 或缺少 App Token。")
     # An established NextSLS legacy URL provides a second tenant boundary for its existing token.
-    try:
-        old_host = urlsplit(agent.api_url or "").hostname or ""
-    except ValueError:
-        raise ProtocolError("原有轨迹配置格式无效，请核对代理配置。") from None
-    if old_host.endswith(".nextsls.com") and old_host != urlsplit(origin).hostname:
+    if not legacy_tenant_matches(agent.api_url, origin):
         raise ProtocolError("基础域名与现有 NextSLS 轨迹租户不一致，请检查代理配置。")
-    target = SimpleNamespace(api_url=origin + "/api/v5" + path, is_active=agent.is_active,
+    target = SimpleNamespace(api_url=endpoint(origin, path), is_active=agent.is_active,
                              supports_api=agent.supports_api, app_token=agent.app_token,
                              app_key=agent.app_key, password=agent.password)
     try:

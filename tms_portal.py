@@ -552,6 +552,12 @@ def reviewable_order(order_id):
 
 def staff_detail(order, **context):
     agents = CarrierAgent.query.filter_by(is_active=True).order_by(CarrierAgent.name).all()
+    channels = {}
+    if order.status != "approved" and agents and tms_carriers.carrier_schema():
+        channels = {profile.agent_id: profile.service_codes for profile in db.session.scalars(
+            select(TmsAgentApi).where(TmsAgentApi.provider == "nextsls",
+                                     TmsAgentApi.agent_id.in_([agent.id for agent in agents])))
+                    if profile.service_codes}
     adjustments = (db.session.scalars(select(TmsChargeAdjustment).where(
         TmsChargeAdjustment.order_id == order.id).order_by(TmsChargeAdjustment.id.desc())).all()
         if order.status == "approved" and billing_available() else [])
@@ -588,7 +594,7 @@ def staff_detail(order, **context):
                     TmsSupplierEvent.order_id == order.id, TmsSupplierEvent.kind.in_(("cost", "snapshot")),
                 ).order_by(TmsSupplierEvent.id.desc()).limit(15)).all(),
             }
-    return order_detail(order, agents=agents, customer=db.session.get(Customer, order.customer_id),
+    return order_detail(order, agents=agents, agent_channels=channels, customer=db.session.get(Customer, order.customer_id),
                         adjustments=adjustments, supplier=supplier, **context)
 
 
@@ -727,6 +733,10 @@ def save_pricing(order, decision):
         raise ValueError("请选择启用的实际物流代理。")
     if decision == "approve" and not service:
         raise ValueError("请填写实际代理运输渠道。")
+    if decision == "approve":
+        profile = tms_carriers.agent_profile(agent.id)
+        if profile and profile.provider == "nextsls" and profile.service_codes and service not in profile.service_codes:
+            raise ValueError("请选择此 NextSLS 代理已配置的渠道代码。")
     details = confirm_price(values, form) if decision == "approve" else values
     if decision == "approve":
         db.session.get(Customer, order.customer_id, with_for_update=True)

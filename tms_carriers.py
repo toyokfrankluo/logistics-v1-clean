@@ -9,7 +9,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from sqlalchemy import func, inspect, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from models import CarrierAgent, Shipment, db
 import nextsls
@@ -56,13 +56,43 @@ def configure(agent_id, form):
         profile.verified = {}
     profile.provider, profile.base_url = provider, origin
     profile.enabled, profile.service_codes, profile.sender = enabled, sorted(set(codes)), sender
+    return profile
+
+
+def agent_profile(agent_id):
+    if not carrier_schema():
+        return None
+    profiles = g.setdefault("nextsls_agent_profiles", {})
+    if agent_id not in profiles:
+        profiles[agent_id] = db.session.get(TmsAgentApi, agent_id)
+    return profiles[agent_id]
+
+
+def unavailable_reason(profile, agent, key):
+    if not profile or profile.provider != "nextsls":
+        return "仅适用于 NextSLS V5"
+    if key not in nextsls.WIRED:
+        return "接口尚未接入"
+    if not profile.base_url:
+        return "未填写 API 基础域名"
+    if not agent.app_token:
+        return "未配置 App Token"
+    if not nextsls.legacy_tenant_matches(agent.api_url, profile.base_url):
+        return "原有轨迹地址与基础域名租户不一致"
+    if not agent.is_active or not agent.supports_api:
+        return "代理已停用或不支持 API"
+    if key not in profile.enabled:
+        return "功能未勾选启用"
+    if key == "create" and not profile.service_codes:
+        return "未配置代理渠道代码"
+    switch = "TMS_NEXTSLS_CREATE_ENABLED" if key == "create" else "TMS_NEXTSLS_READ_ENABLED"
+    if not current_app.config.get(switch):
+        return "系统未开放真实下单" if key == "create" else "系统未开放 NextSLS 只读请求"
+    return None
 
 
 def available(profile, agent, key):
-    switch = "TMS_NEXTSLS_CREATE_ENABLED" if key == "create" else "TMS_NEXTSLS_READ_ENABLED"
-    return bool(profile and profile.provider == "nextsls" and profile.base_url and key in profile.enabled
-                and key in nextsls.WIRED and agent.is_active and agent.supports_api and agent.app_token
-                and current_app.config.get(switch))
+    return unavailable_reason(profile, agent, key) is None
 
 
 def approved_shipment(order):
@@ -209,6 +239,23 @@ def unlock_retry(order, actor_id, reason):
 
 def mark_verified(profile, keys):
     profile.verified = {**profile.verified, **{key: datetime.utcnow().isoformat(timespec="seconds") for key in keys}}
+
+
+def record_tracking_verification(profile, agent):
+    # Only called from the administrator's standalone tracking query, which has no other writes.
+    if current_app.testing or current_app.config.get("ISOLATED_MODE") or profile.verified.get("tracking"):
+        return
+    origin, token = profile.base_url, agent.app_token
+    try:
+        db.session.refresh(agent, with_for_update=True)
+        db.session.refresh(profile, with_for_update=True)
+        if (profile.base_url == origin and agent.app_token == token
+                and available(profile, agent, "tracking") and not profile.verified.get("tracking")):
+            mark_verified(profile, {"tracking"})
+        db.session.commit()
+    except SQLAlchemyError:
+        db.session.rollback()
+        current_app.logger.warning("nextsls tracking verification status was not saved")
 
 
 def latest_event(order_id, kind):

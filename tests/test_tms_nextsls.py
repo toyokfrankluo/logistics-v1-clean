@@ -96,6 +96,10 @@ class NextSLSTests(unittest.TestCase):
             self.assertNotIn(secret, body)
         self.assertIn("文档确认", body)
         self.assertIn("未验证", body)
+        for path in ("/admin/carrieragent/", f"/admin/carrieragent/edit/?id={self.agent.id}"):
+            admin_body = self.get(self.staff, path).get_data(as_text=True)
+            for secret in (TOKEN, "hidden-synthetic-key", "hidden-synthetic-account"):
+                self.assertNotIn(secret, admin_body)
         self.post(self.staff, url, {"provider": "nextsls", "base_url": "https://127.0.0.1",
                                     "capability": "create"}, "/login")
         self.assertEqual(db.session.get(TmsAgentApi, self.agent.id).base_url, ORIGIN)
@@ -121,8 +125,30 @@ class NextSLSTests(unittest.TestCase):
         self.assertIsNone(db.session.get(Shipment, receivable.shipment_id).shipment_id)
 
     def test_approved_excel_creates_once_and_keeps_distinct_identifiers(self):
-        order_id = self.approve()
-        self.profile()
+        order_id = self.pending_order()
+        self.assertEqual(self.post(self.staff, "/agents", {
+            "name": "虚构 API 代理", "provider": "nextsls", "base_url": ORIGIN,
+            "app_token": TOKEN, "service_codes": "TMS_DEMO", "capability": "create",
+        }, "/login").status_code, 302)
+        agent = CarrierAgent.query.filter_by(name="虚构 API 代理").one()
+        self.assertFalse(agent.api_url)
+        self.assertIn("0000123", self.get(self.staff, "/tms/admin/").get_data(as_text=True))
+        review = self.get(self.staff, f"/tms/admin/orders/{order_id}").get_data(as_text=True)
+        self.assertIn('data-channel-list=', review)
+        self.assertIn('<option value="TMS_DEMO">', review)
+        self.assertNotIn(TOKEN, review)
+        pricing = self.pricing(agent_id=agent.id, agent_service="TMS_DEMO", surcharge="5.50", operation="6.25",
+                               high_value="7.75", other_mode="items", other_name="虚构费用", other_amount="8.40",
+                               other_currency="CNY", other_note="虚构说明")
+        invalid = self.decision(order_id, 2, decision="approve", **(pricing | {"agent_service": "OTHER-ACCOUNT"}))
+        self.assertEqual(invalid.status_code, 400)
+        self.assertIn("请选择此 NextSLS 代理已配置的渠道代码", invalid.get_data(as_text=True))
+        self.assertEqual(self.decision(order_id, 2, decision="approve", **pricing).status_code, 302)
+        self.carrier_post.assert_not_called()
+        receivable = db.session.get(TmsReceivable, order_id)
+        self.assertEqual(str(receivable.total), "1227.90")
+        shipment = db.session.get(Shipment, receivable.shipment_id)
+        self.assertIsNone(shipment.shipment_id)
         sent = []
 
         def fake(target, *, json, headers):
@@ -146,11 +172,73 @@ class NextSLSTests(unittest.TestCase):
         self.assertEqual(sent[0]["parcels"][0]["reference"], "0001")
         self.assertEqual(sent[0]["parcels"][0]["declarations"][0]["hscode"], "00123456")
         self.assertNotIn("photo_url", sent[0]["parcels"][0]["declarations"][0])
-        shipment = db.session.get(Shipment, db.session.get(TmsReceivable, order_id).shipment_id)
+        self.assertNotIn("1227.90", str(sent))
+        db.session.refresh(shipment)
         self.assertEqual((shipment.tracking_number, shipment.shipment_id, shipment.third_party_tracking_number),
                          ("0000123", SUPPLIER_NUMBER, None))
         self.assertEqual(Shipment.query.count(), 1)
         self.assertEqual(self.post(self.staff, f"/shipments/{shipment.id}/edit", {"shipment_id": "WRONG"}, "/login").status_code, 409)
+
+    def test_tracking_dispatches_per_agent_without_legacy_url(self):
+        self.staff_login()
+        for index in (1, 2):
+            result = self.post(self.staff, "/agents", {
+                "name": f"自动轨迹测试 {index}", "provider": "nextsls", "base_url": f"https://demo{index}.nextsls.com",
+                "app_token": f"fictional-tracking-token-{index}", "capability": "tracking",
+            }, "/login")
+            self.assertEqual(result.status_code, 302)
+            agent = CarrierAgent.query.filter_by(name=f"自动轨迹测试 {index}").one()
+            self.assertFalse(agent.api_url)
+            db.session.add(Shipment(tracking_number=f"LOCAL-{index}", shipment_id=f"PROVIDER-{index}",
+                                    agent_id=agent.id, customer_id=self.customer_a.id))
+        db.session.commit()
+        agent = CarrierAgent.query.filter_by(name="自动轨迹测试 1").one()
+        url = f"/agents/{agent.id}/edit"
+        body = self.get(self.staff, url).get_data(as_text=True)
+        self.assertIn("POST https://demo1.nextsls.com/api/v5/shipment/get_tracking", body)
+        self.assertIn("POST https://demo1.nextsls.com/api/v5/shipment/get_info", body)
+        self.assertIn("系统未开放 NextSLS 只读请求", body)
+        self.assertIn("未验证", body)
+        self.assertNotIn("fictional-tracking-token-1", body)
+        calls = []
+
+        def fake(target, *, json, headers):
+            number = json["shipment"]["shipment_id"]
+            index = number[-1]
+            self.assertEqual(target.api_url, f"https://demo{index}.nextsls.com/api/v5/shipment/get_tracking")
+            self.assertEqual(headers["Authorization"], f"Bearer fictional-tracking-token-{index}")
+            self.assertEqual(json, {"shipment": {"shipment_id": number, "language": "zh"}})
+            calls.append(index)
+            return success({"shipment": {"shipment_id": number, "traces": [{"info": "模拟轨迹到达"}]}})
+
+        disabled = self.post(self.staff, "/track", {"numbers": "LOCAL-1"}, "/login")
+        self.assertIn("系统未开放 NextSLS 只读请求", disabled.get_data(as_text=True))
+        with patch.dict(app.config, TMS_NEXTSLS_READ_ENABLED=True), patch("carrier_http.post", side_effect=fake):
+            result = self.post(self.staff, "/track", {"numbers": "LOCAL-1\nLOCAL-2"}, "/login")
+            self.assertIn("模拟轨迹到达", result.get_data(as_text=True))
+        self.assertEqual(calls, ["1", "2"])
+        self.assertEqual(db.session.get(TmsAgentApi, agent.id).verified, {})
+
+    def test_tracking_disable_and_tenant_change_do_not_reuse_legacy_credentials(self):
+        order_id = self.approve()
+        profile = self.profile()
+        self.assign_supplier_number(order_id)
+        url = f"/agents/{self.agent.id}/edit"
+        settings = {"provider": "nextsls", "base_url": ORIGIN, "service_codes": "TMS_DEMO"}
+        with patch.dict(app.config, TMS_NEXTSLS_READ_ENABLED=True):
+            response = self.post(self.staff, "/track", {"numbers": "0000123"}, "/login")
+            self.assertIn("功能未勾选启用", response.get_data(as_text=True))
+        self.post(self.staff, url, settings | {"base_url": "https://other.nextsls.com", "api_url": ""}, "/login")
+        self.assertEqual(profile.base_url, ORIGIN)
+        self.assertEqual(self.agent.app_token, TOKEN)
+        self.assertTrue(self.agent.api_url)
+        self.post(self.staff, url, settings | {"capability": "tracking", "app_token": ""}, "/login")
+        self.assertEqual(self.agent.app_token, TOKEN)
+        with patch.dict(app.config, TMS_NEXTSLS_READ_ENABLED=True), patch("carrier_http.post", return_value=success(
+                {"shipment": {"shipment_id": "OTHER", "traces": [{"info": "错误归属"}]}})):
+            response = self.post(self.staff, "/track", {"numbers": "0000123"}, "/login")
+            self.assertNotIn("错误归属", response.get_data(as_text=True))
+            self.assertIn("归属或响应结构无法确认", response.get_data(as_text=True))
 
     def test_timeout_requires_reconciliation_never_blind_retry(self):
         order_id = self.approve()

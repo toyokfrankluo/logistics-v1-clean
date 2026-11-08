@@ -120,6 +120,15 @@ document.addEventListener("input", event => {
     pricingPreview(form);
   }
 });
+document.addEventListener("change", event => {
+  const agent = event.target;
+  if (agent.name !== "agent_id" || !agent.form?.matches("[data-pricing]")) return;
+  const channel = agent.form.elements.namedItem("agent_service");
+  const list = agent.selectedOptions[0]?.dataset.channelList;
+  channel.value = "";
+  if (list) channel.setAttribute("list", list);
+  else channel.removeAttribute("list");
+});
 document.addEventListener("click", event => {
   const button = event.target.closest("[data-add-fee], [data-remove-fee]");
   const form = button?.closest("[data-pricing]");

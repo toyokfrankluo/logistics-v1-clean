@@ -1,0 +1,3 @@
+<label>API 类型<select name="provider">{% for key, label in providers.items() %}<option value="{{ key }}"{% if (profile.provider if profile else 'other') == key %} selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
+<label>API 基础域名<input name="base_url" type="url" maxlength="255" value="{{ profile.base_url if profile else '' }}" placeholder="https://租户.nextsls.com"></label>
+<label>已核对的代理渠道代码<input name="service_codes" value="{{ profile.service_codes|join(' ') if profile else '' }}" placeholder="多个代码以空格分隔"></label>

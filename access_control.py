@@ -55,8 +55,8 @@ class OwnedRecordView(SecureModelView):
 
 class CarrierAdminView(SecureModelView):
     # Credentials are managed in /agents, where blank means retain existing value.
-    column_exclude_list = ("app_key", "app_token", "password")
-    form_excluded_columns = ("app_key", "app_token", "password")
+    column_exclude_list = ("api_url", "app_key", "app_token", "customer_code", "password")
+    form_excluded_columns = column_exclude_list
     can_view_details = False
 
 

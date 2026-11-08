@@ -6,6 +6,7 @@ from flask_login import login_required, logout_user, current_user
 from sqlalchemy.orm import joinedload, selectinload
 from datetime import datetime, timedelta
 from sqlalchemy import inspect as sqlalchemy_inspect, MetaData, Table, select, func
+from sqlalchemy.exc import SQLAlchemyError
 from utils import export_invoice
 from tms_models import TmsOrder, TmsReceivable
 from tms_billing import billing_available, linked_receivable, receivable_totals
@@ -23,6 +24,41 @@ views = Blueprint("views", __name__)
 # -------------------------------
 # API 轨迹获取函数
 # -------------------------------
+def _nextsls_events(traces):
+    tracks = []
+    for event in traces:
+        when = event.get("time")
+        if isinstance(when, int):
+            when = datetime.fromtimestamp(when).strftime("%Y-%m-%d %H:%M:%S")
+        tracks.append({"time": when, "location": event.get("location", ""),
+                       "description": event.get("info", "")})
+    return tracks
+
+
+def _configured_nextsls_tracks(profile, agent, shipment, *, verify=False):
+    reason = tms_carriers.unavailable_reason(profile, agent, "tracking")
+    if reason:
+        return None, reason
+    number = shipment.shipment_id if shipment else None
+    if not isinstance(number, str) or not nextsls.CODE.fullmatch(number):
+        return None, "NextSLS 轨迹需要本票已关联的供应商系统单号"
+    if db.session.scalar(select(Shipment.id).where(Shipment.agent_id == agent.id,
+            Shipment.shipment_id == number, Shipment.id != shipment.id).limit(1)) is not None:
+        return None, "同一代理存在重复供应商单号，无法核对轨迹归属"
+    try:
+        data = nextsls.request_data(agent, profile.base_url, nextsls.CAPABILITIES["tracking"][1],
+                                    {"shipment": {"shipment_id": number, "language": "zh"}})
+        info = data.get("shipment")
+        if nextsls.parse_supplier_number(data) != number or not isinstance(info.get("traces"), list):
+            return None, "NextSLS 轨迹归属或响应结构无法确认"
+        tracks = _nextsls_events(info["traces"])
+    except (nextsls.ProtocolError, AttributeError, OSError, OverflowError, ValueError):
+        return None, "NextSLS 轨迹查询失败，请核对代理账号权限及运单"
+    if verify:
+        tms_carriers.record_tracking_verification(profile, agent)
+    return tracks, None
+
+
 def fetch_tracking_from_api(agent: CarrierAgent, tracking_number: str, *, selected_shipment=None, safe_errors=False, read_only_preview=False):
     """
     根据不同的代理调用不同 API
@@ -227,6 +263,17 @@ def fetch_tracking_from_api(agent: CarrierAgent, tracking_number: str, *, select
         return None, "tracking:request_failed" if safe_errors else "API请求失败，请检查代理配置或稍后重试"
 
 
+def _fetch_selected_tracking(agent, tracking_number, *, selected_shipment, safe_errors=False, read_only_preview=False):
+    if not agent or selected_shipment.agent_id != agent.id or selected_shipment.tracking_number != tracking_number:
+        return None, "运单身份与代理不一致"
+    profile = tms_carriers.agent_profile(agent.id) if agent.is_active and agent.supports_api else None
+    if profile and profile.provider == "nextsls":
+        return _configured_nextsls_tracks(profile, agent, selected_shipment, verify=(
+            read_only_preview is True and not safe_errors and current_user.is_admin))
+    return fetch_tracking_from_api(agent, tracking_number, selected_shipment=selected_shipment,
+                                   safe_errors=safe_errors, read_only_preview=read_only_preview)
+
+
 # =============== 新增：去重同步函数 ===============
 def sync_tracking_to_supabase(shipment, tracks):
     if not _sync_identity_safe(shipment):
@@ -325,7 +372,7 @@ def _refresh_query(shipment, agent, *, history=False):
     if history:
         return None, "refresh:history_mapping_unavailable"
     try:
-        tracks, error = fetch_tracking_from_api(agent, shipment.tracking_number, selected_shipment=shipment, safe_errors=True)
+        tracks, error = _fetch_selected_tracking(agent, shipment.tracking_number, selected_shipment=shipment, safe_errors=True)
         return (None, "refresh:supplier_failure") if error else (tracks, None)
     except Exception:
         return None, "refresh:query_failure"
@@ -334,28 +381,70 @@ def _refresh_query(shipment, agent, *, history=False):
 # -------------------------------
 # 代理管理
 # -------------------------------
+def _save_agent_settings(agent, form, ready):
+    for key, limit in (("api_url", 1000), ("app_key", 255), ("app_token", 255), ("customer_code", 255)):
+        if len(form.get(key, "")) > limit:
+            raise nextsls.ProtocolError("代理配置字段过长")
+    active = form.get("agent_active")
+    supports_api = form.get("supports_api")
+    if any(value is not None and value not in {"yes", "no"} for value in (active, supports_api)):
+        raise nextsls.ProtocolError("代理状态无效")
+    old_config = (agent.api_url, agent.app_key, agent.app_token, agent.customer_code)
+    profile = db.session.get(TmsAgentApi, agent.id) if ready else None
+    was_managed = profile and profile.provider == "nextsls"
+    old_url = (profile.base_url or agent.api_url) if was_managed else agent.api_url
+    if ready and "provider" in form and (profile or form["provider"] != "other" or form.get("base_url")):
+        profile = tms_carriers.configure(agent.id, form)
+    if active is not None:
+        agent.is_active = active == "yes"
+    if supports_api is not None:
+        agent.supports_api = supports_api == "yes"
+    agent.api_url = "" if form.get("clear_legacy_url") == "yes" else form.get("api_url", agent.api_url)
+    agent.app_key = form.get("app_key", "").strip() or agent.app_key
+    agent.app_token = form.get("app_token", "").strip() or agent.app_token
+    agent.customer_code = form.get("customer_code", "").strip() or agent.customer_code
+    managed = profile and profile.provider == "nextsls"
+    if managed and profile.base_url and not nextsls.legacy_tenant_matches(agent.api_url, profile.base_url):
+        raise nextsls.ProtocolError("原有轨迹地址与基础域名租户不一致，请先核对两项配置。")
+    new_url = profile.base_url if managed else agent.api_url
+    if (was_managed or managed or nextsls.tenant_host(old_url) or nextsls.tenant_host(new_url)) and old_config[2]:
+        try:
+            old_host, new_host = ((urlsplit(url or "").hostname or "").rstrip(".") for url in (old_url, new_url))
+        except ValueError:
+            raise nextsls.ProtocolError("NextSLS 地址无效，请先核对代理配置。") from None
+        if (new_host and new_host != old_host
+                and (not form.get("app_token", "").strip() or (old_host and agent.app_token == old_config[2]))):
+            raise nextsls.ProtocolError("切换 NextSLS 租户时，请填写目标账号的 App Token。")
+    if profile and old_config != (agent.api_url, agent.app_key, agent.app_token, agent.customer_code):
+        profile.verified = {}
+
+
 @views.route("/agents", methods=["GET", "POST"])
 @login_required
 def agents():
+    ready = tms_carriers.carrier_schema()
     if request.method == "POST":
         name = request.form.get("name", "").strip()
-        if not name:
-            flash("代理名称不能为空", "danger")
+        if not name or len(name) > 200:
+            flash("代理名称不能为空或超过 200 个字符", "danger")
             return redirect(url_for("views.agents"))
 
         if CarrierAgent.query.filter_by(name=name).count():
             flash('代理名称已存在，请编辑现有代理', 'danger')
             return redirect(url_for('views.agents'))
-        a = CarrierAgent(
-            name=name,
-            api_url=request.form.get("api_url"),
-            app_key=request.form.get("app_key"),
-            app_token=request.form.get("app_token"),
-            customer_code=request.form.get("customer_code"),
-            is_active=True
-        )
+        a = CarrierAgent(name=name, is_active=True)
         db.session.add(a)
-        db.session.commit()
+        try:
+            db.session.flush()
+            _save_agent_settings(a, request.form, ready)
+            db.session.commit()
+        except nextsls.ProtocolError as error:
+            db.session.rollback()
+            flash(str(error), "danger")
+            return redirect(url_for("views.agents"))
+        except SQLAlchemyError:
+            db.session.rollback()
+            return "代理配置保存失败，请刷新后重试。", 409
         flash("代理已添加", "success")
         return redirect(url_for("views.agents"))
 
@@ -363,50 +452,43 @@ def agents():
     counts = dict(db.session.execute(select(Shipment.agent_id, func.count(Shipment.id))
                                     .group_by(Shipment.agent_id)).all())
     profiles = ({row.agent_id: row for row in db.session.scalars(select(TmsAgentApi))}
-                if tms_carriers.carrier_schema() else {})
+                if ready else {})
     return render_template("agent.html", agents=data, shipment_counts=counts,
-                           profiles=profiles, providers=tms_carriers.PROVIDERS)
+                           profiles=profiles, providers=tms_carriers.PROVIDERS,
+                           integration_ready=ready, capabilities=nextsls.CAPABILITIES)
 
 @views.route("/agents/<int:agent_id>/edit", methods=["GET", "POST"])
 @login_required
 def edit_agent(agent_id):
-    a = CarrierAgent.query.get_or_404(agent_id)
+    a = db.session.get(CarrierAgent, agent_id, with_for_update=request.method == "POST")
+    if a is None:
+        abort(404)
     ready = tms_carriers.carrier_schema()
     if request.method == "POST":
         name = request.form.get("name", a.name).strip()
         if not name or len(name) > 200 or CarrierAgent.query.filter(CarrierAgent.name == name, CarrierAgent.id != a.id).count():
             return "代理名称为空、过长或已存在", 400
-        old_config = (a.api_url, a.app_key, a.app_token)
-        for key, limit in (("api_url", 1000), ("app_key", 255), ("app_token", 255), ("customer_code", 255)):
-            if len(request.form.get(key, "")) > limit:
-                return "代理配置字段过长", 400
-        active = request.form.get("agent_active")
-        if active is not None and active not in {"yes", "no"}:
-            return "代理状态无效", 400
         try:
-            if ready and "provider" in request.form:
-                tms_carriers.configure(a.id, request.form)
+            _save_agent_settings(a, request.form, ready)
+            a.name = name
+            db.session.commit()
         except nextsls.ProtocolError as error:
             db.session.rollback()
             flash(str(error), "danger")
             return redirect(url_for("views.edit_agent", agent_id=agent_id))
-        a.name = name
-        if active is not None:
-            a.is_active = active == "yes"
-        a.api_url = request.form.get("api_url", a.api_url)
-        a.app_key = request.form.get("app_key", "").strip() or a.app_key
-        a.app_token = request.form.get("app_token", "").strip() or a.app_token
-        a.customer_code = request.form.get("customer_code", "").strip() or a.customer_code
-        if ready and old_config != (a.api_url, a.app_key, a.app_token):
-            profile = db.session.get(TmsAgentApi, a.id)
-            if profile:
-                profile.verified = {}
-        db.session.commit()
+        except SQLAlchemyError:
+            db.session.rollback()
+            return "代理配置保存失败，请刷新后重试。", 409
         flash("代理已更新", "success")
         return redirect(url_for("views.agents"))
 
     profile = db.session.get(TmsAgentApi, a.id) if ready else None
-    usable = {key: tms_carriers.available(profile, a, key) for key in nextsls.CAPABILITIES}
+    origin = profile.base_url if profile and profile.provider == "nextsls" else ""
+    endpoints = {key: nextsls.endpoint(origin, path) for key, (_, path, _) in nextsls.CAPABILITIES.items()
+                 if origin and path}
+    if origin:
+        endpoints["create_preflight"] = nextsls.endpoint(origin, "/shipment/get_services")
+    blocked = {key: tms_carriers.unavailable_reason(profile, a, key) for key in nextsls.CAPABILITIES}
     legacy_url = a.api_url or ""
     try:
         legacy_endpoint = urlsplit(legacy_url)
@@ -418,7 +500,7 @@ def edit_agent(agent_id):
         legacy_url = None
     return render_template("edit_agent.html", agent=a, legacy_url=legacy_url,
                            integration_ready=ready, profile=profile, providers=tms_carriers.PROVIDERS,
-                           capabilities=nextsls.CAPABILITIES, usable=usable)
+                           capabilities=nextsls.CAPABILITIES, endpoints=endpoints, blocked=blocked)
 
 
 @views.route("/agents/<int:agent_id>/delete", methods=["POST"])
@@ -1132,7 +1214,7 @@ def _tracking_result(s, no):
     # 2. API 轨迹（显示不带 [API] 标签）
     if s and s.agent:
         try:
-            api_tracks, api_err = fetch_tracking_from_api(s.agent, no, selected_shipment=s, read_only_preview=True)
+            api_tracks, api_err = _fetch_selected_tracking(s.agent, no, selected_shipment=s, read_only_preview=True)
         except Exception:
             api_tracks, api_err = None, '该票物流查询失败，请稍后重试'
         if api_tracks:

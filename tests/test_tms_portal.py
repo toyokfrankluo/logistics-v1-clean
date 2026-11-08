@@ -21,7 +21,8 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from app import app, User
 from models import BankAccount, CarrierAgent, Customer, Shipment, db
 from tms_invoice import InvoiceError, SERVICES, blank_invoice, parse_invoice
-from tms_models import TmsAccount, TmsAudit, TmsChargeAdjustment, TmsOrder, TmsReceivable
+from tms_models import (TmsAccount, TmsAgentApi, TmsAudit, TmsChargeAdjustment, TmsOrder, TmsReceivable,
+                        TmsSupplierEvent, TmsSupplierOrder)
 from tms_xlsx_images import XLSX_NS
 
 
@@ -630,10 +631,11 @@ class PortalTests(unittest.TestCase):
 
     def test_additive_upgrade_idempotent(self):
         existing = self.customer_a.id
+        db.session.remove()
         with db.engine.begin() as connection:
-            for table in (TmsChargeAdjustment.__table__, TmsReceivable.__table__, TmsAudit.__table__,
-                          TmsOrder.__table__, TmsAccount.__table__):
-                table.drop(connection)
+            for model in (TmsSupplierEvent, TmsSupplierOrder, TmsAgentApi, TmsChargeAdjustment,
+                          TmsReceivable, TmsAudit, TmsOrder, TmsAccount):
+                model.__table__.drop(connection)
         runner = app.test_cli_runner()
         self.assertNotEqual(runner.invoke(args=["tms-upgrade-v1"]).exit_code, 0)
         for _ in range(2):
