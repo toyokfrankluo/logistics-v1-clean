@@ -6,7 +6,7 @@
 <p>{{ shipment.tracking_number }} 已审核。收费变更从订单详情发起。</p>
 <form method="post" class="editor-form">
   <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-  <label>代理系统单号<input name="shipment_id" maxlength="50" value="{{ shipment.shipment_id or '' }}"></label>
+  <label>代理系统单号<input name="shipment_id" maxlength="50"{% if locked_supplier_number %} disabled{% endif %} value="{{ shipment.shipment_id or '' }}"></label>
   <label>第三方承运单号<input name="third_party_tracking_number" maxlength="50" value="{{ shipment.third_party_tracking_number or '' }}"></label>
   <label>物流状态<input name="status" maxlength="50" value="{{ shipment.status or '' }}"></label>
   <div class="inline-actions"><button>保存物流资料</button><a class="button secondary" href="{{ url_for('views.shipment_detail', shipment_id=shipment.id) }}">返回</a></div>

@@ -223,6 +223,7 @@ def resolve_address(raw, code):
             key: cell_text(row[col - 1], REQUIRED_ADDRESS.get(key, "地址库收件资料"), required=False)
             for key, col in ADDRESS_COLUMNS.items()
         }
+        address["warehouse_code"] = cell_text(row[3], "地址库 FBA 仓库代码", required=False, limit=50)
         address["country"] = address["country"].upper()
         if not re.fullmatch(r"[A-Z]{2}", address["country"]):
             raise InvoiceError("L13（国家二字代码）须为两位字母。")

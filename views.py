@@ -9,6 +9,9 @@ from sqlalchemy import inspect as sqlalchemy_inspect, MetaData, Table, select, f
 from utils import export_invoice
 from tms_models import TmsOrder, TmsReceivable
 from tms_billing import billing_available, linked_receivable, receivable_totals
+from tms_models import TmsAgentApi, TmsSupplierOrder
+import nextsls
+import tms_carriers
 import requests
 import carrier_http
 import json
@@ -359,26 +362,63 @@ def agents():
     data = CarrierAgent.query.order_by(CarrierAgent.is_active.desc(), CarrierAgent.name).all()
     counts = dict(db.session.execute(select(Shipment.agent_id, func.count(Shipment.id))
                                     .group_by(Shipment.agent_id)).all())
-    return render_template("agent.html", agents=data, shipment_counts=counts)
+    profiles = ({row.agent_id: row for row in db.session.scalars(select(TmsAgentApi))}
+                if tms_carriers.carrier_schema() else {})
+    return render_template("agent.html", agents=data, shipment_counts=counts,
+                           profiles=profiles, providers=tms_carriers.PROVIDERS)
 
 @views.route("/agents/<int:agent_id>/edit", methods=["GET", "POST"])
 @login_required
 def edit_agent(agent_id):
     a = CarrierAgent.query.get_or_404(agent_id)
+    ready = tms_carriers.carrier_schema()
     if request.method == "POST":
-        name = request.form.get('name', a.name).strip()
-        if not name or CarrierAgent.query.filter(CarrierAgent.name == name, CarrierAgent.id != a.id).count():
-            return '代理名称为空或已存在', 400
+        name = request.form.get("name", a.name).strip()
+        if not name or len(name) > 200 or CarrierAgent.query.filter(CarrierAgent.name == name, CarrierAgent.id != a.id).count():
+            return "代理名称为空、过长或已存在", 400
+        old_config = (a.api_url, a.app_key, a.app_token)
+        for key, limit in (("api_url", 1000), ("app_key", 255), ("app_token", 255), ("customer_code", 255)):
+            if len(request.form.get(key, "")) > limit:
+                return "代理配置字段过长", 400
+        active = request.form.get("agent_active")
+        if active is not None and active not in {"yes", "no"}:
+            return "代理状态无效", 400
+        try:
+            if ready and "provider" in request.form:
+                tms_carriers.configure(a.id, request.form)
+        except nextsls.ProtocolError as error:
+            db.session.rollback()
+            flash(str(error), "danger")
+            return redirect(url_for("views.edit_agent", agent_id=agent_id))
         a.name = name
+        if active is not None:
+            a.is_active = active == "yes"
         a.api_url = request.form.get("api_url", a.api_url)
         a.app_key = request.form.get("app_key", "").strip() or a.app_key
         a.app_token = request.form.get("app_token", "").strip() or a.app_token
-        a.customer_code = request.form.get("customer_code", a.customer_code)
+        a.customer_code = request.form.get("customer_code", "").strip() or a.customer_code
+        if ready and old_config != (a.api_url, a.app_key, a.app_token):
+            profile = db.session.get(TmsAgentApi, a.id)
+            if profile:
+                profile.verified = {}
         db.session.commit()
         flash("代理已更新", "success")
         return redirect(url_for("views.agents"))
 
-    return render_template("edit_agent.html", agent=a)
+    profile = db.session.get(TmsAgentApi, a.id) if ready else None
+    usable = {key: tms_carriers.available(profile, a, key) for key in nextsls.CAPABILITIES}
+    legacy_url = a.api_url or ""
+    try:
+        legacy_endpoint = urlsplit(legacy_url)
+        sensitive = (a.app_key, a.app_token, a.customer_code, a.password)
+        if (legacy_endpoint.username or legacy_endpoint.password or legacy_endpoint.query or legacy_endpoint.fragment
+                or any(secret and secret in legacy_url for secret in sensitive)):
+            legacy_url = None
+    except ValueError:
+        legacy_url = None
+    return render_template("edit_agent.html", agent=a, legacy_url=legacy_url,
+                           integration_ready=ready, profile=profile, providers=tms_carriers.PROVIDERS,
+                           capabilities=nextsls.CAPABILITIES, usable=usable)
 
 
 @views.route("/agents/<int:agent_id>/delete", methods=["POST"])
@@ -617,17 +657,24 @@ def add_shipment():
 @login_required
 def edit_shipment(shipment_id):
     s = Shipment.query.get_or_404(shipment_id)
-    if linked_receivable(shipment_id):
+    if (receivable := linked_receivable(shipment_id)):
+        if request.method == "POST":
+            db.session.refresh(s, with_for_update=True)
+        link = (db.session.get(TmsSupplierOrder, receivable.order_id)
+                if tms_carriers.carrier_schema() else None)
+        locked_supplier_number = bool(link and link.state != "new")
         if request.method == "POST":
             from shipment_updates import update_shipment
             allowed = {"shipment_id", "third_party_tracking_number", "status"}
             if set(request.form) - allowed - {"csrf_token"} or any(len(request.form.get(field, "")) > 50 for field in allowed):
                 abort(409, "已审核的运单只可在这里维护物流单号和状态。收费请使用调整流程。")
+            if locked_supplier_number and request.form.get("shipment_id", s.shipment_id) != s.shipment_id:
+                abort(409, "供应商单号已有对账记录，不能从物流资料页面覆盖。")
             update_shipment(s, request.form)
             db.session.commit()
             flash("运单物流资料已更新。", "success")
             return redirect(url_for("views.shipment_detail", shipment_id=shipment_id))
-        return render_template("shipment_logistics.html", shipment=s)
+        return render_template("shipment_logistics.html", shipment=s, locked_supplier_number=locked_supplier_number)
     if request.method == "POST":
         from shipment_updates import update_shipment
         try:
@@ -987,6 +1034,15 @@ def finance():
         rows = [(shipment, None) for shipment in query.all()]
     totals = receivable_totals(rows)
 
+    internal_costs = {}
+    if current_user.is_admin:
+        internal_costs = tms_carriers.finance_costs([charge for _, charge in rows if charge])
+    if form.get("profit_export"):
+        if not current_user.is_admin:
+            abort(403)
+        report = tms_carriers.profit_export(rows, internal_costs)
+        return send_file(report, as_attachment=True, download_name="tms-profit.xlsx")
+
     if form.get("export"):
         if not selected_account_id:
             return "请先选择收款银行账户", 400
@@ -1018,7 +1074,7 @@ def finance():
         return send_file(filename, as_attachment=True, download_name="invoice.xlsx",
                          mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-    return render_template("finance.html", customers=customers, agents=agents, accounts=accounts, rows=rows,
+    return render_template("finance.html", customers=customers, agents=agents, accounts=accounts, rows=rows, internal_costs=internal_costs,
                            total_shipments=len(rows), totals=totals, selected_customer_id=selected_customer_id,
                            selected_agent_id=selected_agent_id, tracking_number=tracking_number,
                            selected_account_id=selected_account_id, date_from=date_from, date_to=date_to)

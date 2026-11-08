@@ -123,6 +123,7 @@
 </section>
 </aside></div>
 {% elif staff and order.status == 'approved' and receivable and receivable.shipment_id %}
+{% if supplier %}{% include "tms/supplier.html" %}{% endif %}
 <details class="panel"{% if pricing_error %} open{% endif %}>
 <summary>调整已审核费用</summary>
 {% include "tms/pricing_form.html" %}

@@ -1,37 +1,48 @@
 {% extends "base.html" %}
+{% block title %}编辑代理接口{% endblock %}
 {% block content %}
-<div class="container mt-4">
-    <h2>编辑代理</h2>
-
-    <form method="POST">
+<div class="heading"><div><p class="kicker">代理管理</p><h1>编辑代理 · {{ agent.name }}</h1></div>
+<a href="{{ url_for('views.agents') }}" class="button secondary">返回代理列表</a></div>
+<form method="post" class="carrier-editor">
 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-        <div class="form-group mb-2">
-            <label for="name">代理名称</label>
-            <input type="text" class="form-control" id="name" name="name" value="{{ agent.name }}" required>
-        </div>
-
-        <div class="form-group mb-2">
-            <label for="api_url">API 地址</label>
-            <input type="text" class="form-control" id="api_url" name="api_url" value="{{ agent.api_url }}">
-        </div>
-
-        <div class="form-group mb-2">
-            <label for="app_key">App Key</label>
-            <input type="password" class="form-control" id="app_key" name="app_key" value="" placeholder="留空保持原值" autocomplete="new-password">
-        </div>
-
-        <div class="form-group mb-2">
-            <label for="app_token">App Token</label>
-            <input type="password" class="form-control" id="app_token" name="app_token" value="" placeholder="留空保持原值" autocomplete="new-password">
-        </div>
-
-        <div class="form-group mb-2">
-            <label for="customer_code">客户代码</label>
-            <input type="text" class="form-control" id="customer_code" name="customer_code" value="{{ agent.customer_code }}">
-        </div>
-
-        <button type="submit" class="btn btn-success">保存修改</button>
-        <a href="{{ url_for('views.agents') }}" class="btn btn-secondary">返回</a>
-    </form>
-</div>
+<section class="panel">
+  <h2>基础配置</h2>
+  <div class="carrier-fields">
+    <label>代理名称<input name="name" value="{{ agent.name }}" required maxlength="200"></label>
+    <label>原有轨迹 API 地址<input name="api_url" maxlength="1000" value="{{ legacy_url }}" {% if legacy_url is none %}disabled placeholder="原地址含保留参数，已隐藏并保留"{% endif %}></label>
+    <label>App Key<input type="password" name="app_key" maxlength="255" placeholder="留空保留原值" autocomplete="new-password"></label>
+    <label>App Token<input type="password" name="app_token" maxlength="255" placeholder="留空保留原值" autocomplete="new-password"></label>
+    <label>客户代码<input type="password" name="customer_code" maxlength="255" placeholder="留空保留原值" autocomplete="new-password"></label>
+    <label>代理状态<select name="agent_active"><option value="yes"{% if agent.is_active %} selected{% endif %}>启用</option><option value="no"{% if not agent.is_active %} selected{% endif %}>停用</option></select></label>
+    {% if integration_ready %}
+    <label>API 类型<select name="provider">{% for key, label in providers.items() %}<option value="{{ key }}"{% if (profile.provider if profile else 'other') == key %} selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
+    <label>API 基础域名<input name="base_url" type="url" maxlength="255" value="{{ profile.base_url if profile else '' }}" placeholder="https://租户.nextsls.com"></label>
+    <label>已核对的代理渠道代码<input name="service_codes" value="{{ profile.service_codes|join(' ') if profile else '' }}" placeholder="多个代码以空格分隔"></label>
+    {% endif %}
+  </div>
+</section>
+{% if integration_ready %}
+<section class="panel">
+  <h2>功能接口</h2>
+  <p>勾选只保存配置。NextSLS 新接口使用 App Token；还须验证账号权限。旧轨迹继续使用原配置。</p>
+  <div class="table-wrap"><table><thead><tr><th>启用配置</th><th>用途与端点</th><th>文档 / 权限</th><th>真实只读验证</th><th>当前系统</th></tr></thead><tbody>
+  {% for key, (label, path, access) in capabilities.items() %}
+  <tr><td><label class="check-label"><input type="checkbox" name="capability" value="{{ key }}"{% if profile and key in profile.enabled %} checked{% endif %}>{{ label }}</label></td>
+    <td>{% if path and profile and profile.provider == 'nextsls' %}<code>POST /api/v5{{ path }}</code>{% else %}—{% endif %}</td>
+    <td>{% if path and profile and profile.provider == 'nextsls' %}文档确认 · {{ access }} · 账号权限待核实{% else %}待确认{% endif %}</td>
+    <td>{% if profile and profile.verified.get(key) %}{{ profile.verified[key]|replace('T', ' ') }} UTC{% else %}{{ '不适用（写入）' if access == '写入' else '未验证' }}{% endif %}</td>
+    <td>{% if key == 'tracking' %}沿用旧轨迹{% elif usable[key] %}操作已开放{% elif profile and profile.base_url and key in profile.enabled %}已配置 · 暂不可用{% else %}未配置{% endif %}</td></tr>
+  {% endfor %}
+  </tbody></table></div>
+</section>
+<details class="panel"><summary>补充发件地址（渠道要求时必填）</summary>
+  <div class="carrier-fields">
+    {% for key, label in [('name','联系人'),('company','公司'),('tel','电话'),('mobile','手机'),('address_1','地址一'),('address_2','地址二'),('address_3','地址三'),('city','城市'),('state','省州'),('country','国家代码'),('postcode','邮编'),('email','邮箱')] %}
+    <label>{{ label }}<input name="sender_{{ key }}" maxlength="200" value="{{ profile.sender.get(key, '') if profile else '' }}"></label>
+    {% endfor %}
+  </div>
+</details>
+{% else %}<p class="notice">多接口配置需要先执行 TMS 增量迁移。</p>{% endif %}
+<button type="submit">保存代理配置</button>
+</form>
 {% endblock %}

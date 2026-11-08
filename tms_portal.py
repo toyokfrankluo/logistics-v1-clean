@@ -27,6 +27,9 @@ from tms_billing import (
     CURRENCIES, FIXED, SOURCES, UNITS, billing_available, confirm_price, price_form, valid_draft,
 )
 from tms_xlsx_images import MEDIA_PART, image_type
+import nextsls
+import tms_carriers
+from tms_models import TmsAgentApi, TmsSupplierEvent, TmsSupplierOrder
 
 client = Blueprint("tms_client", __name__, url_prefix="/tms/customer")
 staff = Blueprint("tms_staff", __name__, url_prefix="/tms/admin")
@@ -60,6 +63,8 @@ def init_tms(app):
         TMS_ENABLED=app.config.get("ISOLATED_MODE") or os.getenv("TMS_ENABLED") == "1",
         TMS_ADDRESS_BOOK_DIR=os.getenv("TMS_ADDRESS_BOOK_DIR"),
         TMS_INVOICE_TEMPLATE_PATH=os.getenv("TMS_INVOICE_TEMPLATE_PATH"),
+        TMS_NEXTSLS_READ_ENABLED=os.getenv("TMS_NEXTSLS_READ_ENABLED") == "1",
+        TMS_NEXTSLS_CREATE_ENABLED=os.getenv("TMS_NEXTSLS_CREATE_ENABLED") == "1",
     )
     if app.config["TMS_ENABLED"] and not app.config.get("ISOLATED_MODE"):
         app.config["SESSION_COOKIE_SECURE"] = True
@@ -99,7 +104,8 @@ def create_tms_schema():
     with db.engine.begin() as connection:
         if connection.dialect.name == "postgresql":
             connection.execute(text("SELECT pg_advisory_xact_lock(651360348)"))
-        for model in (TmsAccount, TmsOrder, TmsAudit, TmsReceivable, TmsChargeAdjustment):
+        for model in (TmsAccount, TmsOrder, TmsAudit, TmsReceivable, TmsChargeAdjustment,
+                      TmsAgentApi, TmsSupplierOrder, TmsSupplierEvent):
             model.__table__.create(connection, checkfirst=True)
 
 
@@ -505,13 +511,89 @@ def staff_detail(order, **context):
     adjustments = (db.session.scalars(select(TmsChargeAdjustment).where(
         TmsChargeAdjustment.order_id == order.id).order_by(TmsChargeAdjustment.id.desc())).all()
         if order.status == "approved" and billing_available() else [])
+    supplier = {}
+    if order.status == "approved" and tms_carriers.carrier_schema():
+        try:
+            shipment, receivable = tms_carriers.approved_shipment(order)
+        except nextsls.ProtocolError:
+            pass
+        else:
+            agent = db.session.get(CarrierAgent, order.agent_id)
+            profile = db.session.get(TmsAgentApi, order.agent_id)
+            link = db.session.get(TmsSupplierOrder, order.id)
+            snapshot = tms_carriers.latest_event(order.id, "snapshot")
+            cost = tms_carriers.latest_event(order.id, "cost")
+            supplier = {
+                "link": link, "snapshot": snapshot, "cost": cost, "supplier_number": shipment.shipment_id,
+                "can_create": bool(agent and tms_carriers.available(profile, agent, "create")),
+                "can_reconcile": bool(agent and tms_carriers.available(profile, agent, "reconcile")),
+                "can_sync": bool(agent and any(tms_carriers.available(profile, agent, key)
+                                 for key in tms_carriers.DETAILS)),
+                "profit": tms_carriers.profit(receivable, cost, snapshot),
+                "settlements": tms_carriers.SETTLEMENTS,
+                "summary_fields": tms_carriers.SUMMARY_FIELDS, "parcel_fields": tms_carriers.PARCEL_FIELDS,
+                "history": db.session.scalars(select(TmsSupplierEvent).where(
+                    TmsSupplierEvent.order_id == order.id, TmsSupplierEvent.kind.in_(("cost", "snapshot")),
+                ).order_by(TmsSupplierEvent.id.desc()).limit(15)).all(),
+            }
     return order_detail(order, agents=agents, customer=db.session.get(Customer, order.customer_id),
-                        adjustments=adjustments, **context)
+                        adjustments=adjustments, supplier=supplier, **context)
 
 
 @staff.get("/orders/<int:order_id>")
 def review(order_id):
     return staff_detail(reviewable_order(order_id))
+
+
+@staff.post("/orders/<int:order_id>/supplier")
+def supplier_action(order_id):
+    order = reviewable_order(order_id)
+    action = request.form.get("action")
+    if action not in {"create", "reconcile", "retry", "sync", "cost"}:
+        abort(400)
+    try:
+        if action == "create":
+            if request.form.get("confirm") != "yes":
+                raise nextsls.ProtocolError("请确认本票供应商下单。")
+            state = tms_carriers.send_order(order, current_user.id)
+            message = ("已保存供应商运单号。" if state == "linked"
+                       else "提交结果未确认。请先对账，系统不会自动重试。")
+        elif action == "reconcile":
+            state = tms_carriers.reconcile_order(order, current_user.id)
+            message = ("已核对并保存供应商运单号。" if state == "linked"
+                       else "列表未找到匹配运单。请向供应商核实后再解除重试锁。")
+        elif action == "retry":
+            if request.form.get("confirm") != "yes":
+                raise nextsls.ProtocolError("请确认供应商已核实没有创建运单。")
+            tms_carriers.unlock_retry(order, current_user.id, request.form.get("reason"))
+            message = "已解除重试锁。再次下单仍须单独确认。"
+        elif action == "sync":
+            tms_carriers.sync_snapshot(order, current_user.id)
+            message = "已保存本票可用的代理数据。"
+        else:
+            tms_carriers.record_cost(order, current_user.id, request.form)
+            message = "已保存人工确认的采购成本。"
+    except nextsls.ProtocolError as error:
+        db.session.rollback()
+        return staff_detail(order, supplier_error=str(error)), 400
+    except SQLAlchemyError:
+        db.session.rollback()
+        abort(409, "代理数据未能保存。若已提交下单，请先对账。")
+    flash(message, "success")
+    return redirect(url_for("tms_staff.review", order_id=order.id))
+
+
+@staff.get("/orders/<int:order_id>/supplier/measurements.xlsx")
+def supplier_measurements(order_id):
+    order = reviewable_order(order_id)
+    if not tms_carriers.carrier_schema():
+        abort(404)
+    link = db.session.get(TmsSupplierOrder, order.id)
+    snapshot = tms_carriers.latest_event(order.id, "snapshot") if link else None
+    if not snapshot:
+        abort(404)
+    report = tms_carriers.measurement_export(order, link, snapshot, business_date(link.synced_at))
+    return send_file(report, download_name="supplier-measurements.xlsx", as_attachment=True)
 
 
 @staff.post("/orders/<int:order_id>/decision")

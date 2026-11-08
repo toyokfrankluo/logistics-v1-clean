@@ -12,7 +12,7 @@
         </div>
 
         <div class="form-group mb-2">
-            <label for="api_url">API 地址</label>
+            <label for="api_url">原有轨迹 API 地址</label>
             <input type="text" class="form-control" id="api_url" name="api_url">
         </div>
 
@@ -41,7 +41,7 @@
             <tr>
                 <th>ID</th>
                 <th>代理名称</th>
-                <th>API 地址</th>
+                <th>原有轨迹 API 地址</th>
                 <th>App Key</th>
                 <th>App Token</th>
                 <th>状态 / 接口能力</th><th>关联运单</th>
@@ -53,13 +53,13 @@
             <tr>
                 <td>{{ agent.id }}</td>
                 <td>{{ agent.name }}</td>
-                <td>{{ agent.api_url.split('?', 1)[0].split('#', 1)[0].split('@')[-1] if agent.api_url else '手工代理' }}</td>
+                <td>{{ '已配置 · 在编辑页查看' if agent.api_url else '手工代理' }}</td>
                 <td>{{ "已配置" if agent.app_key else "未配置" }}</td>
                 <td>{{ "已配置" if agent.app_token else "未配置" }}</td>
-                <td><span class="badge {{ 'approved' if agent.is_active else '' }}">{{ '启用' if agent.is_active else '停用' }}</span><small class="cell-note">{{ '已配置轨迹能力，连通性待验证' if agent.supports_api and agent.api_url else '手工轨迹' }}</small></td>
+                <td><span class="badge {{ 'approved' if agent.is_active else '' }}">{{ '启用' if agent.is_active else '停用' }}</span>{% if profiles.get(agent.id) %}<small class="cell-note">{{ providers[profiles[agent.id].provider] }} · 已勾选 {{ profiles[agent.id].enabled|length }} 项</small>{% endif %}<small class="cell-note">{{ '已配置轨迹能力，连通性待验证' if agent.supports_api and agent.api_url else '手工轨迹' }}</small></td>
                 <td>{{ shipment_counts.get(agent.id, 0) }}</td>
                 <td>
-                    <a href="{{ url_for('views.edit_agent', agent_id=agent.id) }}" class="btn btn-sm btn-warning">编辑</a>
+                    <a href="{{ url_for('views.edit_agent', agent_id=agent.id) }}" class="btn btn-sm btn-warning">编辑代理与功能接口</a>
                     {% if agent.is_active %}<form method="POST" action="{{ url_for('views.delete_agent', agent_id=agent.id) }}" style="display:inline;">
 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <button type="submit" class="btn btn-sm btn-danger" onclick="return confirm('停用此代理？历史运单会保留。');">停用</button>
