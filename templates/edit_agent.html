@@ -46,4 +46,34 @@
 {% else %}<p class="notice">多接口配置需要先执行 TMS 增量迁移。</p>{% endif %}
 <button type="submit">保存代理配置</button>
 </form>
+{% if profile and profile.provider == 'nextsls' %}
+<section class="panel" id="channel-mapping">
+  <h2>星睿销售服务与 NextSLS 渠道映射</h2>
+  <p>先读取此账号的渠道，再选择实际产品。保存映射只更新代理配置，已审核订单的渠道需在订单页单独更正。</p>
+  <form method="post" action="{{ url_for('views.edit_agent', agent_id=agent.id, _anchor='channel-mapping') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <button type="submit" name="channel_action" value="load" class="secondary">读取 NextSLS 渠道（只读）</button>
+  </form>
+  {% if catalogue %}
+  <p>此账号返回 {{ catalogue|length }} 个渠道。清单用于核对代码，创建权限须另行确认。</p>
+  <form method="post" action="{{ url_for('views.edit_agent', agent_id=agent.id, _anchor='channel-mapping') }}" class="carrier-fields">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label>星睿销售服务<select name="sales_service" required>
+      <option value="">请选择销售服务</option>
+      {% for sale in sales_services %}<option value="{{ sale }}"{% if request.form.get('sales_service') == sale %} selected{% endif %}>{{ sale }}</option>{% endfor %}
+    </select></label>
+    <label>供应商渠道代码<select name="supplier_channel_code" required>
+      <option value="">请选择供应商渠道</option>
+      {% for code, label in catalogue|dictsort %}<option value="{{ code }}"{% if request.form.get('supplier_channel_code') == code %} selected{% endif %}>{{ code }} · {{ label }}</option>{% endfor %}
+    </select></label>
+    <button type="submit" name="channel_action" value="save">保存渠道映射</button>
+  </form>
+  {% elif catalogue is not none %}<p>此账号当前没有返回渠道。</p>{% endif %}
+  {% if channel_mappings %}
+  <dl class="fields">
+    {% for sale, mapping in channel_mappings|dictsort %}<div><dt>{{ sale }}</dt><dd>{{ mapping.code }} · {{ mapping.name }}</dd></div>{% endfor %}
+  </dl>
+  {% endif %}
+</section>
+{% endif %}
 {% endblock %}

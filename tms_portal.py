@@ -83,6 +83,7 @@ def init_tms(app):
         TMS_INVOICE_TEMPLATE_PATH=os.getenv("TMS_INVOICE_TEMPLATE_PATH"),
         TMS_NEXTSLS_READ_ENABLED=os.getenv("TMS_NEXTSLS_READ_ENABLED") == "1",
         TMS_NEXTSLS_CREATE_ENABLED=os.getenv("TMS_NEXTSLS_CREATE_ENABLED") == "1",
+        TMS_NEXTSLS_CREATE_ORDER_ID=os.getenv("TMS_NEXTSLS_CREATE_ORDER_ID", ""),
     )
     if app.config["TMS_ENABLED"] and not app.config.get("ISOLATED_MODE"):
         app.config["SESSION_COOKIE_SECURE"] = True
@@ -674,11 +675,17 @@ def destination_reference(order):
 def staff_detail(order, **context):
     agents = CarrierAgent.query.filter_by(is_active=True).order_by(CarrierAgent.name).all()
     channels = {}
+    mapped_channels = {}
     if order.status != "approved" and agents and tms_carriers.carrier_schema():
-        channels = {profile.agent_id: profile.service_codes for profile in db.session.scalars(
+        profiles = db.session.scalars(
             select(TmsAgentApi).where(TmsAgentApi.provider == "nextsls",
                                      TmsAgentApi.agent_id.in_([agent.id for agent in agents])))
-                    if profile.service_codes}
+        for profile in profiles:
+            if profile.service_codes:
+                channels[profile.agent_id] = profile.service_codes
+                mapping = tms_carriers.channel_mappings(profile).get(order.invoice["service"])
+                if mapping:
+                    mapped_channels[profile.agent_id] = mapping["code"]
     adjustments = (db.session.scalars(select(TmsChargeAdjustment).where(
         TmsChargeAdjustment.order_id == order.id).order_by(TmsChargeAdjustment.id.desc())).all()
         if order.status == "approved" and billing_available() else [])
@@ -704,7 +711,7 @@ def staff_detail(order, **context):
                 "channel_choices": ([code for code in profile.service_codes if code != order.agent_service]
                                     if profile and profile.provider == "nextsls" and not shipment.shipment_id
                                     and (not link or (link.state == "new" and not link.attempt_at)) else []),
-                "create_blockers": tms_carriers.create_blockers(profile, agent, order.agent_service),
+                "create_blockers": tms_carriers.create_blockers(profile, agent, order.agent_service, order.id),
                 "can_reconcile": bool(agent and tms_carriers.available(profile, agent, "reconcile")),
                 "can_sync": bool(agent and any(tms_carriers.available(profile, agent, key)
                                  for key in tms_carriers.DETAILS)),
@@ -727,7 +734,8 @@ def staff_detail(order, **context):
             "destination_fields": DESTINATION_FIELDS, "required_destination": REQUIRED_ADDRESS,
             "destination_reference": destination_reference(order),
         }
-    return order_detail(order, agents=agents, agent_channels=channels, customer=db.session.get(Customer, order.customer_id),
+    return order_detail(order, agents=agents, agent_channels=channels, mapped_channels=mapped_channels,
+                        customer=db.session.get(Customer, order.customer_id),
                         adjustments=adjustments, supplier=supplier, **destination, **context)
 
 
@@ -934,10 +942,13 @@ def save_pricing(order, decision):
     agent = db.session.get(CarrierAgent, agent_id, with_for_update=True) if agent_id else None
     if (agent_id or decision == "approve") and (not agent or not agent.is_active):
         raise ValueError("请选择启用的实际物流代理。")
-    if decision == "approve" and not service:
-        raise ValueError("请填写实际代理运输渠道。")
     if decision == "approve":
         profile = tms_carriers.agent_profile(agent.id)
+        if not service:
+            mapping = tms_carriers.channel_mappings(profile).get(order.invoice["service"])
+            service = mapping["code"] if mapping else ""
+        if not service:
+            raise ValueError("请填写实际代理运输渠道。")
         if profile and profile.provider == "nextsls" and profile.service_codes and service not in profile.service_codes:
             raise ValueError("请选择此 NextSLS 代理已配置的渠道代码。")
     details = confirm_sales_terms(values, form) if decision == "approve" else values

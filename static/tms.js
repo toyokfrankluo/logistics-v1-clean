@@ -112,8 +112,9 @@ document.addEventListener("change", event => {
   const agent = event.target;
   if (agent.name !== "agent_id" || !agent.form?.matches("[data-pricing]")) return;
   const channel = agent.form.elements.namedItem("agent_service");
-  const list = agent.selectedOptions[0]?.dataset.channelList;
-  channel.value = "";
+  const selected = agent.selectedOptions[0];
+  const list = selected?.dataset.channelList;
+  channel.value = selected?.dataset.mappedChannel || "";
   if (list) channel.setAttribute("list", list);
   else channel.removeAttribute("list");
 });

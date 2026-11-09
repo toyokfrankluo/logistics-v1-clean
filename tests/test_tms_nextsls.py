@@ -327,6 +327,63 @@ class NextSLSTests(unittest.TestCase):
             self.assertEqual(request.call_count, 1)
         self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
 
+    def test_channel_editor_reads_and_saves_only_codes_visible_to_this_account(self):
+        order_id = self.pending_order()
+        profile = self.profile(service_codes=[])
+        path = f"/agents/{self.agent.id}/edit"
+        calls = []
+
+        def mock_catalogue(target, *, json, headers):
+            calls.append(target.api_url)
+            self.assertEqual(headers["Authorization"], "Bearer " + TOKEN)
+            self.assertEqual(json, {"services": {"type": "all"}})
+            return success({"services": [{"code": "TMS_DEMO", "name": "虚构标准渠道"},
+                                          {"code": "TMS_ALT", "name": "虚构其他渠道"}]})
+
+        def edit(**values):
+            return self.post(self.staff, path, values, "/login").get_data(as_text=True)
+
+        with patch.dict(app.config, TMS_NEXTSLS_CREATE_ENABLED=False, TMS_NEXTSLS_READ_ENABLED=False), patch(
+            "carrier_http.post", side_effect=mock_catalogue,
+        ):
+            html = edit(channel_action="load")
+            self.assertIn("TMS_DEMO · 虚构标准渠道", html)
+            self.assertNotIn(TOKEN, html)
+            self.assertEqual(profile.service_codes, [])
+            bad = edit(channel_action="save", sales_service="UPS红单", supplier_channel_code="WRONG")
+            self.assertIn("该账号当前可用的渠道代码", bad)
+            self.assertEqual(profile.service_codes, [])
+            saved = edit(channel_action="save", sales_service="UPS红单", supplier_channel_code="TMS_DEMO")
+            self.assertIn("渠道映射已保存", saved)
+
+        db.session.expire_all()
+        self.assertEqual(profile.service_codes, ["TMS_DEMO"])
+        self.assertNotIn("create", profile.verified)
+        self.assertEqual(calls, [ORIGIN + "/api/v5/shipment/get_services"] * 3)
+        self.assertEqual(db.session.get(TmsOrder, order_id).revision, 2)
+        self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
+        self.assertEqual(self.post(self.staff, path, {"name": self.agent.name, "provider": "nextsls",
+                         "base_url": ORIGIN, "capability": "create"}, "/login").status_code, 302)
+        view = self.get(self.staff, f"/tms/admin/orders/{order_id}").get_data(as_text=True)
+        self.assertIn('data-mapped-channel="TMS_DEMO"', view)
+        response = self.decision(order_id, 2, decision="approve", **self.pricing(agent_service=""))
+        self.assertEqual(response.status_code, 302)
+        db.session.expire_all()
+        self.assertEqual(db.session.get(TmsOrder, order_id).agent_service, "TMS_DEMO")
+        self.assertEqual(self.staff.post(path, data={"channel_action": "load"}).status_code, 400)
+        self.staff_login("tms-test-reader")
+        self.assertEqual(self.post(self.staff, path, {"channel_action": "load"}, "/login").status_code, 403)
+
+    def test_real_create_switch_also_requires_the_explicit_order_id(self):
+        order_id = self.approve()
+        self.profile()
+        with patch.dict(app.config, ISOLATED_MODE=False, TMS_NEXTSLS_CREATE_ENABLED=True,
+                        TMS_NEXTSLS_CREATE_ORDER_ID=str(order_id + 1)):
+            response = self.action(order_id, "create", confirm="yes")
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("此订单不在本次真实下单授权范围内", response.get_data(as_text=True))
+        self.carrier_post.assert_not_called()
+
     def test_snapshot_billing_needs_matching_unit_and_changes_require_review(self):
         order_id = self.approve(unit="cbm")
         self.profile()

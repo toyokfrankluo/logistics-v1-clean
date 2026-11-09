@@ -416,7 +416,12 @@ def _save_agent_settings(agent, form, ready):
                 and (not form.get("app_token", "").strip() or (old_host and agent.app_token == old_config[2]))):
             raise nextsls.ProtocolError("切换 NextSLS 租户时，请填写目标账号的 App Token。")
     if profile and old_config != (agent.api_url, agent.app_key, agent.app_token, agent.customer_code):
-        profile.verified = {}
+        mappings = tms_carriers.channel_mappings(profile)
+        if agent.app_token != old_config[2] and mappings:
+            profile.service_codes = [code for code in profile.service_codes
+                                     if code not in {item["code"] for item in mappings.values()}]
+            mappings = {}
+        profile.verified = {tms_carriers.CHANNEL_MAPPINGS: mappings} if mappings else {}
 
 
 @views.route("/agents", methods=["GET", "POST"])
@@ -460,11 +465,36 @@ def agents():
 @views.route("/agents/<int:agent_id>/edit", methods=["GET", "POST"])
 @login_required
 def edit_agent(agent_id):
-    a = db.session.get(CarrierAgent, agent_id, with_for_update=request.method == "POST")
+    channel_action = request.form.get("channel_action") if request.method == "POST" else None
+    a = db.session.get(CarrierAgent, agent_id, with_for_update=request.method == "POST" and not channel_action)
     if a is None:
         abort(404)
     ready = tms_carriers.carrier_schema()
-    if request.method == "POST":
+    profile = db.session.get(TmsAgentApi, a.id) if ready else None
+    catalogue = None
+    if channel_action:
+        if channel_action not in {"load", "save"}:
+            abort(400)
+        try:
+            catalogue = tms_carriers.read_channel_catalogue(profile, a)
+            if channel_action == "save":
+                origin, token = profile.base_url, a.app_token
+                db.session.refresh(a, with_for_update=True)
+                db.session.refresh(profile, with_for_update=True)
+                if (profile.provider != "nextsls" or "create" not in profile.enabled or profile.base_url != origin
+                        or a.app_token != token or not a.is_active or not a.supports_api):
+                    raise nextsls.ProtocolError("代理配置已经变更，请重新读取渠道。")
+                tms_carriers.save_channel_mapping(profile, catalogue, request.form.get("sales_service", ""),
+                                                  request.form.get("supplier_channel_code", ""))
+                db.session.commit()
+                flash("渠道映射已保存，适用于后续选码。", "success")
+        except nextsls.ProtocolError as error:
+            db.session.rollback()
+            flash(str(error), "danger")
+        except SQLAlchemyError:
+            db.session.rollback()
+            return "渠道映射未保存，请刷新后重试。", 409
+    elif request.method == "POST":
         name = request.form.get("name", a.name).strip()
         if not name or len(name) > 200 or CarrierAgent.query.filter(CarrierAgent.name == name, CarrierAgent.id != a.id).count():
             return "代理名称为空、过长或已存在", 400
@@ -482,7 +512,6 @@ def edit_agent(agent_id):
         flash("代理已更新", "success")
         return redirect(url_for("views.agents"))
 
-    profile = db.session.get(TmsAgentApi, a.id) if ready else None
     origin = profile.base_url if profile and profile.provider == "nextsls" else ""
     endpoints = {key: nextsls.endpoint(origin, path) for key, (_, path, _) in nextsls.CAPABILITIES.items()
                  if origin and path}
@@ -500,7 +529,9 @@ def edit_agent(agent_id):
         legacy_url = None
     return render_template("edit_agent.html", agent=a, legacy_url=legacy_url,
                            integration_ready=ready, profile=profile, providers=tms_carriers.PROVIDERS,
-                           capabilities=nextsls.CAPABILITIES, endpoints=endpoints, blocked=blocked)
+                           capabilities=nextsls.CAPABILITIES, endpoints=endpoints, blocked=blocked,
+                           catalogue=catalogue, sales_services=tms_carriers.SERVICES,
+                           channel_mappings=tms_carriers.channel_mappings(profile))
 
 
 @views.route("/agents/<int:agent_id>/delete", methods=["POST"])

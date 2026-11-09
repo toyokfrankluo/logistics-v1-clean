@@ -14,6 +14,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from models import CarrierAgent, Shipment, db
 import nextsls
 import tms_measurements as measurements
+from tms_invoice import SERVICES
 from tms_models import TmsAgentApi, TmsReceivable, TmsSupplierEvent, TmsSupplierOrder
 
 
@@ -23,6 +24,7 @@ CENT = Decimal("0.01")
 SETTLEMENTS = {"pending": "待结算", "settled": "已结算（人工确认）"}
 COST_BASES = {"estimated": "预估费用", "actual": "实际费用"}
 COST_OWNERSHIP = {"payable": "属于星睿应付", "not_payable": "已确认无星睿应付"}
+CHANNEL_MAPPINGS = "sales_service_mappings"
 
 
 def carrier_schema():
@@ -41,9 +43,6 @@ def configure(agent_id, form):
     enabled = sorted(set(form.getlist("capability")))
     if any(key not in nextsls.CAPABILITIES for key in enabled):
         raise nextsls.ProtocolError("存在未知 API 功能。")
-    codes = form.get("service_codes", "").split()
-    if len(codes) > 50 or any(not nextsls.CODE.fullmatch(code) for code in codes):
-        raise nextsls.ProtocolError("渠道代码格式无效。请输入最多 50 个代码，以空格分隔。")
     sender = {key: form.get("sender_" + key, "").strip() for key in nextsls.ADDRESS}
     sender = {key: nextsls.supplied_text(value, 200) for key, value in sender.items() if value}
     if sender:
@@ -52,11 +51,52 @@ def configure(agent_id, form):
     if profile is None:
         profile = TmsAgentApi(agent_id=agent_id, verified={})
         db.session.add(profile)
-    if (profile.provider, profile.base_url) != (provider, origin):
+    same_account = (profile.provider, profile.base_url) == (provider, origin)
+    codes = (form["service_codes"].split() if "service_codes" in form
+             else (profile.service_codes or []) if same_account else [])
+    if len(codes) > 50 or any(not nextsls.CODE.fullmatch(code) for code in codes):
+        raise nextsls.ProtocolError("渠道代码格式无效，最多可保存 50 个代码。")
+    if not same_account:
         profile.verified = {}
     profile.provider, profile.base_url = provider, origin
     profile.enabled, profile.service_codes, profile.sender = enabled, sorted(set(codes)), sender
     return profile
+
+
+def channel_mappings(profile):
+    mappings = (profile.verified or {}).get(CHANNEL_MAPPINGS, {}) if profile else {}
+    return {sale: mapping for sale, mapping in mappings.items() if mapping["code"] in profile.service_codes}
+
+
+def read_channel_catalogue(profile, agent):
+    if not profile or profile.provider != "nextsls" or "create" not in profile.enabled:
+        raise nextsls.ProtocolError("请先保存 NextSLS 代理配置并勾选创建运单能力，再读取渠道。")
+    data = nextsls.request_data(agent, profile.base_url, "/shipment/get_services",
+                                {"services": {"type": "all"}})
+    rows = data.get("services")
+    if not isinstance(rows, list):
+        raise nextsls.ProtocolError("NextSLS 未返回渠道列表。")
+    catalogue = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise nextsls.ProtocolError("NextSLS 渠道数据结构无效。")
+        code, name = row.get("code"), row.get("name")
+        if not isinstance(code, str) or not nextsls.CODE.fullmatch(code) or code in catalogue:
+            raise nextsls.ProtocolError("NextSLS 渠道代码格式无效或重复。")
+        catalogue[code] = nextsls.supplied_text(name, 200)
+    return catalogue
+
+
+def save_channel_mapping(profile, catalogue, sale, code):
+    if sale not in SERVICES or code not in catalogue:
+        raise nextsls.ProtocolError("请选择星睿销售服务及该账号当前可用的渠道代码。")
+    codes = sorted(set(profile.service_codes) | {code})
+    if len(codes) > 50:
+        raise nextsls.ProtocolError("已达到 50 个渠道代码的配置上限。")
+    mappings = channel_mappings(profile)
+    mappings[sale] = {"code": code, "name": catalogue[code]}
+    profile.service_codes = codes
+    profile.verified = {**profile.verified, CHANNEL_MAPPINGS: mappings}
 
 
 def agent_profile(agent_id):
@@ -95,7 +135,7 @@ def available(profile, agent, key):
     return unavailable_reason(profile, agent, key) is None
 
 
-def create_blockers(profile, agent, code):
+def create_blockers(profile, agent, code, order_id):
     if not agent:
         return ["未找到订单所选代理"]
     reason = unavailable_reason(profile, agent, "create")
@@ -104,6 +144,9 @@ def create_blockers(profile, agent, code):
         blockers.append("审核所选渠道未列入代理的已确认渠道代码")
     if not current_app.config.get("TMS_NEXTSLS_CREATE_ENABLED") and "系统未开放真实下单" not in blockers:
         blockers.append("系统未开放真实下单")
+    if (current_app.config.get("TMS_NEXTSLS_CREATE_ENABLED") and not current_app.config.get("ISOLATED_MODE")
+            and current_app.config.get("TMS_NEXTSLS_CREATE_ORDER_ID") != str(order_id)):
+        blockers.append("此订单不在本次真实下单授权范围内")
     return blockers
 
 
@@ -173,7 +216,7 @@ def attach_number(shipment, link, number):
 
 def send_order(order, actor_id, *, transport=None):
     agent = db.session.get(CarrierAgent, order.agent_id) if order.agent_id else None
-    blockers = create_blockers(agent_profile(order.agent_id) if agent else None, agent, order.agent_service)
+    blockers = create_blockers(agent_profile(order.agent_id) if agent else None, agent, order.agent_service, order.id)
     if blockers:
         raise nextsls.ProtocolError("；".join(blockers) + "。")
     shipment, agent, profile, link = operation_context(order, "create")

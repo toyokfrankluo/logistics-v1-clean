@@ -30,9 +30,9 @@
   </fieldset>
   {% endif %}
   <label>实际物流代理<select name="agent_id" required><option value="">请选择启用的代理</option>
-  {% for agent in agents %}<option value="{{ agent.id }}"{% if agent_channels.get(agent.id) %} data-channel-list="channels-{{ order.id }}-{{ agent.id }}"{% endif %}{% if agent.id == active_agent %} selected{% endif %}>{{ agent.name }}</option>{% endfor %}
+  {% for agent in agents %}<option value="{{ agent.id }}"{% if agent_channels.get(agent.id) %} data-channel-list="channels-{{ order.id }}-{{ agent.id }}"{% endif %}{% if mapped_channels.get(agent.id) %} data-mapped-channel="{{ mapped_channels[agent.id] }}"{% endif %}{% if agent.id == active_agent %} selected{% endif %}>{{ agent.name }}</option>{% endfor %}
   </select></label>
-  <label>实际代理运输渠道<input name="agent_service" value="{{ agent_service or '' }}"{% if agent_channels.get(active_agent) %} list="channels-{{ order.id }}-{{ active_agent }}"{% endif %} maxlength="100" required></label>
+  <label>实际代理运输渠道<input name="agent_service" value="{{ agent_service or mapped_channels.get(active_agent, '') }}"{% if agent_channels.get(active_agent) %} list="channels-{{ order.id }}-{{ active_agent }}"{% endif %} maxlength="100" required></label>
   {% for agent_id, codes in agent_channels.items() %}
   <datalist id="channels-{{ order.id }}-{{ agent_id }}">{% for code in codes %}<option value="{{ code }}">{% endfor %}</datalist>
   {% endfor %}
