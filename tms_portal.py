@@ -708,19 +708,18 @@ def staff_detail(order, **context):
                 snapshot = None
             cost = tms_carriers.latest_event(order.id, "cost")
             unsubmitted = not shipment.shipment_id and (not link or (link.state == "new" and not link.attempt_at))
+            preparation = tms_carriers.supplier_preparation(order, profile, agent) if unsubmitted else {}
             supplier = {
                 "link": link, "snapshot": snapshot, "cost": cost, "supplier_number": shipment.shipment_id,
                 "last_attempt": (tms_carriers.latest_event(order.id, "attempt")
                                  if link and link.state == "uncertain" else None),
                 "agent_name": agent.name if agent else "—",
-                "can_prepare": bool(unsubmitted and profile and profile.provider == "nextsls"),
-                "supplement": tms_carriers.order_supplement(order),
+                "preparation": preparation, "agent_id": agent.id if agent else None,
                 "supplement_fields": nextsls.SUPPLEMENTAL_DECLARATIONS,
                 "channel_choices": ({code: name for code, name in tms_carriers.channel_catalogue(profile).items()
                                      if code != order.agent_service}
                                     if agent and agent.is_active and agent.supports_api and not shipment.shipment_id
                                     and (not link or (link.state == "new" and not link.attempt_at)) else {}),
-                "create_blockers": tms_carriers.create_blockers(profile, agent, order.agent_service, order.id),
                 "can_reconcile": bool(agent and tms_carriers.available(profile, agent, "reconcile")),
                 "can_sync": bool(agent and any(tms_carriers.available(profile, agent, key)
                                  for key in tms_carriers.DETAILS)),
@@ -824,16 +823,19 @@ def correct_supplier_channel(order):
         raise nextsls.ProtocolError("请选择此代理已配置且不同于当前值的渠道代码。")
     if order.invoice.get("supplier_tenant_origin", profile.base_url) != profile.base_url:
         raise nextsls.ProtocolError("代理租户已与审核记录不符，请核对原代理账号。")
-    reason = nextsls.supplied_text(request.form.get("channel_reason"), 200)
-    review = {"from": order.agent_service, "to": code, "reason": reason, "to_name": catalogue[code],
+    review = {"from": order.agent_service, "to": code, "to_name": catalogue[code],
               "from_name": order.invoice.get("supplier_channel", {}).get("name"),
               "by": current_user.id, "at": datetime.now(timezone.utc).isoformat()}
     invoice = dict(order.invoice, supplier_channel={"code": code, "name": catalogue[code]},
                    supplier_tenant_origin=profile.base_url, supplier_channel_reviews=[
                        *order.invoice.get("supplier_channel_reviews", []), review,
                    ])
-    # A channel change requires a fresh review of the order's supplemental data.
-    invoice.pop("nextsls_supplement", None)
+    # Keep factual declarations, and recalculate which fields the new channel needs.
+    declarations = tms_carriers.order_supplement(order).get("declarations")
+    if declarations:
+        invoice["nextsls_supplement"] = {"agent_id": order.agent_id, "service": code, "declarations": declarations}
+    else:
+        invoice.pop("nextsls_supplement", None)
     update_order(order, {"agent_service": code, "invoice": invoice})
     receivable.agent_service = code
     if receivable.final_total is not None:
@@ -854,28 +856,37 @@ def save_supplier_supplement(order, form):
         raise nextsls.ProtocolError("仅可补充尚未提交的 NextSLS 订单。")
     if not nextsls.CODE.fullmatch(order.agent_service or ""):
         raise nextsls.ProtocolError("请先在订单中选择实际 NextSLS 渠道。")
-    rows = {}
-    for index, _ in enumerate(order.invoice["declarations"]):
-        values = {}
-        for field in nextsls.SUPPLEMENTAL_DECLARATIONS:
+    if order.invoice.get("supplier_tenant_origin", profile.base_url) != profile.base_url:
+        raise nextsls.ProtocolError("代理租户已与审核记录不符，请核对原代理账号。")
+    if {"packing_name", "packing_url", "remove_packing"}.intersection(form):
+        raise nextsls.ProtocolError("装箱单由系统生成，请刷新页面后补充申报资料。")
+    rules = tms_carriers.channel_rules(profile, order.agent_service)
+    if rules is None:
+        raise nextsls.ProtocolError("此渠道的完整必填规则尚未读取或已过期，请刷新代理渠道。")
+    prior = tms_carriers.order_supplement(order)
+    missing = nextsls.missing_supplements(order.invoice, prior, rules)
+    allowed = {f"supplement_{index}_{field}" for index, fields in missing.items() for field in fields}
+    if profile.base_url == tms_carriers.BC_ORIGIN:
+        allowed.update(f"supplement_{index}_no_model" for index, fields in missing.items() if "model" in fields)
+    if any(key.startswith("supplement_") and (key not in allowed or len(form.getlist(key)) != 1) for key in form):
+        raise nextsls.ProtocolError("渠道所需资料已变化，请刷新页面后补充。")
+    rows = dict(prior.get("declarations", {}))
+    for index, fields in missing.items():
+        values = dict(rows.get(str(index), {}))
+        for field in fields:
             raw = form.get(f"supplement_{index}_{field}", "").strip()
+            if field == "model":
+                no_model = form.get(f"supplement_{index}_no_model") == "yes"
+                if (no_model and raw) or raw == "无":
+                    raise nextsls.ProtocolError("商品没有型号时，请仅勾选「无型号」。")
+                raw = "无" if no_model else raw
             if raw:
-                values[field] = nextsls.supplied_text(raw, 120)
+                values[field] = nextsls.supplemental_value(order.invoice, field, raw)
         if values:
             rows[str(index)] = values
-    old = tms_carriers.order_supplement(order).get("packing_list", {})
-    packing_name = form.get("packing_name", "").strip()
-    packing_url = form.get("packing_url", "").strip()
-    packing = {}
-    if form.get("remove_packing") != "yes" and (packing_name or packing_url or old):
-        name = nextsls.supplied_text(packing_name or old.get("name"), 100)
-        if any(char in name for char in "/\\"):
-            raise nextsls.ProtocolError("装箱单名称不能包含目录。")
-        url = packing_url or old.get("url")
-        nextsls.packing_url_host(url)
-        packing = {"name": name, "url": url}
-    supplement = {"agent_id": order.agent_id, "service": order.agent_service, "declarations": rows,
-                  "packing_list": packing}
+    if rows == prior.get("declarations", {}):
+        raise nextsls.ProtocolError("请填写至少一项当前缺少的申报资料。")
+    supplement = {**prior, "agent_id": order.agent_id, "service": order.agent_service, "declarations": rows}
     update_order(order, {"invoice": dict(order.invoice, nextsls_supplement=supplement)})
     history(order, "supplier_prep")
     db.session.commit()

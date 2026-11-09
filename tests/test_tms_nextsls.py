@@ -64,7 +64,7 @@ class NextSLSTests(unittest.TestCase):
             agent_service="TMS_DEMO", **pricing)).status_code, 302)
         return order_id
 
-    def profile(self, **changes):
+    def profile(self, *, rules=None, **changes):
         agent = db.session.get(CarrierAgent, self.agent.id)
         agent.app_token = TOKEN
         agent.api_url = ORIGIN + "/api/v5/shipment/get_tracking"
@@ -73,7 +73,10 @@ class NextSLSTests(unittest.TestCase):
                         service_codes=["TMS_DEMO"], sender={}, verified={})
         profile = TmsAgentApi(agent_id=agent.id, **(settings | changes))
         if profile.service_codes:
-            tms_carriers.store_channel_catalogue(profile, {code: SERVICE["name"] for code in profile.service_codes})
+            tms_carriers.store_channel_catalogue(
+                profile, {code: SERVICE["name"] for code in profile.service_codes},
+                rules if rules is not None else {code: nextsls.preparation_rules(SERVICE) for code in profile.service_codes},
+            )
         db.session.add(profile)
         db.session.commit()
         return profile
@@ -323,15 +326,77 @@ class NextSLSTests(unittest.TestCase):
         ) as request:
             response = self.action(order_id, "create", confirm="yes")
             self.assertEqual(response.status_code, 400)
-            self.assertIn("额外装箱单", response.get_data(as_text=True))
+            self.assertIn("渠道要求装箱单", response.get_data(as_text=True))
             html = response.get_data(as_text=True)
             self.assertIn("photos", html)
             self.assertIn("Amazon 参考号、品牌、型号", html)
         self.assertEqual(request.call_count, 1)
         self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
 
+    def test_preparation_displays_only_channel_missing_fields_and_never_reuses_manual_attachment(self):
+        required = SERVICE | {"packing_list_required": 1,
+                              "require_declaration_list": ["brand", "model", "amazon_ref_id"]}
+        profile = self.profile(rules={"TMS_DEMO": nextsls.preparation_rules(required)})
+        order_id = self.approve()
+        order = db.session.get(TmsOrder, order_id)
+        order.invoice = dict(order.invoice, declarations=[
+            dict(row, brand="Customer brand") for row in order.invoice["declarations"]
+        ], nextsls_supplement={"agent_id": order.agent_id, "service": "TMS_DEMO",
+            "packing_list": {"name": "old.xlsx", "url": "https://files.example.com/old.xlsx"}})
+        db.session.commit()
+        page = self.get(self.staff, f"/tms/admin/orders/{order_id}").get_data(as_text=True)
+        for message in ("系统未开放真实下单", "只读对账", "装箱单", "识别 3 / 3 张"):
+            self.assertIn(message, page)
+        self.assertNotIn('name="supplement_0_brand"', page)
+        self.assertIn('name="supplement_0_amazon_ref_id"', page)
+        self.assertIn('name="supplement_0_model"', page)
+        self.assertNotIn('name="packing_url"', page)
+        self.assertNotIn("files.example.com/old.xlsx", page)
+        for invalid in ("无", "DEMO-PO", "0001", "0000123"):
+            self.assertEqual(self.action(order_id, "prepare", revision=3,
+                                         supplement_0_amazon_ref_id=invalid).status_code, 400)
+        with self.assertRaisesRegex(nextsls.ProtocolError, "装箱单"):
+            nextsls.create_payload(order.invoice, "TMS_DEMO", "XR-DEMO", required, {},
+                                   supplement=tms_carriers.order_supplement(order), packing_host="files.example.com")
+
+        tms_carriers.store_channel_catalogue(profile, {"TMS_DEMO": SERVICE["name"]}, {})
+        db.session.commit()
+        stale = self.get(self.staff, f"/tms/admin/orders/{order_id}").get_data(as_text=True)
+        self.assertIn("完整必填规则尚未读取", stale)
+        self.assertNotIn('name="supplement_0_model"', stale)
+        self.carrier_post.assert_not_called()
+
+    def test_bc_no_model_and_channel_change_drop_unneeded_amazon_field(self):
+        profile = self.profile(service_codes=["TMS_DEMO", "OTHER"])
+        profile.base_url = tms_carriers.BC_ORIGIN
+        self.agent.api_url = ""
+        both = SERVICE | {"require_declaration_list": ["amazon_ref_id", "model"]}
+        model_only = SERVICE | {"require_declaration_list": ["model"]}
+        tms_carriers.store_channel_catalogue(profile, {"TMS_DEMO": "原渠道", "OTHER": "新渠道"},
+            {"TMS_DEMO": nextsls.preparation_rules(both), "OTHER": nextsls.preparation_rules(model_only)})
+        db.session.commit()
+        order_id = self.approve()
+        fields = {f"supplement_{index}_{key}": value for index in range(3)
+                  for key, value in (("amazon_ref_id", "FIXTURE-REF"), ("no_model", "yes"))}
+        self.assertEqual(self.action(order_id, "prepare", revision=3, **fields).status_code, 302)
+        self.assertEqual(self.action(order_id, "channel", revision=4, channel_code="OTHER").status_code, 302)
+        db.session.expire_all()
+        order = db.session.get(TmsOrder, order_id)
+        payload = nextsls.create_payload(order.invoice, "OTHER", "XR-DEMO", model_only, {},
+                                         supplement=tms_carriers.order_supplement(order))
+        for box in payload["shipment"]["parcels"]:
+            for row in box["declarations"]:
+                self.assertEqual(row["model"], "无")
+                self.assertNotIn("amazon_ref_id", row)
+        page = self.get(self.staff, f"/tms/admin/orders/{order_id}").get_data(as_text=True)
+        self.assertNotIn('name="supplement_0_amazon_ref_id"', page)
+        self.assertNotIn('name="supplement_0_model"', page)
+
     def test_b888_invoice_to_mock_create_uses_confirmed_supplement_and_one_reservation(self):
-        self.profile(service_codes=["B888"])
+        rule = SERVICE | {"code": "B888", "name": "超级经济线", "packing_list_required": 1,
+                          "require_declaration_list": ["amazon_ref_id", "name_zh", "name_en", "unit_value",
+                                                       "qty", "material", "usage", "brand", "model", "hscode"]}
+        self.profile(service_codes=["B888"], rules={"B888": nextsls.preparation_rules(rule)})
         self.sign_in(self.alice, "customer-a")
         raw = fixture.floating_workbook(service="超级经济线卡派")
         upload = self.upload(self.alice, raw)
@@ -341,15 +406,16 @@ class NextSLSTests(unittest.TestCase):
         self.staff_login()
         self.assertEqual(self.decision(order_id, 2, decision="approve",
                                        **self.pricing(agent_service="B888")).status_code, 302)
-        rule = SERVICE | {"code": "B888", "name": "超级经济线", "packing_list_required": 1,
-                          "require_declaration_list": ["amazon_ref_id", "name_zh", "name_en", "unit_value",
-                                                       "qty", "material", "usage", "brand", "model", "hscode"]}
-        attachment = "https://files.example.com/packing.pdf?download=fixture"
-        calls, requests, photos = [], [], []
+        attachment = "https://files.example.com/packing.xlsx?download=fixture"
+        calls, requests, photos, drafts = [], [], [], []
 
         def publish(mime, data):
             photos.append((mime, data))
             return f"https://files.example.com/photo-{len(photos)}?download=fixture"
+
+        def publish_packing(data):
+            drafts.append(data)
+            return attachment
 
         def mock(target, *, json, headers):
             path = target.api_url.rsplit("/", 1)[-1]
@@ -361,7 +427,8 @@ class NextSLSTests(unittest.TestCase):
             requests.append(json["shipment"])
             return success({"shipment": {"shipment_id": SUPPLIER_NUMBER}})
 
-        send_mock = partial(tms_carriers.send_order, transport=mock, photo_publisher=publish)
+        send_mock = partial(tms_carriers.send_order, transport=mock, photo_publisher=publish,
+                            packing_publisher=publish_packing)
         with patch.dict(app.config, TMS_NEXTSLS_CREATE_ENABLED=True), patch(
             "tms_carriers.send_order", side_effect=send_mock,
         ):
@@ -373,13 +440,13 @@ class NextSLSTests(unittest.TestCase):
             invalid = self.action(order_id, "prepare", revision=3, packing_name="packing.pdf",
                                   packing_url="http://127.0.0.1/private.pdf", **fields)
             self.assertEqual(invalid.status_code, 400)
-            saved = self.action(order_id, "prepare", revision=3, packing_name="packing.pdf",
-                                packing_url=attachment, **fields)
+            saved = self.action(order_id, "prepare", revision=3, **fields)
             self.assertEqual(saved.status_code, 302)
             response = self.action(order_id, "create", confirm="yes")
-            self.assertIn("待供应商确认创建时使用订单附件链接", response.get_data(as_text=True))
+            self.assertIn("创建时的自动传输方式尚待供应商确认", response.get_data(as_text=True))
             self.assertNotIn(attachment, response.get_data(as_text=True))
             self.assertEqual(photos, [])
+            self.assertEqual(drafts, [])
             with patch.dict(app.config, TMS_NEXTSLS_PACKING_ATTACHMENT_HOST="files.example.com"):
                 self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 302)
                 self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 400)
@@ -392,7 +459,13 @@ class NextSLSTests(unittest.TestCase):
         self.assertEqual(payload["client_reference"], link.client_reference)
         self.assertEqual(payload["to_address"]["postcode"], "00001")
         self.assertNotIn("from_address", payload)
-        self.assertEqual(payload["attachments"], [{"name": "packing.pdf", "file_type": "order", "url": attachment}])
+        self.assertEqual(payload["attachments"], [{"name": "packing.xlsx", "file_type": "order", "url": attachment}])
+        self.assertEqual(len(drafts), 1)
+        book = load_workbook(BytesIO(drafts[0]), read_only=True)
+        try:
+            self.assertEqual([sheet.max_row for sheet in book.worksheets], [3, 4])
+        finally:
+            book.close()
         self.assertEqual([len(box["declarations"]) for box in payload["parcels"]], [2, 1])
         declarations = [row for box in payload["parcels"] for row in box["declarations"]]
         self.assertEqual([row["photo_url"] for row in declarations],
@@ -405,7 +478,7 @@ class NextSLSTests(unittest.TestCase):
         self.assertEqual(declaration["model"], fields["supplement_2_model"])
         self.assertEqual((link.supplier_number, link.state), (SUPPLIER_NUMBER, "linked"))
         detail = self.get(self.alice, upload.location).get_data(as_text=True)
-        for private in (SUPPLIER_NUMBER, attachment, "packing.pdf", "fixture-brand", "files.example.com/photo"):
+        for private in (SUPPLIER_NUMBER, attachment, "packing.xlsx", "fixture-brand", "files.example.com/photo"):
             self.assertNotIn(private, detail)
         self.assertEqual(db.session.get(TmsOrder, order_id).workbook, raw)
 
@@ -429,7 +502,9 @@ class NextSLSTests(unittest.TestCase):
         self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
 
     def test_expanded_b888_mock_maps_each_product_and_staff_packing_draft(self):
-        self.profile(service_codes=["B888"])
+        rule = SERVICE | {"code": "B888", "packing_list_required": 1,
+                          "require_declaration_list": ["amazon_ref_id", "brand", "model"]}
+        self.profile(service_codes=["B888"], rules={"B888": nextsls.preparation_rules(rule)})
         self.sign_in(self.alice, "customer-a")
         raw = fixture.expanded_workbook()
         uploaded = self.upload(self.alice, raw)
@@ -442,8 +517,7 @@ class NextSLSTests(unittest.TestCase):
         fields = {f"supplement_{index}_{key}": f"{key}-{index}" for index in range(36)
                   for key in nextsls.SUPPLEMENTAL_DECLARATIONS}
         link = "https://files.example.com/packing.xlsx"
-        self.assertEqual(self.action(order_id, "prepare", revision=3, packing_name="packing.xlsx",
-                                     packing_url=link, **fields).status_code, 302)
+        self.assertEqual(self.action(order_id, "prepare", revision=3, **fields).status_code, 302)
         draft_path = f"/tms/admin/orders/{order_id}/supplier/packing-draft.xlsx"
         self.assertEqual(self.get(self.alice, draft_path).status_code, 302)
         response = self.get(self.staff, draft_path)
@@ -453,8 +527,6 @@ class NextSLSTests(unittest.TestCase):
         self.assertEqual(sum(row[1] for row in book["货箱"].iter_rows(min_row=2, values_only=True)), 231)
         self.assertEqual(book["商品申报"]["G37"].value, "brand-35")
         book.close()
-        rule = SERVICE | {"code": "B888", "packing_list_required": 1,
-                          "require_declaration_list": ["amazon_ref_id", "brand", "model"]}
         photos = []
         requests = []
 
@@ -469,7 +541,8 @@ class NextSLSTests(unittest.TestCase):
             requests.append(json["shipment"])
             return success({"shipment": {"shipment_id": SUPPLIER_NUMBER}})
 
-        mock_send = partial(tms_carriers.send_order, transport=transport, photo_publisher=publish)
+        mock_send = partial(tms_carriers.send_order, transport=transport, photo_publisher=publish,
+                            packing_publisher=lambda _: link)
         with patch.dict(app.config, TMS_NEXTSLS_CREATE_ENABLED=True,
                         TMS_NEXTSLS_PACKING_ATTACHMENT_HOST="files.example.com"), patch(
             "tms_carriers.send_order", side_effect=mock_send,
@@ -669,7 +742,9 @@ class NextSLSTests(unittest.TestCase):
                                          "traces": [{"info": f"虚构轨迹-{index}"}]}})
 
         self.assertFalse(app.config["TMS_NEXTSLS_CREATE_ENABLED"])
-        with patch("carrier_http.post", side_effect=transport):
+        mock_send = partial(tms_carriers.send_order, transport=transport,
+                            packing_publisher=lambda _: "https://files.example.com/pack.xlsx")
+        with patch("carrier_http.post", side_effect=transport), patch("tms_carriers.send_order", side_effect=mock_send):
             for index, (client, suffix) in enumerate(zip((self.alice, self.bob, third_client), "abc")):
                 origin, code, name, required, packing = profiles[index]
                 calls[index] = []
@@ -711,8 +786,6 @@ class NextSLSTests(unittest.TestCase):
                         self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
                         fields = {f"supplement_{i}_{key}": f"verified-{key}-{i}"
                                   for i in range(3) for key in required}
-                        if packing:
-                            fields.update(packing_name="packing.xlsx", packing_url="https://files.example.com/pack.xlsx")
                         self.assertEqual(self.action(order_id, "prepare", revision=3, **fields).status_code, 302)
                         db.session.expire_all()
                     created = self.action(order_id, "create", confirm="yes")
@@ -848,13 +921,16 @@ class NextSLSTests(unittest.TestCase):
         self.assertEqual(self.decision(order_id, 2, decision="approve", **self.pricing(
             agent_service="虚构销售服务")).status_code, 302)
         self.profile()
-        form = {"revision": 3, "channel_code": "TMS_DEMO", "channel_reason": "按代理服务清单更正"}
+        form = {"revision": 3, "channel_code": "TMS_DEMO"}
         self.assertEqual(self.action(order_id, "channel", **(form | {"channel_code": "OTHER"})).status_code, 400)
         self.assertEqual(self.action(order_id, "channel", **form).status_code, 302)
         db.session.expire_all()
         order = db.session.get(TmsOrder, order_id)
         self.assertEqual(order.agent_service, "TMS_DEMO")
         self.assertEqual(order.invoice["supplier_channel_reviews"][0]["from"], "虚构销售服务")
+        self.assertEqual(order.invoice["supplier_channel_reviews"][0]["to"], "TMS_DEMO")
+        self.assertTrue(order.invoice["supplier_channel_reviews"][0]["by"])
+        self.assertTrue(order.invoice["supplier_channel_reviews"][0]["at"])
         self.assertEqual(order.invoice["supplier_channel"]["name"], SERVICE["name"])
         self.assertEqual(db.session.get(TmsReceivable, order_id).agent_service, "TMS_DEMO")
         self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))

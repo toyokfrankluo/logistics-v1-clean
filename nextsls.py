@@ -37,10 +37,18 @@ DECLARATIONS = {"name_zh": "name_zh", "name_en": "name_en", "material": "materia
 SUPPLEMENTAL_DECLARATIONS = {
     "amazon_ref_id": "Amazon 参考号", "brand": "品牌", "model": "型号",
 }
+REQUIRED_FLAGS = ("tel_required", "email_required", "company_required", "city_required",
+                  "vat_number_required", "eori_required", "packing_list_required")
 
 
 class ProtocolError(ValueError):
     pass
+
+
+class PreparationError(ProtocolError):
+    def __init__(self, blockers):
+        self.blockers = tuple(dict.fromkeys(blockers))
+        super().__init__("；".join(self.blockers) + "。")
 
 
 def base_url(value, provider):
@@ -90,8 +98,7 @@ def request_data(agent, origin, path, payload, *, transport=None):
     if not legacy_tenant_matches(agent.api_url, origin):
         raise ProtocolError("基础域名与现有 NextSLS 轨迹租户不一致，请检查代理配置。")
     target = SimpleNamespace(api_url=endpoint(origin, path), is_active=agent.is_active,
-                             supports_api=agent.supports_api, app_token=agent.app_token,
-                             app_key=agent.app_key, password=agent.password)
+                             supports_api=agent.supports_api, app_token=agent.app_token)
     try:
         response = (transport or carrier_http.post)(target, json=payload, headers={
             "Authorization": "Bearer " + agent.app_token, "Accept": "application/json",
@@ -149,6 +156,53 @@ def service_profile(data, code):
     return found[0]
 
 
+def preparation_rules(profile):
+    fields = profile.get("require_declaration_list")
+    if (not isinstance(fields, list) or len(fields) > 100
+            or any(not isinstance(key, str) or not re.fullmatch(r"[a-zA-Z0-9_]{1,64}", key) for key in fields)):
+        raise ProtocolError("渠道的产品申报必填项待核实")
+    sender = profile.get("from_address")
+    if sender not in ("no", "optional", "required", "yes"):
+        raise ProtocolError("渠道的发件地址规则待核实")
+    return {**{key: int(required_flag(profile, key)) for key in REQUIRED_FLAGS},
+            "from_address": sender, "require_declaration_list": sorted(set(fields))}
+
+
+def supplemental_value(invoice, field, value):
+    value = supplied_text(value, 120)
+    if field == "amazon_ref_id":
+        invalid = {"无", "暂无", "不适用", "未知", "none", "n/a", "na", "null", "unknown", "-", "0",
+                   invoice["metadata"]["po_number"].casefold(), invoice["customer_number"].casefold()}
+        invalid.update(box["box_number"].casefold() for box in invoice["boxes"])
+        if value.casefold() in invalid:
+            raise ProtocolError("Amazon 参考号须使用真实资料，不能使用占位值、PO、客户订单号或箱号")
+    return value
+
+
+def declaration_supplements(invoice, supplement, index, fields):
+    saved = supplement.get("declarations", {}).get(str(index), {})
+    declared = invoice["declarations"][index]
+    result = {}
+    for field in fields:
+        for value in (declared.get(field), saved.get(field)):
+            try:
+                result[field] = supplemental_value(invoice, field, value)
+                break
+            except ProtocolError:
+                continue
+    return result
+
+
+def missing_supplements(invoice, supplement, rules):
+    required = [field for field in SUPPLEMENTAL_DECLARATIONS if field in rules["require_declaration_list"]]
+    missing = {}
+    for index, _ in enumerate(invoice["declarations"]):
+        values = declaration_supplements(invoice, supplement, index, required)
+        if len(values) < len(required):
+            missing[index] = [field for field in required if field not in values]
+    return missing
+
+
 def address_values(values):
     for field in REQUIRED_ADDRESS:
         supplied_text(values.get(field), 200)
@@ -172,18 +226,24 @@ def packing_url_host(value):
 
 
 def create_payload(invoice, code, reference, profile, sender, *, supplement=None, packing_host="",
-                   publish_photos=None):
+                   publish_photos=None, publish_packing=None):
     """Translate a reviewed invoice; do not manufacture fields missing for the selected service."""
     if not CODE.fullmatch(code) or not CODE.fullmatch(reference):
         raise ProtocolError("渠道代码或系统对账参考号无效。")
+    profile = preparation_rules(profile)
+    blockers = []
     suspicious = address_placeholders(invoice["address"])
     review = invoice.get("destination_review", {})
     verified = review.get("verified_optional", {})
     if ({"mobile", "phone"}.intersection(suspicious)
             or any(not (review.get("by") and review.get("at") and review.get("reason")
                         and verified.get(key) == invoice["address"][key]) for key in suspicious)):
-        raise ProtocolError("收件地址含未经核对的历史模板占位值，请更正后再提交。")
-    to_address = address_values({target: invoice["address"].get(source, "") for target, source in ADDRESS.items()})
+        blockers.append("收件地址含未经核对的历史模板占位值，请更正后再提交")
+    to_address = {target: invoice["address"].get(source, "") for target, source in ADDRESS.items()}
+    try:
+        to_address = address_values(to_address)
+    except ProtocolError:
+        blockers.append("收件人、地址、城市、国家或邮编缺失或无效")
     meta = invoice["metadata"]
     shipment = {
         "service": code, "client_reference": reference, "reference_1": invoice["customer_number"],
@@ -202,60 +262,58 @@ def create_payload(invoice, code, reference, profile, sender, *, supplement=None
     ):
         if meta.get(source):
             if meta[source] not in codes:
-                raise ProtocolError("报关、清关或交税方式尚无已确认的 NextSLS 映射。")
-            shipment[target] = codes[meta[source]]
+                blockers.append("报关、清关或交税方式尚无已确认的 NextSLS 映射")
+            else:
+                shipment[target] = codes[meta[source]]
     tax_id = meta.get("vat_eori", "")
     if tax_id:
         match = re.fullmatch(r"(VAT|EORI)\s*[:：]\s*(\S+)", tax_id, re.I)
         if not match:
-            raise ProtocolError("税号须用 VAT: 或 EORI: 标记，以免发送到错误字段。")
-        shipment["vat_number" if match[1].upper() == "VAT" else "eori"] = match[2]
-    for setting, field in (("tel_required", "tel"), ("email_required", "email"),
-                           ("company_required", "company"), ("city_required", "city")):
+            blockers.append("税号须用 VAT: 或 EORI: 标记")
+        else:
+            shipment["vat_number" if match[1].upper() == "VAT" else "eori"] = match[2]
+    for setting, field, label in (("tel_required", "tel", "电话"), ("email_required", "email", "邮箱"),
+                                  ("company_required", "company", "公司"), ("city_required", "city", "城市")):
         if required_flag(profile, setting) and not to_address.get(field):
-            raise ProtocolError(f"渠道要求收件资料字段 {field}。")
+            blockers.append(f"渠道要求收件{label}（{field}）")
     for setting, field in (("vat_number_required", "vat_number"), ("eori_required", "eori")):
         if required_flag(profile, setting) and not shipment.get(field):
-            raise ProtocolError(f"渠道要求 {field}。")
+            blockers.append(f"渠道要求 {field}")
     sender_requirement = profile.get("from_address")
-    if sender_requirement not in ("no", "optional", "required", "yes"):
-        raise ProtocolError("渠道的发件地址规则待核实。")
     if sender_requirement in ("required", "yes") or (sender_requirement == "optional" and sender):
-        shipment["from_address"] = address_values(
-            {**sender, "company": sender.get("company") or meta.get("sender", "")})
+        try:
+            shipment["from_address"] = address_values(
+                {**sender, "company": sender.get("company") or meta.get("sender", "")})
+        except ProtocolError:
+            blockers.append("请在代理配置中补齐有效发件地址")
     requirements = profile.get("require_declaration_list")
-    if not isinstance(requirements, list) or any(not isinstance(key, str) for key in requirements):
-        raise ProtocolError("渠道的产品申报必填项待核实。")
     supplement = supplement or {}
     supported = DECLARATIONS.keys() | SUPPLEMENTAL_DECLARATIONS.keys() | {
         "unit_value", "qty", "is_battery", "photo_url",
     }
     unsupported = sorted(set(requirements) - supported)
-    blockers = []
-    if required_flag(profile, "packing_list_required"):
-        packing = supplement.get("packing_list")
-        if not packing_host:
-            blockers.append("渠道要求额外装箱单附件，待供应商确认创建时使用订单附件链接")
-        if not packing:
-            blockers.append("请在补充下单资料中填写装箱单")
-        elif packing_host:
-            if packing_url_host(packing["url"]) != packing_host:
-                blockers.append("装箱单链接与已授权的附件域名不一致")
-            else:
-                shipment["attachments"] = [{"name": packing["name"], "file_type": "order", "url": packing["url"]}]
+    packing_required = required_flag(profile, "packing_list_required")
+    if packing_required and (publish_packing is None or not packing_host):
+        blockers.append("渠道要求装箱单，创建时的自动传输方式尚待供应商确认")
+    if "photos" in unsupported:
+        blockers.append("渠道要求 photos，图片传输格式尚待供应商确认")
+        unsupported.remove("photos")
     if unsupported:
         known = sorted(set(unsupported) & {"amazon_ref_id", "brand", "model", "photos", "weight", "size"})
         blockers.append("当前发票映射不支持该渠道的全部必填申报字段" + (f"（{', '.join(known)}）" if known else ""))
-    supplemental_rows = supplement.get("declarations", {})
+    missing = missing_supplements(invoice, supplement, profile)
     missing_fields = [label for field, label in SUPPLEMENTAL_DECLARATIONS.items()
-                      if field in requirements and any(not supplemental_rows.get(str(index), {}).get(field)
-                                                       for index in range(len(invoice["declarations"])))]
+                      if any(field in fields for fields in missing.values())]
     if missing_fields:
         blockers.append("请逐条补充申报：" + "、".join(missing_fields))
     if "photo_url" in requirements and publish_photos is None:
         blockers.append("商品图片链接传输尚未获准")
+    if {"photos", "photo_url"}.intersection(requirements) and any(
+        not item.get("image_part") for item in invoice["declarations"]
+    ):
+        blockers.append("原发票有申报行缺少内嵌商品图片")
     if blockers:
-        raise ProtocolError("；".join(blockers) + "。")
+        raise PreparationError(blockers)
     parcels = {}
     for box in invoice["boxes"]:
         number = supplied_text(box["box_number"], 50)
@@ -272,10 +330,8 @@ def create_payload(invoice, code, reference, profile, sender, *, supplement=None
     declarations = []
     for index, item in enumerate(invoice["declarations"]):
         declaration = {target: supplied_text(item.get(source)) for target, source in DECLARATIONS.items()}
-        values = supplemental_rows.get(str(index), {})
-        for key in SUPPLEMENTAL_DECLARATIONS:
-            if values.get(key):
-                declaration[key] = supplied_text(values[key], 120)
+        fields = [key for key in SUPPLEMENTAL_DECLARATIONS if key != "amazon_ref_id" or key in requirements]
+        declaration.update(declaration_supplements(invoice, supplement, index, fields))
         qty = item["quantity"]
         if type(qty) is not int or qty <= 0:
             raise ProtocolError("产品申报数量无效。")
@@ -296,6 +352,11 @@ def create_payload(invoice, code, reference, profile, sender, *, supplement=None
             raise ProtocolError("商品图片链接数量与申报行数不一致。")
         for declaration, url in zip(declarations, urls):
             declaration["photo_url"] = product_photo_url(url)
+    if packing_required:
+        url = publish_packing()
+        if packing_url_host(url) != packing_host:
+            raise ProtocolError("自动生成的装箱单链接与已授权的附件域名不一致。")
+        shipment["attachments"] = [{"name": "packing.xlsx", "file_type": "order", "url": url}]
     shipment.update(parcels=list(parcels.values()), parcel_count=str(len(parcels)))
     return {"shipment": shipment}
 

@@ -497,14 +497,14 @@ def edit_agent(agent_id):
         try:
             origin = profile.base_url if profile else None
             token = a.app_token
-            catalogue = tms_carriers.read_channel_catalogue(profile, a)
+            catalogue, rules = tms_carriers.read_channel_catalogue(profile, a)
             db.session.refresh(a, with_for_update=True)
             db.session.refresh(profile, with_for_update=True)
             if (profile.provider != "nextsls" or "create" not in profile.enabled or profile.base_url != origin
                     or a.app_token != token or not a.is_active or not a.supports_api
                     or not nextsls.legacy_tenant_matches(a.api_url, origin)):
                 raise nextsls.ProtocolError("代理配置已经变更，请重新读取渠道。")
-            tms_carriers.store_channel_catalogue(profile, catalogue)
+            tms_carriers.store_channel_catalogue(profile, catalogue, rules)
             if channel_action == "save":
                 tms_carriers.save_channel_mapping(profile, catalogue, request.form.get("sales_service", ""),
                                                   request.form.get("supplier_channel_code", ""))

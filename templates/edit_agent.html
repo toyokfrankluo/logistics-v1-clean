@@ -25,6 +25,7 @@
 <section class="panel">
   <h2>功能接口</h2>
   <p>选择 NextSLS V5 后，已接入的接口使用同一基础域名和 App Token。新代理可留空原有轨迹地址。仍使用旧地址的代理请选择「其他」或原 API 类型。</p>
+  <p>NextSLS V5 使用 Bearer App Token。App Key 与客户代码仅供需要它们的旧接口使用。供应商网页账号和密码独立管理。</p>
   <p>勾选是本地启用配置。账号是否具备供应商权限，以接口验证为准。</p>
   <div class="table-wrap"><table><thead><tr><th>功能与启用开关</th><th>实际接口地址</th><th>配置状态</th><th>真实只读验证</th><th>当前可用性</th></tr></thead><tbody>
   {% for key, (label, path, access) in capabilities.items() %}

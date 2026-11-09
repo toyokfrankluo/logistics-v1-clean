@@ -1,62 +1,64 @@
 {% set link = supplier.link %}
 {% set snapshot = supplier.snapshot %}
 {% set cost = supplier.cost %}
+{% set preparation = supplier.preparation %}
 {% if supplier_error %}<p class="error" role="alert">{{ supplier_error }}</p>{% endif %}
 <section class="panel" id="supplier-order">
   <h2>供应商下单</h2>
-  <p><a href="{{ url_for('tms_staff.supplier_packing_draft', order_id=order.id) }}">下载装箱单草稿</a> · 供内部核对，需按代理要求确认后再提交。</p>
   {% set states = {'new':'待提交代理', 'sending':'提交中 · 已预留', 'uncertain':'待对账 · 提交结果未确认', 'not_found':'列表无匹配，待人工核实', 'linked':'代理已接单 · 单号已关联'} %}
   <p><span class="badge">{{ states[link.state] if link else ('已录入供应商单号' if supplier.supplier_number else '待提交代理') }}</span>
     {% if supplier.supplier_number %} · {{ supplier.supplier_number }}{% endif %}
     {% if link %} · 对账参考号 <code>{{ link.client_reference }}</code>{% endif %}</p>
-  {% if not supplier.supplier_number and (not link or link.state == 'new') %}
-  <details><summary class="button">提交代理下单</summary>
+  {% if preparation %}
   <dl class="fields">
     <div><dt>客户单号</dt><dd>{{ invoice.customer_number }}</dd></div>
     <div><dt>代理</dt><dd>{{ supplier.agent_name }}</dd></div>
     <div><dt>实际代理渠道</dt><dd>{{ invoice.supplier_channel.name ~ ' · ' if invoice.supplier_channel else '' }}{{ order.agent_service }}</dd></div>
     <div><dt>箱数</dt><dd>{{ invoice.boxes|length }}</dd></div>
     <div><dt>申报信息</dt><dd>{{ invoice.declarations|length }} 项 · {{ totals.value }} USD · {{ invoice.metadata.declaration_mode }}</dd></div>
+    <div><dt>商品图片</dt><dd>从星睿 Excel 识别 {{ preparation.image_count }} / {{ invoice.declarations|length }} 张</dd></div>
+    <div><dt>装箱单</dt><dd>{% if preparation.packing_required is true %}
+      可由系统按审核后的箱货数据生成。创建传输待确认。
+      <a href="{{ url_for('tms_staff.supplier_packing_draft', order_id=order.id) }}">下载草稿</a>
+      {% elif preparation.packing_required is false %}本渠道无需单独装箱单
+      {% else %}等待渠道规则确认{% endif %}</dd></div>
     <div><dt>目的地</dt><dd>{{ invoice.address.recipient }} · {{ [invoice.address.street, invoice.address.street2, invoice.address.street3, invoice.address.city, invoice.address.region, invoice.address.postal_code, invoice.address.country]|select|join(' · ') }}</dd></div>
   </dl>
   <ul>{% for item in invoice.declarations %}<li>{{ item.box_number }} · {{ item.name_zh }} / {{ item.name_en }} · {{ item.quantity }} 件 · {{ item.total_usd }} USD</li>{% endfor %}</ul>
-  {% if supplier.create_blockers %}
-    <p class="notice">暂不能提交：{{ supplier.create_blockers|join('；') }}。</p>
-    <button type="button" disabled>确认并提交代理</button>
+  {% if preparation.blockers %}
+    <p class="notice">暂不能提交</p>
+    <ul>{% for blocker in preparation.blockers %}<li>{{ blocker }}</li>{% endfor %}</ul>
+    {% if preparation.packing_required is none and supplier.agent_id %}
+    <p><a href="{{ url_for('views.edit_agent', agent_id=supplier.agent_id, _anchor='channel-mapping') }}">前往代理设置核对渠道规则</a></p>
+    {% endif %}
+    <button type="button" disabled>提交代理下单</button>
   {% else %}
   <form method="post" action="{{ url_for('tms_staff.supplier_action', order_id=order.id) }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input type="hidden" name="revision" value="{{ order.revision }}">
     <label class="check-label"><input type="checkbox" name="confirm" value="yes" required>确认向审核选定的代理提交本票资料</label>
-    <button name="action" value="create">确认并提交代理</button>
+    <button name="action" value="create">提交代理下单</button>
   </form>
   {% endif %}
-  </details>
   {% endif %}
-  {% if supplier.can_prepare %}
-  <details><summary>补充 NextSLS 下单资料</summary>
-    <p>请先选定实际代理渠道。Amazon 参考号请从对应的 Amazon 发货资料核对。商品确实没有型号时，可填「无」。</p>
+  {% if preparation.missing %}
+  <details open><summary>补齐本渠道缺少的申报资料</summary>
     <form method="post" action="{{ url_for('tms_staff.supplier_action', order_id=order.id) }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <input type="hidden" name="revision" value="{{ order.revision }}">
-      {% for row in invoice.declarations %}
-      {% set row_index = loop.index0 %}
-      {% set supplements = supplier.supplement.get('declarations', {}).get(row_index|string, {}) %}
+      {% for row_index, fields in preparation.missing.items() %}
+      {% set row = invoice.declarations[row_index] %}
       <fieldset class="other-fees">
-        <legend>申报 {{ loop.index }} · {{ row.box_number }} · {{ row.name_zh }}</legend>
+        <legend>申报 {{ row_index + 1 }} · {{ row.box_number }} · {{ row.name_zh }}</legend>
         <div class="pricing-grid">
-        {% for key, label in supplier.supplement_fields.items() %}
-        <label>{{ label }}<input name="supplement_{{ row_index }}_{{ key }}" maxlength="120" value="{{ supplements.get(key, '') }}"></label>
+        {% for key in fields %}
+        <label>{{ supplier.supplement_fields[key] }}<input name="supplement_{{ row_index }}_{{ key }}" maxlength="120"
+          {% if key == 'amazon_ref_id' %}placeholder="使用对应 Amazon 货件的参考号"{% endif %}></label>
+        {% if key == 'model' and preparation.allow_no_model %}<label class="check-label"><input type="checkbox" name="supplement_{{ row_index }}_no_model" value="yes">无型号</label>{% endif %}
         {% endfor %}
         </div>
       </fieldset>
       {% endfor %}
-      {% set packing = supplier.supplement.get('packing_list', {}) %}
-      <label>装箱单文件名<input name="packing_name" maxlength="100" value="{{ packing.get('name', '') }}"></label>
-      <label>装箱单授权 HTTPS 链接<input type="url" name="packing_url" maxlength="500" autocomplete="off"
-        placeholder="{{ '已保存，留空保留原链接' if packing else '填写已获授权的文件链接' }}"></label>
-      {% if packing %}<label class="check-label"><input type="checkbox" name="remove_packing" value="yes">移除已保存的装箱单链接</label>{% endif %}
-      <p class="muted">系统从发票 O 列按申报行读取商品图片，无需重复上传。装箱单在供应商确认本渠道接受的方式后才会随下单请求传输。</p>
       <button class="secondary" name="action" value="prepare">保存下单资料</button>
     </form>
   </details>
@@ -72,14 +74,13 @@
           {% for code, name in supplier.channel_choices|dictsort %}<option value="{{ code }}">{{ name }} · {{ code }}</option>{% endfor %}
         </select></label>
       </div>
-      <label>更正原因<input name="channel_reason" maxlength="200" required></label>
       <button class="secondary" name="action" value="channel">保存渠道更正</button>
     </form>
   </details>
   {% endif %}
   {% if invoice.supplier_channel_reviews %}
   <details><summary>代理渠道更正记录</summary>
-    <ul>{% for item in invoice.supplier_channel_reviews %}<li>{{ item.from }} → {{ item.to }} · {{ item.reason }} · #{{ item.by }}</li>{% endfor %}</ul>
+    <ul>{% for item in invoice.supplier_channel_reviews %}<li>{{ item.from }} → {{ item.to }} · #{{ item.by }} · {{ item.at }}{% if item.reason %} · {{ item.reason }}{% endif %}</li>{% endfor %}</ul>
   </details>
   {% endif %}
   {% if link and link.state in ['sending','uncertain','not_found'] %}

@@ -27,6 +27,7 @@ COST_OWNERSHIP = {"payable": "属于星睿应付", "not_payable": "已确认无�
 CHANNEL_MAPPINGS = "sales_service_mappings"
 CHANNEL_CATALOGUE = "channel_catalogue"
 CHANNEL_CATALOGUE_TTL = timedelta(hours=24)
+BC_ORIGIN = "https://bckjkj.nextsls.com"
 
 
 def carrier_schema():
@@ -83,10 +84,16 @@ def channel_catalogue(profile):
     return cache["channels"] if timedelta(0) <= age < CHANNEL_CATALOGUE_TTL else {}
 
 
-def store_channel_catalogue(profile, catalogue):
+def store_channel_catalogue(profile, catalogue, rules=None):
     profile.verified = {**profile.verified, CHANNEL_CATALOGUE: {
-        "fetched_at": datetime.utcnow().isoformat(), "channels": catalogue,
+        "fetched_at": datetime.utcnow().isoformat(), "channels": catalogue, "rules": rules or {},
     }}
+
+
+def channel_rules(profile, code):
+    if code in channel_catalogue(profile):
+        return profile.verified[CHANNEL_CATALOGUE].get("rules", {}).get(code)
+    return None
 
 
 def read_channel_catalogue(profile, agent):
@@ -98,6 +105,7 @@ def read_channel_catalogue(profile, agent):
     if not isinstance(rows, list):
         raise nextsls.ProtocolError("NextSLS 未返回渠道列表。")
     catalogue = {}
+    rules = {}
     for row in rows:
         if not isinstance(row, dict):
             raise nextsls.ProtocolError("NextSLS 渠道数据结构无效。")
@@ -105,7 +113,12 @@ def read_channel_catalogue(profile, agent):
         if not isinstance(code, str) or not nextsls.CODE.fullmatch(code) or code in catalogue:
             raise nextsls.ProtocolError("NextSLS 渠道代码格式无效或重复。")
         catalogue[code] = nextsls.supplied_text(name, 200)
-    return catalogue
+        try:
+            rules[code] = nextsls.preparation_rules(row)
+        except nextsls.ProtocolError:
+            # A selectable service may return no rules. Keep it visible, but require verification.
+            continue
+    return catalogue, rules
 
 
 def save_channel_mapping(profile, catalogue, sale, code):
@@ -125,27 +138,32 @@ def agent_profile(agent_id):
     return profiles[agent_id]
 
 
-def unavailable_reason(profile, agent, key):
+def capability_blockers(profile, agent, key):
     if not profile or profile.provider != "nextsls":
-        return "仅适用于 NextSLS V5"
+        return ["仅适用于 NextSLS V5"]
     if key not in nextsls.WIRED:
-        return "接口尚未接入"
+        return ["接口尚未接入"]
+    blockers = []
     if not profile.base_url:
-        return "未填写 API 基础域名"
+        blockers.append("未填写 API 基础域名")
     if not agent.app_token:
-        return "未配置 App Token"
-    if not nextsls.legacy_tenant_matches(agent.api_url, profile.base_url):
-        return "原有轨迹地址与基础域名租户不一致"
+        blockers.append("未配置 App Token")
+    if profile.base_url and not nextsls.legacy_tenant_matches(agent.api_url, profile.base_url):
+        blockers.append("原有轨迹地址与基础域名租户不一致")
     if not agent.is_active or not agent.supports_api:
-        return "代理已停用或不支持 API"
+        blockers.append("代理已停用或不支持 API")
     if key not in profile.enabled:
-        return "功能未勾选启用"
-    if key == "create" and not channel_catalogue(profile):
-        return "请先到代理编辑页刷新 NextSLS 渠道清单"
+        blockers.append("功能未勾选启用")
+    elif key == "create" and not channel_catalogue(profile):
+        blockers.append("请先到代理编辑页刷新 NextSLS 渠道清单")
     switch = "TMS_NEXTSLS_CREATE_ENABLED" if key == "create" else "TMS_NEXTSLS_READ_ENABLED"
     if not current_app.config.get(switch):
-        return "系统未开放真实下单" if key == "create" else "系统未开放 NextSLS 只读请求"
-    return None
+        blockers.append("系统未开放真实下单" if key == "create" else "系统未开放 NextSLS 只读请求")
+    return blockers
+
+
+def unavailable_reason(profile, agent, key):
+    return next(iter(capability_blockers(profile, agent, key)), None)
 
 
 def available(profile, agent, key):
@@ -155,22 +173,50 @@ def available(profile, agent, key):
 def create_blockers(profile, agent, code, order_id):
     if not agent:
         return ["未找到订单所选代理"]
-    reason = unavailable_reason(profile, agent, "create")
-    blockers = [reason] if reason else []
+    blockers = capability_blockers(profile, agent, "create")
     catalogue = channel_catalogue(profile)
     if catalogue and code not in catalogue:
         blockers.append("审核所选渠道未列入代理的已确认渠道代码")
     if not current_app.config.get("TMS_NEXTSLS_CREATE_ENABLED") and "系统未开放真实下单" not in blockers:
         blockers.append("系统未开放真实下单")
-    if (profile and profile.base_url == "https://bckjkj.nextsls.com"
+    if (profile and profile.base_url == BC_ORIGIN
             and code in {"B888", "B888-1", "B888-2"} and not current_app.config.get("ISOLATED_MODE")):
         blockers.append("该渠道的真实商品图片传输尚待供应商确认")
-    if current_app.config.get("TMS_NEXTSLS_CREATE_ENABLED") and not current_app.config.get("ISOLATED_MODE"):
+    if profile and profile.provider == "nextsls" and not current_app.config.get("ISOLATED_MODE"):
         if current_app.config.get("TMS_NEXTSLS_CREATE_ORDER_ID") != str(order_id):
             blockers.append("此订单不在本次真实下单授权范围内")
-        if not available(profile, agent, "reconcile"):
-            blockers.append("真实下单前须启用只读对账")
+        blockers.extend(f"只读对账：{reason}" for reason in capability_blockers(profile, agent, "reconcile"))
     return blockers
+
+
+def supplier_preparation(order, profile, agent):
+    code = order.agent_service
+    blockers = create_blockers(profile, agent, code, order.id)
+    result = {"blockers": blockers, "missing": {}, "packing_required": None,
+              "allow_no_model": bool(profile and profile.provider == "nextsls" and profile.base_url == BC_ORIGIN),
+              "image_count": sum(bool(item.get("image_part")) for item in order.invoice["declarations"])}
+    if not profile or profile.provider != "nextsls":
+        return result
+    origin = order.invoice.get("supplier_tenant_origin")
+    if origin and origin != profile.base_url:
+        blockers.append("代理租户已与审核记录不符")
+        return result
+    if agent and current_app.config.get("ISOLATED_MODE"):
+        blockers.extend(f"只读对账：{reason}" for reason in capability_blockers(profile, agent, "reconcile"))
+    rules = channel_rules(profile, code)
+    if rules is None:
+        blockers.append("此渠道的完整必填规则尚未读取或已过期，请到代理设置刷新 NextSLS 渠道清单")
+        return result
+    result["packing_required"] = nextsls.required_flag(rules, "packing_list_required")
+    supplement = order_supplement(order)
+    result["missing"] = nextsls.missing_supplements(order.invoice, supplement, rules)
+    try:
+        nextsls.create_payload(order.invoice, code, "XR-PREFLIGHT", rules, profile.sender, supplement=supplement)
+    except nextsls.PreparationError as exc:
+        blockers.extend(exc.blockers)
+    except nextsls.ProtocolError as exc:
+        blockers.append(str(exc))
+    return result
 
 
 def approved_shipment(order):
@@ -240,9 +286,10 @@ def attach_number(shipment, link, number):
     shipment.shipment_id = number
 
 
-def send_order(order, actor_id, *, transport=None, photo_publisher=None):
-    if photo_publisher is not None and (transport is None or not current_app.config.get("ISOLATED_MODE")):
-        raise nextsls.ProtocolError("商品图片发送目前只允许在隔离模拟中验证。")
+def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing_publisher=None):
+    if ((photo_publisher is not None or packing_publisher is not None)
+            and (transport is None or not current_app.config.get("ISOLATED_MODE"))):
+        raise nextsls.ProtocolError("商品图片和装箱单发送目前只允许在隔离模拟中验证。")
     agent = db.session.get(CarrierAgent, order.agent_id) if order.agent_id else None
     blockers = create_blockers(agent_profile(order.agent_id) if agent else None, agent, order.agent_service, order.id)
     if blockers:
@@ -278,6 +325,8 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None):
         order.invoice, code, link.client_reference, service, profile.sender, supplement=order_supplement(order),
         packing_host=current_app.config.get("TMS_NEXTSLS_PACKING_ATTACHMENT_HOST", ""),
         publish_photos=publish_photos if photo_publisher is not None else None,
+        publish_packing=(lambda: packing_publisher(packing_draft(order).getvalue()))
+        if packing_publisher is not None else None,
     )
     transition(link, "new", "sending", attempt_at=datetime.utcnow(), tenant_origin=origin)
     audit(link, "attempt", actor_id, {"state": "sending"})
@@ -631,9 +680,9 @@ def packing_draft(order):
                                      ("weight_kg", "length_cm", "width_cm", "height_cm")))
                  for box in invoice["boxes"])
     products = [("货箱号", "中文品名", "英文品名", "数量", "单价 (USD)", "海关编码", "品牌", "型号")]
-    supplemental = order_supplement(order).get("declarations", {})
+    supplemental = order_supplement(order)
     for index, item in enumerate(invoice["declarations"]):
-        details = supplemental.get(str(index), {})
+        details = nextsls.declaration_supplements(invoice, supplemental, index, ("brand", "model"))
         products.append((item["box_number"], item["name_zh"], item["name_en"], item["quantity"],
                          Decimal(item["unit_price_usd"]), item["hs_code"], details.get("brand"), details.get("model")))
     return xlsx((("货箱", boxes), ("商品申报", products)))
