@@ -1,4 +1,5 @@
 """NextSLS fixtures use synthetic orders and an entirely simulated carrier transport."""
+from datetime import datetime, timedelta
 from io import BytesIO
 from types import SimpleNamespace
 import unittest
@@ -9,6 +10,7 @@ from openpyxl import load_workbook
 import carrier_http
 import nextsls
 import test_tms_portal as fixture
+import tms_carriers
 from app import app
 from models import BankAccount, CarrierAgent, ManualTrack, Shipment, db
 from tms_models import TmsAgentApi, TmsOrder, TmsReceivable, TmsSupplierEvent, TmsSupplierOrder
@@ -18,7 +20,7 @@ ORIGIN = "https://demo.nextsls.com"
 SUPPLIER_NUMBER = "TEST-SLS-1"
 TOKEN = "synthetic-test-token"
 SERVICE = {
-    "code": "TMS_DEMO", "require_declaration_list": ["name_en", "unit_value", "qty"],
+    "code": "TMS_DEMO", "name": "虚构代理标准线", "require_declaration_list": ["name_en", "unit_value", "qty"],
     "from_address": "no", "tel_required": 0, "email_required": 0, "company_required": 0,
     "city_required": 1, "vat_number_required": 0, "eori_required": 0, "packing_list_required": 0,
 }
@@ -68,6 +70,8 @@ class NextSLSTests(unittest.TestCase):
                         enabled=["create", "reconcile", "measurement", "parcels", "charges"],
                         service_codes=["TMS_DEMO"], sender={}, verified={})
         profile = TmsAgentApi(agent_id=agent.id, **(settings | changes))
+        if profile.service_codes:
+            tms_carriers.store_channel_catalogue(profile, {code: SERVICE["name"] for code in profile.service_codes})
         db.session.add(profile)
         db.session.commit()
         return profile
@@ -137,6 +141,9 @@ class NextSLSTests(unittest.TestCase):
         }, "/login").status_code, 302)
         agent = CarrierAgent.query.filter_by(name="虚构 API 代理").one()
         self.assertFalse(agent.api_url)
+        with patch("carrier_http.post", return_value=success({"services": [SERVICE]})):
+            self.assertEqual(self.post(self.staff, f"/agents/{agent.id}/edit",
+                                       {"channel_action": "load"}, "/login").status_code, 200)
         self.assertIn("0000123", self.get(self.staff, "/tms/admin/").get_data(as_text=True))
         review = self.get(self.staff, f"/tms/admin/orders/{order_id}").get_data(as_text=True)
         self.assertIn('data-channel-list=', review)
@@ -147,7 +154,7 @@ class NextSLSTests(unittest.TestCase):
                                other_currency="CNY", other_note="虚构说明")
         invalid = self.decision(order_id, 2, decision="approve", **(pricing | {"agent_service": "OTHER-ACCOUNT"}))
         self.assertEqual(invalid.status_code, 400)
-        self.assertIn("请选择此 NextSLS 代理已配置的渠道代码", invalid.get_data(as_text=True))
+        self.assertIn("请选择此 NextSLS 代理当前已核验的渠道", invalid.get_data(as_text=True))
         self.assertEqual(self.decision(order_id, 2, decision="approve", **pricing).status_code, 302)
         self.carrier_post.assert_not_called()
         receivable = db.session.get(TmsReceivable, order_id)
@@ -295,13 +302,15 @@ class NextSLSTests(unittest.TestCase):
     def test_channel_requirements_stop_create(self):
         order_id = self.approve()
         self.profile()
-        required = SERVICE | {"packing_list_required": 1}
+        required = SERVICE | {"packing_list_required": 1,
+                              "require_declaration_list": ["amazon_ref_id", "brand", "model", "photos"]}
         with patch.dict(app.config, TMS_NEXTSLS_CREATE_ENABLED=True), patch(
             "carrier_http.post", return_value=success({"services": [required]}),
         ) as request:
             response = self.action(order_id, "create", confirm="yes")
             self.assertEqual(response.status_code, 400)
             self.assertIn("额外装箱单", response.get_data(as_text=True))
+            self.assertIn("amazon_ref_id, brand, model, photos", response.get_data(as_text=True))
         self.assertEqual(request.call_count, 1)
         self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
 
@@ -310,7 +319,7 @@ class NextSLSTests(unittest.TestCase):
         profile = self.profile(service_codes=[])
         path = f"/tms/admin/orders/{order_id}"
         body = self.get(self.staff, path).get_data(as_text=True)
-        for label in ("待提交代理", "提交代理下单", "TMS_DEMO", "1 Fictional Way", "Demo item", "未配置代理渠道代码"):
+        for label in ("待提交代理", "提交代理下单", "TMS_DEMO", "1 Fictional Way", "Demo item", "刷新 NextSLS 渠道清单"):
             self.assertIn(label, body)
         self.assertNotIn(TOKEN, body)
         with patch.dict(app.config, TMS_NEXTSLS_CREATE_ENABLED=True), patch(
@@ -318,7 +327,7 @@ class NextSLSTests(unittest.TestCase):
         ) as request:
             self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 400)
             request.assert_not_called()
-            profile.service_codes = ["TMS_DEMO"]
+            tms_carriers.store_channel_catalogue(profile, {"TMS_DEMO": SERVICE["name"]})
             db.session.commit()
             self.assertEqual(self.action(order_id, "create", confirm="yes", revision=1).status_code, 400)
             request.assert_not_called()
@@ -354,10 +363,10 @@ class NextSLSTests(unittest.TestCase):
             self.assertIn("该账号当前可用的渠道代码", bad)
             self.assertEqual(profile.service_codes, [])
             saved = edit(channel_action="save", sales_service="UPS红单", supplier_channel_code="TMS_DEMO")
-            self.assertIn("渠道映射已保存", saved)
+            self.assertIn("推荐渠道已保存", saved)
 
         db.session.expire_all()
-        self.assertEqual(profile.service_codes, ["TMS_DEMO"])
+        self.assertEqual(set(tms_carriers.channel_catalogue(profile)), {"TMS_DEMO", "TMS_ALT"})
         self.assertNotIn("create", profile.verified)
         self.assertEqual(calls, [ORIGIN + "/api/v5/shipment/get_services"] * 3)
         self.assertEqual(db.session.get(TmsOrder, order_id).revision, 2)
@@ -365,14 +374,62 @@ class NextSLSTests(unittest.TestCase):
         self.assertEqual(self.post(self.staff, path, {"name": self.agent.name, "provider": "nextsls",
                          "base_url": ORIGIN, "capability": "create"}, "/login").status_code, 302)
         view = self.get(self.staff, f"/tms/admin/orders/{order_id}").get_data(as_text=True)
-        self.assertIn('data-mapped-channel="TMS_DEMO"', view)
+        self.assertIn("TMS_DEMO（推荐）", view)
         response = self.decision(order_id, 2, decision="approve", **self.pricing(agent_service=""))
+        self.assertEqual(response.status_code, 400)
+        response = self.decision(order_id, 2, decision="approve", **self.pricing(agent_service="TMS_ALT"))
         self.assertEqual(response.status_code, 302)
         db.session.expire_all()
-        self.assertEqual(db.session.get(TmsOrder, order_id).agent_service, "TMS_DEMO")
+        self.assertEqual(db.session.get(TmsOrder, order_id).agent_service, "TMS_ALT")
         self.assertEqual(self.staff.post(path, data={"channel_action": "load"}).status_code, 400)
         self.staff_login("tms-test-reader")
         self.assertEqual(self.post(self.staff, path, {"channel_action": "load"}, "/login").status_code, 403)
+
+    def test_same_sales_service_can_select_distinct_channels_across_agents(self):
+        order_id = self.pending_order()
+        profile = self.profile()
+        tms_carriers.store_channel_catalogue(profile, {"TMS_DEMO": "虚构海运", "ALT-1": "虚构卡派"})
+        second_agent = CarrierAgent(name="虚构第二代理", app_token="fixture-second", supports_api=True)
+        db.session.add(second_agent)
+        db.session.flush()
+        other = TmsAgentApi(agent_id=second_agent.id, provider="nextsls", base_url="https://second.nextsls.com",
+                            enabled=["create"], service_codes=[], verified={}, sender={})
+        tms_carriers.store_channel_catalogue(other, {"SECOND-KP": "另一家实际运输服务"})
+        db.session.add(other)
+        db.session.commit()
+        html = self.get(self.staff, f"/tms/admin/orders/{order_id}").get_data(as_text=True)
+        self.assertIn("另一家实际运输服务 · SECOND-KP", html)
+        self.assertIn("虚构卡派 · ALT-1", html)
+        self.assertIn("搜索渠道名称或代码", html)
+        for code in ("TMS_DEMO", "UPS红单", ""):
+            invalid = self.decision(order_id, 2, decision="approve",
+                                    **self.pricing(agent_id=second_agent.id, agent_service=code))
+            self.assertEqual(invalid.status_code, 400)
+        valid = self.decision(order_id, 2, decision="approve",
+                              **self.pricing(agent_id=second_agent.id, agent_service="SECOND-KP"))
+        self.assertEqual(valid.status_code, 302)
+        order = db.session.get(TmsOrder, order_id)
+        self.assertEqual((order.agent_id, order.agent_service, order.invoice["service"]),
+                         (second_agent.id, "SECOND-KP", "UPS红单"))
+        self.assertEqual(order.invoice["supplier_channel"], {"code": "SECOND-KP", "name": "另一家实际运输服务"})
+
+    def test_expired_catalogue_and_token_changes_require_refresh(self):
+        order_id = self.pending_order()
+        profile = self.profile()
+        old = dict(profile.verified[tms_carriers.CHANNEL_CATALOGUE],
+                   fetched_at=(datetime.utcnow() - timedelta(hours=25)).isoformat())
+        profile.verified = {tms_carriers.CHANNEL_CATALOGUE: old}
+        db.session.commit()
+        denied = self.decision(order_id, 2, decision="approve", **self.pricing(agent_service="TMS_DEMO"))
+        self.assertEqual(denied.status_code, 400)
+        self.assertIn("先刷新代理渠道清单", denied.get_data(as_text=True))
+        tms_carriers.store_channel_catalogue(profile, {"TMS_DEMO": "虚构渠道"})
+        db.session.commit()
+        self.assertEqual(self.post(self.staff, f"/agents/{self.agent.id}/edit", {
+            "provider": "nextsls", "base_url": ORIGIN, "capability": "create", "app_token": "fixture-replaced",
+        }, "/login").status_code, 302)
+        db.session.expire_all()
+        self.assertFalse(tms_carriers.channel_catalogue(profile))
 
     def test_real_create_switch_also_requires_the_explicit_order_id(self):
         order_id = self.approve()
@@ -428,6 +485,7 @@ class NextSLSTests(unittest.TestCase):
         order = db.session.get(TmsOrder, order_id)
         self.assertEqual(order.agent_service, "TMS_DEMO")
         self.assertEqual(order.invoice["supplier_channel_reviews"][0]["from"], "虚构销售服务")
+        self.assertEqual(order.invoice["supplier_channel"]["name"], SERVICE["name"])
         self.assertEqual(db.session.get(TmsReceivable, order_id).agent_service, "TMS_DEMO")
         self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
         self.carrier_post.assert_not_called()
@@ -472,7 +530,7 @@ class NextSLSTests(unittest.TestCase):
             self.assertNotIn("actual_weight", event.details["summary"])
             self.assertNotIn("client_weight", event.details["parcels"]["TEST-BOX"])
             self.assertEqual(shipment.weight, weight)
-            self.assertEqual(db.session.get(TmsAgentApi, self.agent.id).verified, {})
+            self.assertNotIn("measurement", db.session.get(TmsAgentApi, self.agent.id).verified)
             self.assertEqual(self.save_cost(order_id).status_code, 302)
             pending_report = load_workbook(BytesIO(self.post(self.staff, "/finance", {"profit_export": "1"}, "/login").data))
             self.assertIsNone(pending_report.active["I2"].value)

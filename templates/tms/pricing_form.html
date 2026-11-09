@@ -29,12 +29,26 @@
     <label class="check-label"><input type="checkbox" name="destination_confirmed" value="yes" required>我已核对并确认本票收件地址</label>
   </fieldset>
   {% endif %}
+  <p>星睿销售服务：<strong>{{ invoice.service }}</strong></p>
   <label>实际物流代理<select name="agent_id" required><option value="">请选择启用的代理</option>
-  {% for agent in agents %}<option value="{{ agent.id }}"{% if agent_channels.get(agent.id) %} data-channel-list="channels-{{ order.id }}-{{ agent.id }}"{% endif %}{% if mapped_channels.get(agent.id) %} data-mapped-channel="{{ mapped_channels[agent.id] }}"{% endif %}{% if agent.id == active_agent %} selected{% endif %}>{{ agent.name }}</option>{% endfor %}
+  {% for agent in agents %}<option value="{{ agent.id }}"{% if agent.id in agent_channels %} data-channel-list="{{ agent.id }}"{% endif %}{% if agent.id == active_agent %} selected{% endif %}>{{ agent.name }}</option>{% endfor %}
   </select></label>
-  <label>实际代理运输渠道<input name="agent_service" value="{{ agent_service or mapped_channels.get(active_agent, '') }}"{% if agent_channels.get(active_agent) %} list="channels-{{ order.id }}-{{ active_agent }}"{% endif %} maxlength="100" required></label>
-  {% for agent_id, codes in agent_channels.items() %}
-  <datalist id="channels-{{ order.id }}-{{ agent_id }}">{% for code in codes %}<option value="{{ code }}">{% endfor %}</datalist>
+  {% set managed = active_agent in agent_channels %}
+  <div data-manual-channel{% if managed or not active_agent %} hidden{% endif %}>
+    <label>实际代理运输渠道<input name="agent_service" value="{{ agent_service or '' if not managed else '' }}" maxlength="100" required{% if managed or not active_agent %} disabled{% endif %}></label>
+  </div>
+  <div data-channel-picker{% if not managed %} hidden{% endif %}>
+    <label>搜索渠道名称或代码<input type="search" data-channel-search placeholder="输入渠道名称或代码"></label>
+    <label>实际代理运输渠道<select name="agent_service" required{% if not managed %} disabled{% endif %}>
+      <option value="">请选择实际渠道</option>
+      {% for code, name in agent_channels.get(active_agent, {})|dictsort %}
+      <option value="{{ code }}"{% if code == agent_service %} selected{% endif %}>{{ name }} · {{ code }}{% if code == mapped_channels.get(active_agent) %}（推荐）{% endif %}</option>
+      {% endfor %}
+    </select></label>
+    <p class="muted" data-channel-empty{% if agent_channels.get(active_agent) %} hidden{% endif %}>请先在代理编辑页刷新此账号的渠道清单。</p>
+  </div>
+  {% for agent_id, catalogue in agent_channels.items() %}
+  <template data-agent-options="{{ agent_id }}">{% for code, name in catalogue|dictsort %}<option value="{{ code }}">{{ name }} · {{ code }}{% if code == mapped_channels.get(agent_id) %}（推荐）{% endif %}</option>{% endfor %}</template>
   {% endfor %}
   {% endif %}
   <div class="pricing-grid">

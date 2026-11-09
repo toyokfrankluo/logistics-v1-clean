@@ -681,11 +681,10 @@ def staff_detail(order, **context):
             select(TmsAgentApi).where(TmsAgentApi.provider == "nextsls",
                                      TmsAgentApi.agent_id.in_([agent.id for agent in agents])))
         for profile in profiles:
-            if profile.service_codes:
-                channels[profile.agent_id] = profile.service_codes
-                mapping = tms_carriers.channel_mappings(profile).get(order.invoice["service"])
-                if mapping:
-                    mapped_channels[profile.agent_id] = mapping["code"]
+            channels[profile.agent_id] = tms_carriers.channel_catalogue(profile)
+            mapping = tms_carriers.channel_mappings(profile).get(order.invoice["service"])
+            if mapping:
+                mapped_channels[profile.agent_id] = mapping["code"]
     adjustments = (db.session.scalars(select(TmsChargeAdjustment).where(
         TmsChargeAdjustment.order_id == order.id).order_by(TmsChargeAdjustment.id.desc())).all()
         if order.status == "approved" and billing_available() else [])
@@ -708,9 +707,10 @@ def staff_detail(order, **context):
                 "last_attempt": (tms_carriers.latest_event(order.id, "attempt")
                                  if link and link.state == "uncertain" else None),
                 "agent_name": agent.name if agent else "—",
-                "channel_choices": ([code for code in profile.service_codes if code != order.agent_service]
-                                    if profile and profile.provider == "nextsls" and not shipment.shipment_id
-                                    and (not link or (link.state == "new" and not link.attempt_at)) else []),
+                "channel_choices": ({code: name for code, name in tms_carriers.channel_catalogue(profile).items()
+                                     if code != order.agent_service}
+                                    if agent and agent.is_active and agent.supports_api and not shipment.shipment_id
+                                    and (not link or (link.state == "new" and not link.attempt_at)) else {}),
                 "create_blockers": tms_carriers.create_blockers(profile, agent, order.agent_service, order.id),
                 "can_reconcile": bool(agent and tms_carriers.available(profile, agent, "reconcile")),
                 "can_sync": bool(agent and any(tms_carriers.available(profile, agent, key)
@@ -799,14 +799,16 @@ def correct_supplier_channel(order):
     if shipment.shipment_id or (link and (link.state != "new" or link.attempt_at)):
         raise nextsls.ProtocolError("已提交或已关联代理的订单不能更改渠道。")
     profile = tms_carriers.agent_profile(order.agent_id)
+    agent = db.session.get(CarrierAgent, order.agent_id)
     code = request.form.get("channel_code", "").strip()
-    if (not profile or profile.provider != "nextsls" or code == order.agent_service
-            or not nextsls.CODE.fullmatch(code) or code not in profile.service_codes):
+    catalogue = tms_carriers.channel_catalogue(profile)
+    if not agent or not agent.is_active or not agent.supports_api or code == order.agent_service or code not in catalogue:
         raise nextsls.ProtocolError("请选择此代理已配置且不同于当前值的渠道代码。")
     reason = nextsls.supplied_text(request.form.get("channel_reason"), 200)
-    review = {"from": order.agent_service, "to": code, "reason": reason,
+    review = {"from": order.agent_service, "to": code, "reason": reason, "to_name": catalogue[code],
+              "from_name": order.invoice.get("supplier_channel", {}).get("name"),
               "by": current_user.id, "at": datetime.now(timezone.utc).isoformat()}
-    invoice = dict(order.invoice, supplier_channel_reviews=[
+    invoice = dict(order.invoice, supplier_channel={"code": code, "name": catalogue[code]}, supplier_channel_reviews=[
         *order.invoice.get("supplier_channel_reviews", []), review,
     ])
     update_order(order, {"agent_service": code, "invoice": invoice})
@@ -942,21 +944,25 @@ def save_pricing(order, decision):
     agent = db.session.get(CarrierAgent, agent_id, with_for_update=True) if agent_id else None
     if (agent_id or decision == "approve") and (not agent or not agent.is_active):
         raise ValueError("请选择启用的实际物流代理。")
+    channel_name = None
     if decision == "approve":
         profile = tms_carriers.agent_profile(agent.id)
         if not service:
-            mapping = tms_carriers.channel_mappings(profile).get(order.invoice["service"])
-            service = mapping["code"] if mapping else ""
-        if not service:
-            raise ValueError("请填写实际代理运输渠道。")
-        if profile and profile.provider == "nextsls" and profile.service_codes and service not in profile.service_codes:
-            raise ValueError("请选择此 NextSLS 代理已配置的渠道代码。")
+            raise ValueError("请选择或填写实际代理运输渠道。")
+        if profile and profile.provider == "nextsls":
+            catalogue = tms_carriers.channel_catalogue(profile)
+            if not agent.supports_api or service not in catalogue:
+                raise ValueError("请选择此 NextSLS 代理当前已核验的渠道。若没有选项，请先刷新代理渠道清单。")
+            channel_name = catalogue[service]
     details = confirm_sales_terms(values, form) if decision == "approve" else values
     if decision == "approve":
         invoice = order.invoice
         changes = {"status": "approved", "agent_id": agent.id, "agent_service": service}
         if invoice.get("address_source") == "workbook":
             invoice = reviewed_invoice(invoice, form)
+            changes["invoice"] = invoice
+        if channel_name:
+            invoice = dict(invoice, supplier_channel={"code": service, "name": channel_name})
             changes["invoice"] = invoice
         db.session.get(Customer, order.customer_id, with_for_update=True)
         if legacy_duplicate(order.customer_id, order.number_key):

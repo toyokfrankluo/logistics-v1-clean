@@ -48,11 +48,11 @@
 </form>
 {% if profile and profile.provider == 'nextsls' %}
 <section class="panel" id="channel-mapping">
-  <h2>星睿销售服务与 NextSLS 渠道映射</h2>
-  <p>先读取此账号的渠道，再选择实际产品。保存映射只更新代理配置，已审核订单的渠道需在订单页单独更正。</p>
+  <h2>NextSLS 渠道清单与推荐</h2>
+  <p>刷新后，审核页可按名称或代码搜索本账号的渠道。清单有效期 24 小时。推荐仅作选码提示，已审核订单可在订单页单独更正。</p>
   <form method="post" action="{{ url_for('views.edit_agent', agent_id=agent.id, _anchor='channel-mapping') }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    <button type="submit" name="channel_action" value="load" class="secondary">读取 NextSLS 渠道（只读）</button>
+    <button type="submit" name="channel_action" value="load" class="secondary">刷新 NextSLS 渠道（只读）</button>
   </form>
   {% if catalogue %}
   <p>此账号返回 {{ catalogue|length }} 个渠道。清单用于核对代码，创建权限须另行确认。</p>
@@ -66,9 +66,9 @@
       <option value="">请选择供应商渠道</option>
       {% for code, label in catalogue|dictsort %}<option value="{{ code }}"{% if request.form.get('supplier_channel_code') == code %} selected{% endif %}>{{ code }} · {{ label }}</option>{% endfor %}
     </select></label>
-    <button type="submit" name="channel_action" value="save">保存渠道映射</button>
+    <button type="submit" name="channel_action" value="save">保存推荐渠道</button>
   </form>
-  {% elif catalogue is not none %}<p>此账号当前没有返回渠道。</p>{% endif %}
+  {% else %}<p>暂无有效渠道清单，请刷新。</p>{% endif %}
   {% if channel_mappings %}
   <dl class="fields">
     {% for sale, mapping in channel_mappings|dictsort %}<div><dt>{{ sale }}</dt><dd>{{ mapping.code }} · {{ mapping.name }}</dd></div>{% endfor %}

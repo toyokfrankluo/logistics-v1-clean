@@ -102,6 +102,15 @@ function pricingPreview(form) {
   form.querySelector("[data-add-fee]").disabled = rows.length >= 200;
 }
 document.addEventListener("input", event => {
+  if (event.target.matches("[data-channel-search]")) {
+    const select = event.target.closest("[data-channel-picker]").querySelector("select");
+    const query = event.target.value.trim().toLocaleLowerCase();
+    for (const option of select.options) {
+      option.hidden = Boolean(option.value && option.value !== select.value &&
+        !option.textContent.toLocaleLowerCase().includes(query));
+    }
+    return;
+  }
   const form = event.target.closest("[data-pricing]");
   if (form) {
     if (event.target.name !== "confirmed") form.elements.namedItem("confirmed").checked = false;
@@ -111,12 +120,22 @@ document.addEventListener("input", event => {
 document.addEventListener("change", event => {
   const agent = event.target;
   if (agent.name !== "agent_id" || !agent.form?.matches("[data-pricing]")) return;
-  const channel = agent.form.elements.namedItem("agent_service");
-  const selected = agent.selectedOptions[0];
-  const list = selected?.dataset.channelList;
-  channel.value = selected?.dataset.mappedChannel || "";
-  if (list) channel.setAttribute("list", list);
-  else channel.removeAttribute("list");
+  const form = agent.form;
+  const list = agent.selectedOptions[0]?.dataset.channelList;
+  const picker = form.querySelector("[data-channel-picker]");
+  const select = picker.querySelector("select");
+  const manual = form.querySelector("[data-manual-channel]");
+  const input = manual.querySelector("input");
+  const options = list && form.querySelector(`template[data-agent-options="${list}"]`);
+  select.replaceChildren(new Option("请选择实际渠道", ""));
+  if (options) select.append(options.content.cloneNode(true));
+  select.value = "";
+  input.value = "";
+  picker.querySelector("[data-channel-search]").value = "";
+  picker.querySelector("[data-channel-empty]").hidden = select.options.length > 1;
+  picker.hidden = select.disabled = !options;
+  manual.hidden = input.disabled = Boolean(options) || !agent.value;
+  form.elements.namedItem("confirmed").checked = false;
 });
 document.addEventListener("click", event => {
   const button = event.target.closest("[data-add-fee], [data-remove-fee]");

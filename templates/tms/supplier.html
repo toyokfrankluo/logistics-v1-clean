@@ -13,7 +13,7 @@
   <dl class="fields">
     <div><dt>客户单号</dt><dd>{{ invoice.customer_number }}</dd></div>
     <div><dt>代理</dt><dd>{{ supplier.agent_name }}</dd></div>
-    <div><dt>实际渠道代码</dt><dd>{{ order.agent_service }}</dd></div>
+    <div><dt>实际代理渠道</dt><dd>{{ invoice.supplier_channel.name ~ ' · ' if invoice.supplier_channel else '' }}{{ order.agent_service }}</dd></div>
     <div><dt>箱数</dt><dd>{{ invoice.boxes|length }}</dd></div>
     <div><dt>申报信息</dt><dd>{{ invoice.declarations|length }} 项 · {{ totals.value }} USD · {{ invoice.metadata.declaration_mode }}</dd></div>
     <div><dt>目的地</dt><dd>{{ invoice.address.recipient }} · {{ [invoice.address.street, invoice.address.street2, invoice.address.street3, invoice.address.city, invoice.address.region, invoice.address.postal_code, invoice.address.country]|select|join(' · ') }}</dd></div>
@@ -37,9 +37,12 @@
     <form method="post" action="{{ url_for('tms_staff.supplier_action', order_id=order.id) }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <input type="hidden" name="revision" value="{{ order.revision }}">
-      <label>已配置的实际渠道代码<select name="channel_code" required><option value="">请选择</option>
-        {% for code in supplier.channel_choices if code != order.agent_service %}<option>{{ code }}</option>{% endfor %}
-      </select></label>
+      <div data-channel-picker>
+        <label>搜索渠道名称或代码<input type="search" data-channel-search placeholder="输入渠道名称或代码"></label>
+        <label>实际代理运输渠道<select name="channel_code" required><option value="">请选择</option>
+          {% for code, name in supplier.channel_choices|dictsort %}<option value="{{ code }}">{{ name }} · {{ code }}</option>{% endfor %}
+        </select></label>
+      </div>
       <label>更正原因<input name="channel_reason" maxlength="200" required></label>
       <button class="secondary" name="action" value="channel">保存渠道更正</button>
     </form>

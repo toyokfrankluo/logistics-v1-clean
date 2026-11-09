@@ -416,12 +416,10 @@ def _save_agent_settings(agent, form, ready):
                 and (not form.get("app_token", "").strip() or (old_host and agent.app_token == old_config[2]))):
             raise nextsls.ProtocolError("切换 NextSLS 租户时，请填写目标账号的 App Token。")
     if profile and old_config != (agent.api_url, agent.app_key, agent.app_token, agent.customer_code):
-        mappings = tms_carriers.channel_mappings(profile)
-        if agent.app_token != old_config[2] and mappings:
-            profile.service_codes = [code for code in profile.service_codes
-                                     if code not in {item["code"] for item in mappings.values()}]
-            mappings = {}
-        profile.verified = {tms_carriers.CHANNEL_MAPPINGS: mappings} if mappings else {}
+        profile.verified = {}
+    if profile and (not agent.is_active or not agent.supports_api):
+        profile.verified = {key: value for key, value in profile.verified.items()
+                            if key != tms_carriers.CHANNEL_CATALOGUE}
 
 
 @views.route("/agents", methods=["GET", "POST"])
@@ -471,23 +469,26 @@ def edit_agent(agent_id):
         abort(404)
     ready = tms_carriers.carrier_schema()
     profile = db.session.get(TmsAgentApi, a.id) if ready else None
-    catalogue = None
     if channel_action:
         if channel_action not in {"load", "save"}:
             abort(400)
         try:
+            origin = profile.base_url if profile else None
+            token = a.app_token
             catalogue = tms_carriers.read_channel_catalogue(profile, a)
+            db.session.refresh(a, with_for_update=True)
+            db.session.refresh(profile, with_for_update=True)
+            if (profile.provider != "nextsls" or "create" not in profile.enabled or profile.base_url != origin
+                    or a.app_token != token or not a.is_active or not a.supports_api
+                    or not nextsls.legacy_tenant_matches(a.api_url, origin)):
+                raise nextsls.ProtocolError("代理配置已经变更，请重新读取渠道。")
+            tms_carriers.store_channel_catalogue(profile, catalogue)
             if channel_action == "save":
-                origin, token = profile.base_url, a.app_token
-                db.session.refresh(a, with_for_update=True)
-                db.session.refresh(profile, with_for_update=True)
-                if (profile.provider != "nextsls" or "create" not in profile.enabled or profile.base_url != origin
-                        or a.app_token != token or not a.is_active or not a.supports_api):
-                    raise nextsls.ProtocolError("代理配置已经变更，请重新读取渠道。")
                 tms_carriers.save_channel_mapping(profile, catalogue, request.form.get("sales_service", ""),
                                                   request.form.get("supplier_channel_code", ""))
-                db.session.commit()
-                flash("渠道映射已保存，适用于后续选码。", "success")
+            db.session.commit()
+            flash("推荐渠道已保存，审核时仍需手动选择。" if channel_action == "save"
+                  else f"已更新此账号的 {len(catalogue)} 个渠道。", "success")
         except nextsls.ProtocolError as error:
             db.session.rollback()
             flash(str(error), "danger")
@@ -530,7 +531,7 @@ def edit_agent(agent_id):
     return render_template("edit_agent.html", agent=a, legacy_url=legacy_url,
                            integration_ready=ready, profile=profile, providers=tms_carriers.PROVIDERS,
                            capabilities=nextsls.CAPABILITIES, endpoints=endpoints, blocked=blocked,
-                           catalogue=catalogue, sales_services=tms_carriers.SERVICES,
+                           catalogue=tms_carriers.channel_catalogue(profile), sales_services=tms_carriers.SERVICES,
                            channel_mappings=tms_carriers.channel_mappings(profile))
 
 

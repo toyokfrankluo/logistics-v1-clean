@@ -200,8 +200,16 @@ def create_payload(invoice, code, reference, profile, sender):
     requirements = profile.get("require_declaration_list")
     if not isinstance(requirements, list) or any(not isinstance(key, str) for key in requirements):
         raise ProtocolError("渠道的产品申报必填项待核实。")
+    supported = DECLARATIONS.keys() | {"unit_value", "qty", "is_battery"}
+    unsupported = sorted(set(requirements) - supported)
+    blockers = []
     if required_flag(profile, "packing_list_required"):
-        raise ProtocolError("渠道要求额外装箱单附件，附件传输规则待核实。")
+        blockers.append("渠道要求额外装箱单附件，附件传输规则待核实")
+    if unsupported:
+        known = sorted(set(unsupported) & {"amazon_ref_id", "brand", "model", "photos", "weight", "size"})
+        blockers.append("当前发票映射不支持该渠道的全部必填申报字段" + (f"（{', '.join(known)}）" if known else ""))
+    if blockers:
+        raise ProtocolError("；".join(blockers) + "。")
     parcels = {}
     for box in invoice["boxes"]:
         number = supplied_text(box["box_number"], 50)

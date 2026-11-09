@@ -14,7 +14,7 @@
 </dl>
 {% if order.rejection_reason %}<p class="error">驳回原因：{{ order.rejection_reason }}</p>{% endif %}
 {% if staff %}
-<p class="notice">客户：{{ customer.name }}{% if order.agent_service %} · 代理服务：{{ order.agent_service }}{% endif %}</p>
+<p class="notice">客户：{{ customer.name }}{% if order.agent_service %} · 代理服务：{{ invoice.supplier_channel.name ~ ' · ' if invoice.supplier_channel else '' }}{{ order.agent_service }}{% endif %}</p>
 {% if supplier and not supplier.supplier_number and (not supplier.link or supplier.link.state == 'new') %}
 <a class="button" href="#supplier-order">待提交代理 · 核对下单</a>
 {% endif %}
