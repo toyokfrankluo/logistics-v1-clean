@@ -34,7 +34,7 @@
   {% endif %}
   {% if supplier.can_prepare %}
   <details><summary>补充 NextSLS 下单资料</summary>
-    <p>请先选定实际代理渠道。逐条填写有来源的资料；Amazon 参考号请从对应的 Amazon 发货资料核对。</p>
+    <p>请先选定实际代理渠道。Amazon 参考号请从对应的 Amazon 发货资料核对。商品确实没有型号时，可填「无」。</p>
     <form method="post" action="{{ url_for('tms_staff.supplier_action', order_id=order.id) }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <input type="hidden" name="revision" value="{{ order.revision }}">
@@ -55,7 +55,7 @@
       <label>装箱单授权 HTTPS 链接<input type="url" name="packing_url" maxlength="500" autocomplete="off"
         placeholder="{{ '已保存，留空保留原链接' if packing else '填写已获授权的文件链接' }}"></label>
       {% if packing %}<label class="check-label"><input type="checkbox" name="remove_packing" value="yes">移除已保存的装箱单链接</label>{% endif %}
-      <p class="muted">商品原图保留在发票内。装箱单在供应商确认本渠道接受的方式后才会随下单请求传输。</p>
+      <p class="muted">系统从发票 O 列按申报行读取商品图片，无需重复上传。装箱单在供应商确认本渠道接受的方式后才会随下单请求传输。</p>
       <button class="secondary" name="action" value="prepare">保存下单资料</button>
     </form>
   </details>

@@ -1,5 +1,4 @@
 """Phase 2 regression checks. All accounts, addresses and workbooks are synthetic."""
-from base64 import b64decode
 from datetime import datetime
 from decimal import Decimal
 import io
@@ -11,22 +10,32 @@ import tempfile
 import unittest
 from unittest.mock import patch
 from xml.etree.ElementTree import SubElement, fromstring, tostring
-from zipfile import ZipFile
+from zipfile import ZIP_DEFLATED, ZipFile
 
 from openpyxl import load_workbook
+from openpyxl.drawing.image import Image as SheetImage
+from openpyxl.drawing.spreadsheet_drawing import AnchorMarker, TwoCellAnchor
+from PIL import Image
 
 os.environ["LOGISTICS_ISOLATED"] = "1"
 
 from werkzeug.security import check_password_hash, generate_password_hash
 from app import app, User
 from models import BankAccount, CarrierAgent, Customer, Shipment, db
-from tms_invoice import InvoiceError, SERVICES, blank_invoice, parse_invoice
+from tms_invoice import InvoiceError, SERVICES, blank_invoice, parse_invoice, product_photos
 from tms_models import (TmsAccount, TmsAddressBook, TmsAgentApi, TmsAudit, TmsChargeAdjustment, TmsOrder, TmsReceivable,
                         TmsSupplierEvent, TmsSupplierOrder)
 from tms_xlsx_images import XLSX_NS
 
 
-PNG = b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j72sAAAAASUVORK5CYII=")
+def photo_bytes(color="red", image_format="PNG"):
+    output = io.BytesIO()
+    Image.new("RGB", (4, 3), color).save(output, format=image_format)
+    return output.getvalue()
+
+
+PNG = photo_bytes()
+FLOATING_PHOTOS = (PNG, photo_bytes("green", "JPEG"), photo_bytes("blue"))
 REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 DRAWING_NS = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
 ART_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
@@ -78,6 +87,28 @@ def with_wps_photo(raw):
             </Relationships>""")
         output.writestr("xl/media/demo.png", PNG)
     return target.getvalue()
+
+
+def floating_workbook(*, cells=("O23", "O24", "O25"), single=False, service="UPS红单"):
+    def add_photos(book):
+        sheet = book["星睿发票"]
+        sheet["D5"] = service
+        if single:
+            sheet["D15"] = 1
+            for row in (24, 25):
+                for col in "ABCDEFGHJKLMNO":
+                    sheet[f"{col}{row}"] = None
+        sheet.add_image(SheetImage(io.BytesIO(photo_bytes("yellow"))), "A1")
+        book["服务选项"].add_image(SheetImage(io.BytesIO(photo_bytes("black"))), "O23")
+        for index, (cell, data) in enumerate(zip(cells, FLOATING_PHOTOS)):
+            image = SheetImage(io.BytesIO(data))
+            if index == 1 and cell == "O24":
+                image.anchor = TwoCellAnchor(
+                    _from=AnchorMarker(col=14, row=23), to=AnchorMarker(col=15, row=24))
+                sheet.add_image(image)
+            else:
+                sheet.add_image(image, cell)
+    return workbook_bytes(change=add_photos, pictures=())
 
 
 class InvoiceParsingTests(unittest.TestCase):
@@ -201,6 +232,51 @@ class InvoiceParsingTests(unittest.TestCase):
                              f'<xdr:wsDr xmlns:xdr="{DRAWING_NS}" xmlns:a="{ART_NS}" xmlns:r="{REL_NS}">{anchors}</xdr:wsDr>')
         invoice = parse_invoice(output.getvalue())
         self.assertEqual([item["image_part"] for item in invoice["declarations"]], ["xl/media/demo.png"] * 3)
+
+    def test_floating_photos_keep_row_order_and_ignore_logo_and_other_sheets(self):
+        raw = floating_workbook()
+        invoice = parse_invoice(raw)
+        self.assertEqual([(item["box_number"], item["image_cell"]) for item in invoice["declarations"]],
+                         [("0001", "O23"), ("0001", "O24"), ("0002", "O25")])
+        self.assertEqual(product_photos(raw, invoice), list(zip(
+            ("image/png", "image/jpeg", "image/png"), FLOATING_PHOTOS)))
+        # Historical orders stored image_part, without the worksheet cell.
+        for item in invoice["declarations"]:
+            item.pop("image_cell")
+        self.assertEqual([data for _, data in product_photos(raw, invoice)], list(FLOATING_PHOTOS))
+        invoice["declarations"][0]["image_part"] = invoice["declarations"][1]["image_part"]
+        with self.assertRaisesRegex(InvoiceError, "O23.*申报不一致"):
+            product_photos(raw, invoice)
+
+    def test_single_product_floating_photo(self):
+        raw = floating_workbook(cells=("O23",), single=True)
+        invoice = parse_invoice(raw)
+        self.assertEqual(len(invoice["boxes"]), 1)
+        self.assertEqual(product_photos(raw, invoice), [("image/png", PNG)])
+
+    def test_duplicate_and_misaligned_floating_photos_are_not_guessed(self):
+        for cells, expected in (
+            (("O23", "O23", "O25"), "O23.*多张"),
+            (("N23", "O24", "O25"), "O23.*产品图片"),
+            (("O26", "O24", "O25"), "O23.*产品图片.*A26"),
+        ):
+            with self.subTest(cells=cells), self.assertRaisesRegex(InvoiceError, expected):
+                parse_invoice(floating_workbook(cells=cells))
+
+    def test_malformed_and_oversized_image_content_is_rejected(self):
+        for data, error in (
+            (PNG[:32], "损坏"), (FLOATING_PHOTOS[1], "扩展名与内容不符"),
+            (PNG + b"x" * (2 * 1024 * 1024), "单张产品图片"),
+            (PNG.replace(b"IDAT", b"iDAT", 1), "损坏"),
+        ):
+            with self.subTest(error=error):
+                output = io.BytesIO()
+                with ZipFile(io.BytesIO(workbook_bytes())) as original, ZipFile(output, "w", ZIP_DEFLATED) as archive:
+                    for entry in original.infolist():
+                        archive.writestr(entry.filename,
+                                         data if entry.filename == "xl/media/demo.png" else original.read(entry))
+                with self.assertRaisesRegex(InvoiceError, f"O23.*{error}"):
+                    parse_invoice(output.getvalue())
 
     def test_declared_total_rounds_like_invoice(self):
         def fractions(book):

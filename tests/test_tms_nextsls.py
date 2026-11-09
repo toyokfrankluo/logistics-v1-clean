@@ -1,5 +1,6 @@
 """NextSLS fixtures use synthetic orders and an entirely simulated carrier transport."""
 from datetime import datetime, timedelta
+from functools import partial
 from io import BytesIO
 from types import SimpleNamespace
 import unittest
@@ -258,6 +259,11 @@ class NextSLSTests(unittest.TestCase):
         self.profile()
         paths = []
         matches = []
+        photo_uploads = []
+
+        def publish(mime, data):
+            photo_uploads.append((mime, data))
+            return "https://files.example.com/mock-photo.png"
 
         def fake(target, *, json, headers):
             path = target.api_url.split("/")[-1]
@@ -265,12 +271,17 @@ class NextSLSTests(unittest.TestCase):
             if path == "get_services":
                 return success({"services": [SERVICE]})
             if path == "create":
+                self.assertEqual(json["shipment"]["parcels"][0]["declarations"][0]["photo_url"],
+                                 "https://files.example.com/mock-photo.png")
                 raise carrier_http.CarrierRequestError("sensitive data never shown")
             self.assertEqual(path, "list")
             ref = json["shipment"]["client_reference"]
             return success({"shipment": [{"shipment_id": SUPPLIER_NUMBER, "client_reference": ref}] if matches else []})
 
-        with patch.dict(app.config, TMS_NEXTSLS_CREATE_ENABLED=True, TMS_NEXTSLS_READ_ENABLED=True), patch("carrier_http.post", side_effect=fake):
+        send_mock = partial(tms_carriers.send_order, transport=fake, photo_publisher=publish)
+        with patch.dict(app.config, TMS_NEXTSLS_CREATE_ENABLED=True, TMS_NEXTSLS_READ_ENABLED=True), patch(
+            "carrier_http.post", side_effect=fake,
+        ), patch("tms_carriers.send_order", side_effect=send_mock):
             self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 302)
             self.assertEqual(db.session.get(TmsSupplierOrder, order_id).state, "uncertain")
             self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 400)
@@ -281,6 +292,7 @@ class NextSLSTests(unittest.TestCase):
             matches.append(True)
             self.assertEqual(self.action(order_id, "reconcile").status_code, 302)
         self.assertEqual(paths, ["get_services", "create", "list", "list"])
+        self.assertEqual(photo_uploads, [("image/png", fixture.PNG)] * 3)
         self.assertEqual(db.session.get(TmsSupplierOrder, order_id).supplier_number, SUPPLIER_NUMBER)
         self.assertNotIn("sensitive data", self.get(self.staff, f"/tms/admin/orders/{order_id}").get_data(as_text=True))
 
@@ -320,7 +332,7 @@ class NextSLSTests(unittest.TestCase):
     def test_b888_invoice_to_mock_create_uses_confirmed_supplement_and_one_reservation(self):
         self.profile(service_codes=["B888"])
         self.sign_in(self.alice, "customer-a")
-        raw = fixture.workbook_bytes(change=lambda book: book["星睿发票"].__setitem__("D5", "超级经济线卡派"))
+        raw = fixture.floating_workbook(service="超级经济线卡派")
         upload = self.upload(self.alice, raw)
         self.assertEqual(upload.status_code, 302)
         order_id = int(upload.location.rsplit("/", 1)[-1])
@@ -332,7 +344,11 @@ class NextSLSTests(unittest.TestCase):
                           "require_declaration_list": ["amazon_ref_id", "name_zh", "name_en", "unit_value",
                                                        "qty", "material", "usage", "brand", "model", "hscode"]}
         attachment = "https://files.example.com/packing.pdf?download=fixture"
-        calls, requests = [], []
+        calls, requests, photos = [], [], []
+
+        def publish(mime, data):
+            photos.append((mime, data))
+            return f"https://files.example.com/photo-{len(photos)}?download=fixture"
 
         def mock(target, *, json, headers):
             path = target.api_url.rsplit("/", 1)[-1]
@@ -344,7 +360,10 @@ class NextSLSTests(unittest.TestCase):
             requests.append(json["shipment"])
             return success({"shipment": {"shipment_id": SUPPLIER_NUMBER}})
 
-        with patch.dict(app.config, TMS_NEXTSLS_CREATE_ENABLED=True), patch("carrier_http.post", side_effect=mock):
+        send_mock = partial(tms_carriers.send_order, transport=mock, photo_publisher=publish)
+        with patch.dict(app.config, TMS_NEXTSLS_CREATE_ENABLED=True), patch(
+            "tms_carriers.send_order", side_effect=send_mock,
+        ):
             incomplete = self.action(order_id, "create", confirm="yes")
             self.assertIn("请逐条补充申报：Amazon 参考号、品牌、型号", incomplete.get_data(as_text=True))
             self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
@@ -359,6 +378,7 @@ class NextSLSTests(unittest.TestCase):
             response = self.action(order_id, "create", confirm="yes")
             self.assertIn("待供应商确认创建时使用订单附件链接", response.get_data(as_text=True))
             self.assertNotIn(attachment, response.get_data(as_text=True))
+            self.assertEqual(photos, [])
             with patch.dict(app.config, TMS_NEXTSLS_PACKING_ATTACHMENT_HOST="files.example.com"):
                 self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 302)
                 self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 400)
@@ -373,14 +393,55 @@ class NextSLSTests(unittest.TestCase):
         self.assertNotIn("from_address", payload)
         self.assertEqual(payload["attachments"], [{"name": "packing.pdf", "file_type": "order", "url": attachment}])
         self.assertEqual([len(box["declarations"]) for box in payload["parcels"]], [2, 1])
+        declarations = [row for box in payload["parcels"] for row in box["declarations"]]
+        self.assertEqual([row["photo_url"] for row in declarations],
+                         [f"https://files.example.com/photo-{i}?download=fixture" for i in (1, 2, 3)])
+        self.assertEqual(photos, list(zip(("image/png", "image/jpeg", "image/png"), fixture.FLOATING_PHOTOS)))
+        self.assertFalse(any("photos" in row or "image_part" in row for row in declarations))
         declaration = payload["parcels"][1]["declarations"][0]
         self.assertEqual(declaration["amazon_ref_id"], fields["supplement_2_amazon_ref_id"])
         self.assertEqual(declaration["brand"], fields["supplement_2_brand"])
         self.assertEqual(declaration["model"], fields["supplement_2_model"])
         self.assertEqual((link.supplier_number, link.state), (SUPPLIER_NUMBER, "linked"))
         detail = self.get(self.alice, upload.location).get_data(as_text=True)
-        for private in (SUPPLIER_NUMBER, attachment, "packing.pdf", "fixture-brand"):
+        for private in (SUPPLIER_NUMBER, attachment, "packing.pdf", "fixture-brand", "files.example.com/photo"):
             self.assertNotIn(private, detail)
+        self.assertEqual(db.session.get(TmsOrder, order_id).workbook, raw)
+
+    def test_photo_mock_cannot_enable_real_bc_create(self):
+        order_id = self.approve()
+        profile = self.profile(service_codes=["B888"])
+        profile.base_url = "https://bckjkj.nextsls.com"
+        self.agent.api_url = profile.base_url + "/api/v5/shipment/get_tracking"
+        order = db.session.get(TmsOrder, order_id)
+        order.agent_service = "B888"
+        db.session.commit()
+        with patch.dict(app.config, ISOLATED_MODE=False, TMS_NEXTSLS_CREATE_ENABLED=True,
+                        TMS_NEXTSLS_READ_ENABLED=True, TMS_NEXTSLS_CREATE_ORDER_ID=str(order_id)), patch(
+            "carrier_http.post",
+        ) as request:
+            with self.assertRaisesRegex(nextsls.ProtocolError, "真实商品图片传输"):
+                tms_carriers.send_order(order, 1)
+            with self.assertRaisesRegex(nextsls.ProtocolError, "隔离模拟"):
+                tms_carriers.send_order(order, 1, transport=request, photo_publisher=lambda *_: None)
+            request.assert_not_called()
+        self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
+
+    def test_photo_url_requires_verified_reference_and_cannot_replace_photos(self):
+        invoice = fixture.parse_invoice(fixture.workbook_bytes())
+        profile = SERVICE | {"require_declaration_list": ["photo_url"]}
+        def payload(publisher=None):
+            return nextsls.create_payload(invoice, "TMS_DEMO", "XR-DEMO", profile, {}, publish_photos=publisher)
+        with self.assertRaisesRegex(nextsls.ProtocolError, "图片链接传输尚未获准"):
+            payload()
+        with self.assertRaisesRegex(nextsls.ProtocolError, "链接数量"):
+            payload(lambda: ["https://files.example.com/image.png"])
+        for unsafe in ("http://files.example.com/image.png", "https://a:b@files.example.com/image.png", "O23"):
+            with self.subTest(unsafe=unsafe), self.assertRaisesRegex(nextsls.ProtocolError, "HTTPS"):
+                payload(lambda: [unsafe] * 3)
+        profile["require_declaration_list"] = ["photos"]
+        with self.assertRaisesRegex(nextsls.ProtocolError, "photos"):
+            payload(lambda: self.fail("未确认 photos 协议时不能调用图片发布器"))
 
     def test_create_requires_configured_channel_and_live_account_visibility(self):
         order_id = self.approve()

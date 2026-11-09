@@ -14,7 +14,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from models import CarrierAgent, Shipment, db
 import nextsls
 import tms_measurements as measurements
-from tms_invoice import SERVICES
+from tms_invoice import InvoiceError, SERVICES, product_photos
 from tms_models import TmsAgentApi, TmsReceivable, TmsSupplierEvent, TmsSupplierOrder
 
 
@@ -162,6 +162,9 @@ def create_blockers(profile, agent, code, order_id):
         blockers.append("审核所选渠道未列入代理的已确认渠道代码")
     if not current_app.config.get("TMS_NEXTSLS_CREATE_ENABLED") and "系统未开放真实下单" not in blockers:
         blockers.append("系统未开放真实下单")
+    if (profile and profile.base_url == "https://bckjkj.nextsls.com"
+            and code in {"B888", "B888-1", "B888-2"} and not current_app.config.get("ISOLATED_MODE")):
+        blockers.append("该渠道的真实商品图片传输尚待供应商确认")
     if current_app.config.get("TMS_NEXTSLS_CREATE_ENABLED") and not current_app.config.get("ISOLATED_MODE"):
         if current_app.config.get("TMS_NEXTSLS_CREATE_ORDER_ID") != str(order_id):
             blockers.append("此订单不在本次真实下单授权范围内")
@@ -234,7 +237,9 @@ def attach_number(shipment, link, number):
     shipment.shipment_id = number
 
 
-def send_order(order, actor_id, *, transport=None):
+def send_order(order, actor_id, *, transport=None, photo_publisher=None):
+    if photo_publisher is not None and (transport is None or not current_app.config.get("ISOLATED_MODE")):
+        raise nextsls.ProtocolError("商品图片发送目前只允许在隔离模拟中验证。")
     agent = db.session.get(CarrierAgent, order.agent_id) if order.agent_id else None
     blockers = create_blockers(agent_profile(order.agent_id) if agent else None, agent, order.agent_service, order.id)
     if blockers:
@@ -258,9 +263,18 @@ def send_order(order, actor_id, *, transport=None):
             or shipment.shipment_id or (link and link.state != "new")):
         raise nextsls.ProtocolError("订单或代理配置已变化，请刷新后重新核对。")
     link = link or ensure_link(order)
+
+    def publish_photos():
+        try:
+            photos = product_photos(order.workbook, order.invoice)
+        except InvoiceError as exc:
+            raise nextsls.ProtocolError(str(exc)) from None
+        return [photo_publisher(mime, data) for mime, data in photos]
+
     payload = nextsls.create_payload(
         order.invoice, code, link.client_reference, service, profile.sender, supplement=order_supplement(order),
         packing_host=current_app.config.get("TMS_NEXTSLS_PACKING_ATTACHMENT_HOST", ""),
+        publish_photos=publish_photos if photo_publisher is not None else None,
     )
     transition(link, "new", "sending", attempt_at=datetime.utcnow(), tenant_origin=origin)
     audit(link, "attempt", actor_id, {"state": "sending"})

@@ -34,7 +34,7 @@ from tms_billing import (
     CURRENCIES, FIXED, SETTLEMENT_SOURCES, UNITS, billing_available, confirm_sales_terms, price_form,
     settle_charge, valid_draft,
 )
-from tms_xlsx_images import MEDIA_PART, image_type
+from tms_xlsx_images import PhotoError, read_photo
 import nextsls
 import tms_carriers
 import tms_measurements as measurements
@@ -540,19 +540,16 @@ def product_photo(order, item_index):
     if item_index >= len(items):
         abort(404)
     part = items[item_index].get("image_part")
-    if not part or not MEDIA_PART.fullmatch(part):
-        abort(404)
     try:
         with ZipFile(BytesIO(order.workbook)) as archive:
-            if archive.getinfo(part).file_size > 16 * 1024 * 1024:
-                abort(404)
-            data = archive.read(part)
-    except (BadZipFile, KeyError, RuntimeError):
+            mimetype, data = read_photo(archive, part)
+    except (BadZipFile, PhotoError, RuntimeError):
         abort(404)
-    mimetype = image_type(part, data)
-    if mimetype is None:
-        abort(404)
-    return send_file(BytesIO(data), mimetype=mimetype, download_name="product-photo")
+    response = send_file(BytesIO(data), mimetype=mimetype, download_name="product-photo")
+    response.cache_control.private = True
+    response.cache_control.no_store = True
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
 
 
 @client.get("/orders/<int:order_id>/photos/<int:item_index>")

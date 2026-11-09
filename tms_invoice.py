@@ -18,8 +18,8 @@ from openpyxl.worksheet.datavalidation import DataValidation
 from xml.etree.ElementTree import ParseError, fromstring
 
 from tms_xlsx_images import (
-    PHOTO_CELL, WPS_IMAGE_FORMULA, XLSX_NS, anchored_images, invoice_sheet_part,
-    valid_media, wps_images,
+    PHOTO_CELL, WPS_IMAGE_FORMULA, XLSX_NS, PhotoError, anchored_images, invoice_sheet_part,
+    read_photo, validate_photos, wps_images,
 )
 
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024
@@ -135,7 +135,10 @@ def workbook_from_bytes(raw):
                 if name == invoice_part or re.fullmatch(r"xl/worksheets/[^/]+\.xml", name, re.IGNORECASE):
                     check_sheet_xml(archive.read(entry), image_refs,
                                     invoice_photos=photos if name == invoice_part else None)
+            validate_photos(archive, photos)
         book = load_workbook(BytesIO(raw), read_only=True, data_only=False, keep_links=False)
+    except PhotoError as exc:
+        raise InvoiceError(str(exc)) from None
     except (BadZipFile, InvalidFileException, KeyError, ValueError, OSError, ParseError,
             RuntimeError, EOFError, NotImplementedError, CompressionError, TokenizerError) as exc:
         if isinstance(exc, InvoiceError):
@@ -378,7 +381,7 @@ def parse_invoice(raw):
                 "unit_price_usd": unit_price, "quantity": quantity,
                 "total_usd": format(total, "f"),
                 "battery": yes_no(row[13], f"第 {line} 行是否带电"),
-                "image_part": photos[f"O{line}"],
+                "image_part": photos[f"O{line}"], "image_cell": f"O{line}",
             })
         if number(rows[14][3], "D15（箱数）", whole=True) != len(boxes):
             raise InvoiceError("发票箱数与不同箱号的数量不一致。")
@@ -387,6 +390,25 @@ def parse_invoice(raw):
             "address_code": address_code, "address": address, "address_source": "workbook", "flags": flags,
             "metadata": metadata, "boxes": list(boxes.values()), "declarations": declarations,
         }
+
+
+def product_photos(raw, invoice):
+    """Recheck saved declaration order against the original workbook before transmission."""
+    original = parse_invoice(raw)
+    items = invoice["declarations"]
+    fields = ("box_number", "name_zh", "name_en", "material", "usage", "hs_code",
+              "unit_price_usd", "quantity", "battery", "image_part")
+    if (original["customer_number"] != invoice["customer_number"]
+            or len(items) != len(original["declarations"])):
+        raise InvoiceError("保存的产品申报与原始发票不一致，请人工核对。")
+    photos = []
+    with ZipFile(BytesIO(raw)) as archive:
+        for item, source in zip(items, original["declarations"]):
+            if (any(item.get(field) != source[field] for field in fields)
+                    or item.get("image_cell", source["image_cell"]) != source["image_cell"]):
+                raise InvoiceError(f'{source["image_cell"]}（产品图片）与保存的申报不一致，请人工核对。')
+            photos.append(read_photo(archive, source["image_part"]))
+    return photos
 
 
 def parse_box(row, line, boxes):

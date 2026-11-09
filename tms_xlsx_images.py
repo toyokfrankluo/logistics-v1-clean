@@ -1,7 +1,10 @@
 """Read internal Excel/WPS image links without executing worksheet formulas."""
+from io import BytesIO
 import posixpath
 import re
 from xml.etree.ElementTree import fromstring
+
+from PIL import Image
 
 
 XLSX_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
@@ -12,6 +15,13 @@ PHOTO_CELL = re.compile(r"O(?:2[3-9]|[34][0-9]|5[0-2])\Z")
 MEDIA_PART = re.compile(r"xl/media/[A-Za-z0-9_.-]+\.(?:png|jpe?g)\Z", re.IGNORECASE)
 WPS_IMAGE_FORMULA = re.compile(r'(?:_xlfn\.)?DISPIMG\(\s*"(ID_[A-Za-z0-9_-]{1,64})"\s*,\s*[12]\s*\)\Z',
                                re.IGNORECASE)
+MAX_PHOTO_BYTES = 2 * 1024 * 1024
+MAX_PHOTO_TOTAL_BYTES = 8 * 1024 * 1024
+MAX_PHOTO_PIXELS = 12_000_000
+
+
+class PhotoError(ValueError):
+    pass
 
 
 def relations(archive, part, kind):
@@ -20,11 +30,16 @@ def relations(archive, part, kind):
     if rels not in archive.namelist():
         return {}
     result = {}
+    seen = set()
     for entry in fromstring(archive.read(rels)):
+        key = entry.attrib["Id"]
+        if key in seen:
+            raise PhotoError("工作簿包含重复的内部关系，无法唯一关联图片。")
+        seen.add(key)
         if entry.get("TargetMode", "").casefold() == "external" or not entry.get("Type", "").endswith("/" + kind):
             continue
         target = entry.attrib["Target"]
-        result[entry.attrib["Id"]] = posixpath.normpath(
+        result[key] = posixpath.normpath(
             target.lstrip("/") if target.startswith("/") else posixpath.join(folder, target))
     return result
 
@@ -48,11 +63,45 @@ def image_type(part, data):
     return None
 
 
-def valid_media(archive, part):
-    if not part or not MEDIA_PART.fullmatch(part) or part not in archive.namelist():
-        return False
-    with archive.open(part) as file:
-        return bool(image_type(part, file.read(8)))
+def read_photo(archive, part):
+    """Return the original bytes after verifying both the container and decoded image."""
+    if not part or not MEDIA_PART.fullmatch(part):
+        raise PhotoError("产品图片必须是工作簿内嵌的 PNG 或 JPEG。")
+    try:
+        entry = archive.getinfo(part)
+    except KeyError:
+        raise PhotoError("找不到内嵌的产品图片。") from None
+    if entry.file_size > MAX_PHOTO_BYTES:
+        raise PhotoError("单张产品图片不可超过 2 MiB。")
+    data = archive.read(entry)
+    mime = image_type(part, data)
+    if not mime:
+        raise PhotoError("产品图片的扩展名与内容不符。")
+    image_format = "PNG" if mime == "image/png" else "JPEG"
+    try:
+        with Image.open(BytesIO(data), formats=(image_format,)) as image:
+            if image.width * image.height > MAX_PHOTO_PIXELS or getattr(image, "n_frames", 1) != 1:
+                raise PhotoError("产品图片必须为静态图片，且不可超过 1200 万像素。")
+            image.verify()
+        with Image.open(BytesIO(data), formats=(image_format,)) as image:
+            image.load()
+    except PhotoError:
+        raise
+    except (OSError, ValueError, SyntaxError, Image.DecompressionBombError):
+        raise PhotoError("产品图片已损坏或无法解码。") from None
+    return mime, data
+
+
+def validate_photos(archive, photos):
+    sizes = {}
+    for cell, part in photos.items():
+        if part not in sizes:
+            try:
+                sizes[part] = len(read_photo(archive, part)[1])
+            except PhotoError as exc:
+                raise PhotoError(f"{cell}（产品图片）：{exc}") from None
+    if sum(sizes[part] for part in photos.values()) > MAX_PHOTO_TOTAL_BYTES:
+        raise PhotoError("产品申报图片合计不可超过 8 MiB。")
 
 
 def wps_images(archive):
@@ -68,8 +117,8 @@ def wps_images(archive):
             continue
         name = properties.get("name")
         target = media.get(image.get(REL_NS + "embed"))
-        if name and valid_media(archive, target):
-            photos[name] = target
+        if name:
+            photos[name] = None if name in photos else target
     return photos
 
 
@@ -85,15 +134,21 @@ def anchored_images(archive, sheet_part):
             continue
         media = relations(archive, drawing, "image")
         for anchor in fromstring(archive.read(drawing)):
+            if anchor.tag not in (DRAWING_NS + "oneCellAnchor", DRAWING_NS + "twoCellAnchor"):
+                continue
             start = anchor.find(DRAWING_NS + "from")
-            image = anchor.find(DRAWING_NS + "pic/" + DRAWING_NS + "blipFill/" + ART_NS + "blip")
-            if start is None or image is None or start.findtext(DRAWING_NS + "col") != "14":
+            pictures = anchor.findall(DRAWING_NS + "pic")
+            if start is None or not pictures or start.findtext(DRAWING_NS + "col") != "14":
                 continue
             row = start.findtext(DRAWING_NS + "row", "")
             if not re.fullmatch(r"\d{1,2}", row):
                 continue
             cell = f"O{int(row) + 1}"
-            part = media.get(image.get(REL_NS + "embed"))
-            if PHOTO_CELL.fullmatch(cell) and valid_media(archive, part):
-                photos.setdefault(cell, part)
+            if PHOTO_CELL.fullmatch(cell):
+                if cell in photos or len(pictures) != 1:
+                    raise PhotoError(f"{cell}（产品图片）有多张浮动图片，请保留一张。")
+                images = pictures[0].findall(DRAWING_NS + "blipFill/" + ART_NS + "blip")
+                if len(images) != 1:
+                    raise PhotoError(f"{cell}（产品图片）无法读取唯一的内嵌图片。")
+                photos[cell] = media.get(images[0].get(REL_NS + "embed"))
     return photos

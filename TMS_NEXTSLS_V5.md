@@ -61,11 +61,17 @@
 | B–H、N 产品申报 | `declarations` | 按箱归组，写入 `name_en/name_zh/material/usage/hscode/unit_value/qty/is_battery`；币种 `USD` |
 | I 申报总价 | `total_usd` | 本地复算；接口以单价和数量为准 |
 | J–M 箱重及尺寸 | 客户申报 `boxes` | `client_weight/client_length/client_width/client_height`；kg/cm |
-| O 图片、原文件 | 私有导入附件 | 保留在原发票中。NextSLS 的 `photos` 字符串编码及 `photo_url` 能否满足渠道要求仍待确认 |
+| O23–O52 商品图片 | 保留原发票，按行和原货箱号关联内嵌 PNG/JPEG | 隔离 Mock 验证了将原图片字节交给模拟文件服务，并把返回的 HTTPS `photo_url` 写入该箱对应的申报明细 |
 
 在管理员订单详情的「供应商下单 → 补充 NextSLS 下单资料」，逐条申报补充真实的 `amazon_ref_id`、`brand`、`model`。Amazon 参考号从对应 Amazon 发货资料取得，`reference_2` 继续使用发票 PO。补充资料绑定订单选定的代理和渠道。
 
+商品图片从原工作簿提取。只读取发票明细 O 列的一/双单元格浮动锚点及 WPS 内嵌图片公式，校验每行唯一、真实格式、像素及字节大小。其他工作表和表头图片不参与下单。发送前对照原发票重新核验申报顺序及关联，原工作簿不改写。
+
+第 2 章列出申报级的 `photo_url`（图片链接）和 `photos`（图片），均标注为可选字符串。文档未说明 `photos` 编码、图片数量、大小、格式或渠道会否接受 `photo_url`。第 20 章要求已有运单标识，因此它提供的 URL/Base64 附件协议不能当作创建前商品图片上传协议。bc 的 B888、B888-1、B888-2 真实创建继续拦截。供应商确认渠道接受的字段、文件限制及私有传输方式后，才能接通真实图片传输。模拟图片链接只在测试使用，客户页面不展示链接。
+
 第 2 章创建请求支持 `shipment.attachments` 中的文件名、类型和链接。第 20 章上传附件支持 URL 或 Base64，但要求已有可识别的运单。对要求装箱单的渠道，系统先拦截。供应商确认接受创建请求内的 `file_type=order` 附件作为该渠道装箱单后，才可在 Render 配置 `TMS_NEXTSLS_PACKING_ATTACHMENT_HOST` 为获准的 HTTPS 文件域名，并为授权订单补充文件名和文件链接。
+
+bc 的 B888 上次渠道查询为 `packing_list_required=1`。第 11 章将其说明为「装箱单必填」，没有注明在哪个环节校验。Token 未确认轮换，未重新查询该账号。本次保留现有装箱单校验。
 
 ## 实测、费用与利润
 

@@ -170,7 +170,8 @@ def packing_url_host(value):
         raise ProtocolError("装箱单须使用经授权的 HTTPS 文件链接。") from None
 
 
-def create_payload(invoice, code, reference, profile, sender, *, supplement=None, packing_host=""):
+def create_payload(invoice, code, reference, profile, sender, *, supplement=None, packing_host="",
+                   publish_photos=None):
     """Translate a reviewed invoice; do not manufacture fields missing for the selected service."""
     if not CODE.fullmatch(code) or not CODE.fullmatch(reference):
         raise ProtocolError("渠道代码或系统对账参考号无效。")
@@ -218,7 +219,9 @@ def create_payload(invoice, code, reference, profile, sender, *, supplement=None
     if not isinstance(requirements, list) or any(not isinstance(key, str) for key in requirements):
         raise ProtocolError("渠道的产品申报必填项待核实。")
     supplement = supplement or {}
-    supported = DECLARATIONS.keys() | SUPPLEMENTAL_DECLARATIONS.keys() | {"unit_value", "qty", "is_battery"}
+    supported = DECLARATIONS.keys() | SUPPLEMENTAL_DECLARATIONS.keys() | {
+        "unit_value", "qty", "is_battery", "photo_url",
+    }
     unsupported = sorted(set(requirements) - supported)
     blockers = []
     if required_flag(profile, "packing_list_required"):
@@ -241,6 +244,8 @@ def create_payload(invoice, code, reference, profile, sender, *, supplement=None
                                                        for index in range(len(invoice["declarations"])))]
     if missing_fields:
         blockers.append("请逐条补充申报：" + "、".join(missing_fields))
+    if "photo_url" in requirements and publish_photos is None:
+        blockers.append("商品图片链接传输尚未获准")
     if blockers:
         raise ProtocolError("；".join(blockers) + "。")
     parcels = {}
@@ -256,6 +261,7 @@ def create_payload(invoice, code, reference, profile, sender, *, supplement=None
         parcels[number] = {"number": box_code, "reference": number, **dimensions, "declarations": []}
     if not parcels:
         raise ProtocolError("没有可提交的箱货数据。")
+    declarations = []
     for index, item in enumerate(invoice["declarations"]):
         declaration = {target: supplied_text(item.get(source)) for target, source in DECLARATIONS.items()}
         values = supplemental_rows.get(str(index), {})
@@ -267,15 +273,36 @@ def create_payload(invoice, code, reference, profile, sender, *, supplement=None
             raise ProtocolError("产品申报数量无效。")
         declaration.update(unit_value=float(numeric(item["unit_price_usd"])), qty=qty,
                            is_battery=int(item.get("battery") is True))
-        if any(key not in declaration or declaration[key] in (None, "") for key in requirements):
+        if any(key not in declaration or declaration[key] in (None, "")
+               for key in requirements if key != "photo_url"):
             raise ProtocolError("发票缺少代理渠道要求的申报项，请核对渠道规则。")
         if item.get("box_number") not in parcels:
             raise ProtocolError("申报商品没有对应货箱。")
         parcels[item["box_number"]]["declarations"].append(declaration)
+        declarations.append(declaration)
     if any(not parcel["declarations"] for parcel in parcels.values()):
         raise ProtocolError("每个货箱至少需要一项申报。")
+    if publish_photos is not None:
+        urls = publish_photos()
+        if not isinstance(urls, (list, tuple)) or len(urls) != len(declarations):
+            raise ProtocolError("商品图片链接数量与申报行数不一致。")
+        for declaration, url in zip(declarations, urls):
+            declaration["photo_url"] = product_photo_url(url)
     shipment.update(parcels=list(parcels.values()), parcel_count=str(len(parcels)))
     return {"shipment": shipment}
+
+
+def product_photo_url(value):
+    try:
+        url = urlsplit(supplied_text(value, 2048))
+        if (url.scheme != "https" or not url.hostname or url.port not in (None, 443)
+                or url.username is not None or url.password is not None or url.fragment
+                or not url.path.strip("/") or any(char.isspace() or ord(char) < 32 for char in value)
+                or "\\" in value):
+            raise ValueError()
+    except ValueError:
+        raise ProtocolError("商品图片必须使用有效的 HTTPS 文件链接。") from None
+    return value
 
 
 def required_flag(profile, name):
