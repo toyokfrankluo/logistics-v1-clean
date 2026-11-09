@@ -1,8 +1,9 @@
 <div class="import-overview">
   <p class="steps">上传发票 <span>→</span> 核对预览 <span>→</span> 提交审核</p>
   <a class="button secondary" href="{{ url_for('tms_client.template_file') }}">下载备用单票模板（如有）</a>
+  <a class="button secondary" href="{{ url_for('tms_client.template_file', extended=1) }}">下载 {{ max_product_lines }} 行扩展模板</a>
 </div>
-<p>直接上传已有的 11.6 版星睿发票，保留「星睿发票」「地址库」「服务选项」三张表。系统按 L4 编码匹配该文件自带的地址库，无需预先配置。每次上传一份 .xlsx（最多 2 MiB）。</p>
+<p>直接上传已有的 11.6 版星睿发票，保留「星睿发票」「地址库」「服务选项」三张表。系统按 L4 编码匹配文件自带的地址库。扩展模板若没有预填地址，请复制自己原有模板的「地址库」数据。{{ upload_limit }}</p>
 {% if replacement %}<p class="notice">替换 {{ replacement.invoice.customer_number }} 的发票后，订单将回到待确认，需要再次提交审核。</p>{% endif %}
 <form method="post" action="{{ url_for('tms_client.upload') }}" enctype="multipart/form-data" class="invoice-upload">
   <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">

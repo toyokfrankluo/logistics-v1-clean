@@ -23,7 +23,8 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 from models import CarrierAgent, Customer, ManualTrack, Shipment, db
 from tms_invoice import (
-    IDENTIFIER, REQUIRED_ADDRESS, InvoiceError, MAX_UPLOAD_BYTES, SERVICES, address_values,
+    IDENTIFIER, REQUIRED_ADDRESS, InvoiceError, MAX_PRODUCT_LINES, MAX_UPLOAD_BYTES, SERVICES,
+    UPLOAD_LIMIT_TEXT, address_placeholders, address_values,
     blank_invoice, comparable_address, parse_invoice, validated_catalogue,
 )
 from tms_models import (
@@ -101,7 +102,7 @@ def init_tms(app):
             abort(404)
         if request.endpoint in {"tms_client.upload", "tms_staff.address_book"} and request.method == "POST":
             if request.content_length is None or request.content_length > MAX_UPLOAD_BYTES + 64 * 1024:
-                abort(413, "每份 Excel 文件上限为 2 MiB。")
+                abort(413, UPLOAD_LIMIT_TEXT)
 
     @app.after_request
     def protect_tms_responses(response):
@@ -184,7 +185,7 @@ def admin_required():
 def page(template, **context):
     return render_template(
         f"tms/{template}.html", staff=request.blueprint == staff.name,
-        status_labels=STATUS_LABELS, **context,
+        status_labels=STATUS_LABELS, upload_limit=UPLOAD_LIMIT_TEXT, max_product_lines=MAX_PRODUCT_LINES, **context,
     )
 
 
@@ -357,7 +358,7 @@ def read_configured_workbook(path):
         raise InvoiceError("无法读取配置的工作簿，请联系星睿。") from None
 
 
-def customer_catalogue(customer_id):
+def customer_catalogue(customer_id, *, allow_empty=False):
     address_book = db.session.get(TmsAddressBook, customer_id)
     if address_book is not None:
         return address_book.rows
@@ -367,6 +368,8 @@ def customer_catalogue(customer_id):
         return read_configured_workbook(local_catalogue[1])
     directory = config.get("TMS_ADDRESS_BOOK_DIR")
     if not directory:
+        if allow_empty:
+            return None
         raise InvoiceError("暂未提供在线下载的地址库模板。可直接上传已有的星睿三工作表发票。")
     return read_configured_workbook(Path(directory) / f"{customer_id}.xlsx")
 
@@ -389,7 +392,7 @@ def upload():
         return page("upload", error="请选择一份 .xlsx 发票。", replacement=order), 400
     raw = files[0].stream.read(MAX_UPLOAD_BYTES + 1)
     if not raw or len(raw) > MAX_UPLOAD_BYTES:
-        return page("upload", error="每份 .xlsx 文件上限为 2 MiB。", replacement=order), 400
+        return page("upload", error=UPLOAD_LIMIT_TEXT, replacement=order), 400
     customer_id = g.tms_account.customer_id
     try:
         invoice = parse_invoice(raw)
@@ -491,23 +494,26 @@ def order_detail(order, **context):
 
 @client.get("/template")
 def template_file():
+    extended = request.args.get("extended") == "1"
     try:
-        return download_invoice_template(customer_catalogue(g.tms_account.customer_id))
+        return download_invoice_template(customer_catalogue(g.tms_account.customer_id, allow_empty=extended),
+                                         extended=extended)
     except InvoiceError as error:
         return page("upload", error=str(error)), 400
 
 
-def download_invoice_template(catalogue):
+def download_invoice_template(catalogue, *, extended=False):
     layout_path = current_app.config.get("TMS_INVOICE_TEMPLATE_PATH")
     layout = read_configured_workbook(layout_path) if layout_path else None
     result = BytesIO()
-    workbook = blank_invoice(catalogue, layout=layout)
+    workbook = blank_invoice(catalogue, layout=layout, extended=extended)
     try:
         workbook.save(result)
     finally:
         workbook.close()
     result.seek(0)
-    return send_file(result, as_attachment=True, download_name="xingrui-invoice-template.xlsx",
+    filename = "xingrui-invoice-extended.xlsx" if extended else "xingrui-invoice-template.xlsx"
+    return send_file(result, as_attachment=True, download_name=filename,
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
@@ -736,6 +742,12 @@ def staff_detail(order, **context):
         destination = {
             "destination_fields": DESTINATION_FIELDS, "required_destination": REQUIRED_ADDRESS,
             "destination_reference": destination_reference(order),
+            "destination_placeholders": [
+                DESTINATION_FIELDS[key] for key in address_placeholders({
+                    key: request.form.get(f"destination_{key}", order.invoice["address"].get(key, ""))
+                    for key in DESTINATION_FIELDS
+                })
+            ],
         }
     return order_detail(order, agents=agents, agent_channels=channels, mapped_channels=mapped_channels,
                         customer=db.session.get(Customer, order.customer_id),
@@ -880,6 +892,16 @@ def supplier_measurements(order_id):
     return send_file(report, download_name="supplier-measurements.xlsx", as_attachment=True)
 
 
+@staff.get("/orders/<int:order_id>/supplier/packing-draft.xlsx")
+def supplier_packing_draft(order_id):
+    order = reviewable_order(order_id)
+    try:
+        tms_carriers.approved_shipment(order)
+    except nextsls.ProtocolError:
+        abort(404)
+    return send_file(tms_carriers.packing_draft(order), download_name="packing-draft.xlsx", as_attachment=True)
+
+
 @staff.post("/orders/<int:order_id>/decision")
 def decide(order_id):
     order = reviewable_order(order_id)
@@ -948,12 +970,18 @@ def reviewed_invoice(invoice, form):
         raise ValueError("收件地址国家代码须为两位字母。")
     changed = code != invoice["address_code"] or address != original
     reason = form.get("destination_reason", "").strip()
-    if len(reason) > 500 or (changed and not reason):
+    suspicious = address_placeholders(address)
+    if {"mobile", "phone"}.intersection(suspicious):
+        raise ValueError("联系电话或手机含历史模板占位值，请更正或留空。")
+    if suspicious and form.get("destination_verify_73") != "yes":
+        raise ValueError("收件地址含疑似历史模板占位值，请更正，或另行确认后填写核对依据。")
+    if len(reason) > 500 or ((changed or suspicious) and not reason):
         raise ValueError("更正收件地址须填写原因，最多 500 字。")
     return dict(invoice, address_code=code, address=address,
                 submitted_destination={"address_code": invoice["address_code"], "address": original},
                 destination_review={"by": current_user.id, "at": datetime.now(timezone.utc).isoformat(),
-                                    "changed": changed, "reason": reason})
+                                    "changed": changed, "reason": reason,
+                                    "verified_optional": {key: address[key] for key in suspicious}})
 
 
 def save_pricing(order, decision):

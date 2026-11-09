@@ -5,6 +5,7 @@ import io
 import os
 from pathlib import Path
 import re
+from random import Random
 import secrets
 import tempfile
 import unittest
@@ -22,7 +23,7 @@ os.environ["LOGISTICS_ISOLATED"] = "1"
 from werkzeug.security import check_password_hash, generate_password_hash
 from app import app, User
 from models import BankAccount, CarrierAgent, Customer, Shipment, db
-from tms_invoice import InvoiceError, SERVICES, blank_invoice, parse_invoice, product_photos
+from tms_invoice import MAX_UPLOAD_BYTES, InvoiceError, SERVICES, blank_invoice, parse_invoice, product_photos
 from tms_models import (TmsAccount, TmsAddressBook, TmsAgentApi, TmsAudit, TmsChargeAdjustment, TmsOrder, TmsReceivable,
                         TmsSupplierEvent, TmsSupplierOrder)
 from tms_xlsx_images import XLSX_NS
@@ -41,8 +42,9 @@ DRAWING_NS = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawin
 ART_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 
 
-def workbook_bytes(order_number="0000123", code="DEMO-A", *, change=None, recipient="虚构地址甲", pictures=(23, 24, 25)):
-    book = blank_invoice()
+def workbook_bytes(order_number="0000123", code="DEMO-A", *, change=None, recipient="虚构地址甲",
+                   pictures=(23, 24, 25), extended=False):
+    book = blank_invoice(extended=extended)
     address_sheet = book["地址库"]
     address_sheet.append(("虚构仓库", code, "", "", recipient, "", "", "", "1 Fictional Way",
                           "", "", "Test City", "CA", "US", "00001"))
@@ -109,6 +111,31 @@ def floating_workbook(*, cells=("O23", "O24", "O25"), single=False, service="UPS
             else:
                 sheet.add_image(image, cell)
     return workbook_bytes(change=add_photos, pictures=())
+
+
+def expanded_workbook(*, edit=None, large=False):
+    def fill(book):
+        sheet = book["星睿发票"]
+        sheet["D5"], sheet["D15"] = "超级经济线卡派", 21
+        for index in range(36):
+            row, box = 23 + index, index % 21 + 1
+            for column, value in zip("ABCDEFGHJKLMN", (
+                f"{box:04}", f"Item-{index}", f"示例商品{index}", "Paper", "Demo", "00123456",
+                index + 0.25, index + 1, box, 20, 10, 8, "否",
+            )):
+                sheet[f"{column}{row}"] = value
+            if index % 3 == 0:
+                sheet[f"O{row}"] = '=_xlfn.DISPIMG("ID_DEMO",1)'
+                continue
+            data = photo_bytes((index, index * 2, 100), "JPEG")
+            if large and index in (1, 2):
+                output = io.BytesIO()
+                Image.frombytes("RGB", (700, 700), Random(index).randbytes(700 * 700 * 3)).save(output, "PNG")
+                data = output.getvalue()
+            sheet.add_image(SheetImage(io.BytesIO(data)), f"O{row}")
+        if edit:
+            edit(book)
+    return workbook_bytes(change=fill, pictures=(), extended=True)
 
 
 class InvoiceParsingTests(unittest.TestCase):
@@ -253,6 +280,32 @@ class InvoiceParsingTests(unittest.TestCase):
         invoice = parse_invoice(raw)
         self.assertEqual(len(invoice["boxes"]), 1)
         self.assertEqual(product_photos(raw, invoice), [("image/png", PNG)])
+
+    def test_extended_21_boxes_36_rows_mixed_images_and_box_totals(self):
+        raw = expanded_workbook()
+        invoice = parse_invoice(raw)
+        self.assertEqual(len(invoice["boxes"]), 21)
+        self.assertEqual(sum(Decimal(box["weight_kg"]) for box in invoice["boxes"]), 231)
+        self.assertEqual(len(invoice["declarations"]), 36)
+        self.assertEqual(invoice["declarations"][35]["image_cell"], "O58")
+        self.assertEqual(invoice["declarations"][21]["box_number"], "0001")
+        self.assertEqual((invoice["declarations"][35]["quantity"], invoice["declarations"][35]["unit_price_usd"]),
+                         (36, "35.25"))
+        self.assertEqual(product_photos(raw, invoice), [
+            ("image/png", PNG) if index % 3 == 0 else
+            ("image/jpeg", photo_bytes((index, index * 2, 100), "JPEG"))
+            for index in range(36)
+        ])
+
+    def test_extended_layout_and_measurement_failures(self):
+        for cell, value, message in (
+            ("O56", None, "O56.*产品图片"),
+            ("J44", 100, "重复箱号"),
+            ("A83", "unsupported", "汇总行"),
+            ("A87", "extra", "最多"),
+        ):
+            with self.subTest(cell=cell), self.assertRaisesRegex(InvoiceError, message):
+                parse_invoice(expanded_workbook(edit=lambda book: book["星睿发票"].__setitem__(cell, value)))
 
     def test_duplicate_and_misaligned_floating_photos_are_not_guessed(self):
         for cells, expected in (
@@ -586,13 +639,60 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(self.alice.post("/tms/customer/import", data={
             "invoice": (io.BytesIO(workbook_bytes()), "fictional.xlsx"),
         }).status_code, 400)
-        self.assertEqual(self.upload(self.alice, b"x" * (3 * 1024 * 1024)).status_code, 413)
+        self.assertEqual(self.upload(self.alice, b"x" * (MAX_UPLOAD_BYTES + 1)).status_code, 400)
+        self.assertEqual(self.upload(self.alice, b"x" * (MAX_UPLOAD_BYTES + 128 * 1024)).status_code, 413)
         response = self.get(self.alice, "/tms/customer/template")
         self.assertEqual(response.status_code, 200)
         self.assertIn("attachment", response.headers["Content-Disposition"])
         with patch.dict(app.config, TMS_ENABLED=False):
             self.assertEqual(self.get(self.alice, "/tms/customer/login").status_code, 404)
         self.assertEqual(TmsOrder.query.count(), 0)
+
+    def test_extended_download_and_upload_above_previous_limit(self):
+        self.sign_in(self.alice, "customer-a")
+        response = self.get(self.alice, "/tms/customer/template?extended=1")
+        self.assertEqual(response.status_code, 200)
+        book = load_workbook(io.BytesIO(response.data))
+        self.assertEqual(book.sheetnames, ["星睿发票", "地址库", "服务选项"])
+        self.assertEqual(book["星睿发票"]["G84"].value, "=SUM(H23:H82)")
+        self.assertEqual(book["星睿发票"]["I82"].value,
+                         '=IF(OR(G82="",H82=""),"",ROUND(G82*H82,2))')
+        self.assertEqual(book["地址库"]["B2"].value, "DEMO-A")
+        book.close()
+        raw = expanded_workbook(large=True)
+        self.assertTrue(2 * 1024 * 1024 < len(raw) < MAX_UPLOAD_BYTES)
+        response = self.upload(self.alice, raw)
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(len(TmsOrder.query.one().invoice["declarations"]), 36)
+
+    def test_placeholder_correction_preserves_original_and_requires_audit(self):
+        self.sign_in(self.alice, "customer-a")
+        def placeholder(book):
+            sheet = book["地址库"]
+            for col in "CHJK":
+                sheet[f"{col}2"] = 73
+            sheet["I2"] = "73 Fictional Road"
+        raw = workbook_bytes(change=placeholder)
+        result = self.upload(self.alice, raw)
+        self.assertEqual(result.status_code, 302)
+        order_id = int(result.location.rsplit("/", 1)[-1])
+        self.assertEqual(self.post(self.alice, result.location + "/confirm", {"revision": 1}).status_code, 302)
+        self.staff_login()
+        page = self.get(self.staff, f"/tms/admin/orders/{order_id}").get_data(as_text=True)
+        self.assertIn("疑似历史占位值", page)
+        self.assertEqual(self.decision(order_id, 2, decision="approve", **self.pricing()).status_code, 400)
+        self.assertEqual(self.decision(order_id, 2, decision="approve", **self.pricing(
+            destination_mobile="", destination_reason="示例仓库已核实")).status_code, 400)
+        self.assertEqual(self.decision(order_id, 2, decision="approve", **self.pricing(
+            destination_mobile="", destination_street3="", destination_verify_73="yes",
+            destination_reason="核实门牌附加段确为 73")).status_code, 302)
+        order = TmsOrder.query.one()
+        self.assertEqual(order.workbook, raw)
+        self.assertEqual(order.invoice["submitted_destination"]["address"]["mobile"], "73")
+        self.assertEqual(order.invoice["address"]["street"], "73 Fictional Road")
+        self.assertEqual(order.invoice["address"]["mobile"], "")
+        self.assertEqual(order.invoice["destination_review"]["verified_optional"], {"street2": "73"})
+        self.assertEqual(TmsAudit.query.filter_by(order_id=order_id, action="approve").count(), 1)
 
     def test_download_preserves_layout_and_includes_only_assigned_catalogue(self):
         self.sign_in(self.alice, "customer-a")

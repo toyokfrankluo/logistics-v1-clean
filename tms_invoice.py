@@ -18,11 +18,15 @@ from openpyxl.worksheet.datavalidation import DataValidation
 from xml.etree.ElementTree import ParseError, fromstring
 
 from tms_xlsx_images import (
-    PHOTO_CELL, WPS_IMAGE_FORMULA, XLSX_NS, PhotoError, anchored_images, invoice_sheet_part,
-    read_photo, validate_photos, wps_images,
+    FIRST_PRODUCT_ROW, LAST_PRODUCT_ROW, MAX_PRODUCT_LINES, PHOTO_CELL, WPS_IMAGE_FORMULA, XLSX_NS,
+    PhotoError, anchored_images, invoice_sheet_part, read_photo, validate_photos, wps_images,
 )
 
-MAX_UPLOAD_BYTES = 2 * 1024 * 1024
+MAX_UPLOAD_MIB = 8
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MIB * 1024 * 1024
+UPLOAD_LIMIT_TEXT = f"每份 .xlsx 文件上限为 {MAX_UPLOAD_MIB} MiB。"
+STANDARD_PRODUCT_LINES = 30
+MAX_INVOICE_ROW = LAST_PRODUCT_ROW + 4
 SHEETS = {"星睿发票", "地址库", "服务选项"}
 SERVICES = (
     "美森限时达卡派", "美森限时达海派（CLX）", "超级经济线卡派",
@@ -44,6 +48,7 @@ ADDRESS_LOOKUPS = {
     5: "recipient", 6: "company", 7: "street", 8: "street2", 9: "street3",
     10: "city", 11: "region", 12: "postal_code", 13: "country", 14: "phone", 15: "mobile",
 }
+PLACEHOLDER_FIELDS = ("warehouse_code", "company", "phone", "mobile", "street2", "street3", "region")
 REQUIRED_ADDRESS = {
     "recipient": "L5（收件人姓名）", "street": "L7（收件地址一）", "city": "L10（城市）",
     "region": "L11（省份 / 州）", "postal_code": "L12（邮编）", "country": "L13（国家二字代码）",
@@ -69,11 +74,15 @@ class InvoiceError(ValueError):
 def check_sheet_xml(xml, image_refs, *, invoice_photos=None):
     shared = set()
     for cell in fromstring(xml).iter(XLSX_NS + "c"):
+        coordinate = cell.get("r", "")
+        if invoice_photos is not None:
+            match = re.fullmatch(r"[A-O]([1-9]\d{0,2})", coordinate)
+            if not match or int(match[1]) > MAX_INVOICE_ROW:
+                raise InvoiceError(f"发票超出版式范围。每票最多 {MAX_PRODUCT_LINES} 条申报。")
         formula = cell.find(XLSX_NS + "f")
         if formula is None:
             continue
         expression = formula.text or ""
-        coordinate = cell.get("r", "")
         image = WPS_IMAGE_FORMULA.fullmatch(expression)
         if image and not formula.attrib and invoice_photos is not None and PHOTO_CELL.fullmatch(coordinate):
             part = image_refs.get(image[1])
@@ -106,7 +115,7 @@ def check_sheet_xml(xml, image_refs, *, invoice_photos=None):
 @contextmanager
 def workbook_from_bytes(raw):
     if not raw or len(raw) > MAX_UPLOAD_BYTES:
-        raise InvoiceError("每份 .xlsx 文件上限为 2 MiB。")
+        raise InvoiceError(UPLOAD_LIMIT_TEXT)
     try:
         with ZipFile(BytesIO(raw)) as archive:
             entries = archive.infolist()
@@ -220,8 +229,13 @@ def validate_address_row(row):
     missing = [label for key, label in REQUIRED_ADDRESS.items() if missing_value(row[ADDRESS_COLUMNS[key] - 1])]
     if missing:
         raise InvoiceError("地址库匹配行缺少必填资料：" + "、".join(missing) + "。")
-    warehouse = cell_text(row[3], "地址库 FBA 仓库代码", required=False, limit=50)
-    values = ["", "", "", warehouse] + [cell_text(cell, "地址库收件资料", required=False) for cell in row[4:]]
+    legacy = str(row[2].value).strip() == "73"
+    legacy_columns = {4, *(ADDRESS_COLUMNS[key] for key in PLACEHOLDER_FIELDS if key in ADDRESS_COLUMNS)}
+    values = ["", "", ""] + [
+        "73" if legacy and col in legacy_columns and cell.data_type == "n" and cell.value == 73
+        else cell_text(cell, "地址库收件资料", required=False, limit=50 if col == 4 else 200)
+        for col, cell in enumerate(row[3:], 4)
+    ]
     values[13] = values[13].upper()
     if not re.fullmatch(r"[A-Z]{2}", values[13]):
         raise InvoiceError("L13（国家二字代码）须为两位字母。")
@@ -239,7 +253,10 @@ def validated_catalogue(raw):
                 raise InvoiceError("地址库含重复编码，请先核对。")
             codes.add(code)
             values = validate_address_row(row)
-            values[:3] = [cell_text(cell, "地址库资料", required=False) for cell in row[:3]]
+            values[:3] = [
+                "73" if index == 2 and cell.data_type == "n" and cell.value == 73
+                else cell_text(cell, "地址库资料", required=False) for index, cell in enumerate(row[:3])
+            ]
             addresses.append(values)
     if not addresses:
         raise InvoiceError("地址库至少需要一条有效地址。")
@@ -269,6 +286,11 @@ def comparable_address(value):
     return " ".join(normalize("NFC", value).split()).casefold()
 
 
+def address_placeholders(address):
+    """Flag exact legacy placeholders in address-book fields where they were observed."""
+    return [key for key in PLACEHOLDER_FIELDS if str(address.get(key, "")).strip() == "73"]
+
+
 def check_displayed_address(raw, rows, address):
     """Check visible values when present; never calculate or trust Excel formulas."""
     expected = {line: address[field] for line, field in ADDRESS_LOOKUPS.items()}
@@ -292,13 +314,13 @@ def check_displayed_address(raw, rows, address):
             raise InvoiceError(f"L{line} 的收件资料与本工作簿地址库冲突。请核对 L4 并重新保存发票。")
 
 
-def required_fields(rows, photos):
+def required_fields(rows, photos, last_product):
     missing = [
         f"{get_column_letter(col)}{line}（{label}）"
         for (line, col), label in REQUIRED_ORDER.items() if missing_value(rows[line - 1][col - 1])
     ]
     used_rows = []
-    for line, row in enumerate(rows[22:52], start=23):
+    for line, row in enumerate(rows[FIRST_PRODUCT_ROW - 1:last_product], start=FIRST_PRODUCT_ROW):
         if f"O{line}" not in photos and all(missing_value(cell) for i, cell in enumerate(row) if i != 8):
             continue
         used_rows.append((line, row))
@@ -331,12 +353,12 @@ def parse_invoice(raw):
         if set(book.sheetnames) != SHEETS:
             raise InvoiceError("请上传星睿三工作表单票模板。")
         sheet = book["星睿发票"]
-        if sheet.max_row is None or sheet.max_row > 56 or sheet.max_column is None or sheet.max_column > 15:
-            raise InvoiceError("仅支持 11.6 版单票模板和现有明细行，其他版式请单独确认。")
+        if sheet.max_row is None or sheet.max_row > MAX_INVOICE_ROW or sheet.max_column is None or sheet.max_column > 15:
+            raise InvoiceError(f"请使用星睿 11.6 版单票模板。每票最多 {MAX_PRODUCT_LINES} 条申报。")
         sheet.reset_dimensions()
-        rows = list(islice(sheet.iter_rows(min_row=1, max_col=15), 57))
+        rows = list(islice(sheet.iter_rows(min_row=1, max_col=15), MAX_INVOICE_ROW + 1))
         if (
-            len(rows) != 56
+            not 56 <= len(rows) <= MAX_INVOICE_ROW
             or "订单号" not in str(rows[3][0].value)
             or "地址库编码" not in str(rows[3][8].value)
             or "货箱编号" not in str(rows[21][0].value)
@@ -344,7 +366,17 @@ def parse_invoice(raw):
             or "货箱重量" not in str(rows[21][9].value)
         ):
             raise InvoiceError("发票表头与星睿 11.6 模板不符。")
-        used_rows = required_fields(rows, photos)
+        # The total and note rows move together when product rows are inserted.
+        last_product = len(rows) - 4
+        total_row = rows[last_product + 1]
+        if (not str(total_row[0].value).startswith(("合计", "申报汇总"))
+                or any(str(total_row[col].value).upper().replace("$", "") != f"=SUM({letter}23:{letter}{last_product})"
+                       for col, letter in ((6, "H"), (8, "I")))
+                or any(not missing_value(cell) for i in (last_product, last_product + 2) for cell in rows[i])
+                or any(not missing_value(cell) for cell in rows[-1][1:])
+                or any(int(cell[1:]) > last_product for cell in photos)):
+            raise InvoiceError("发票的申报区或汇总行已错位。请使用星睿扩展模板。")
+        used_rows = required_fields(rows, photos, last_product)
         customer_number = identifier(rows[3][3], "客户单号")
         service = cell_text(rows[4][3], "运输服务")
         if service not in SERVICES:
@@ -427,8 +459,10 @@ def parse_box(row, line, boxes):
     return key
 
 
-def blank_invoice(catalogue=None, *, layout=None):
+def blank_invoice(catalogue=None, *, layout=None, extended=False):
     """Generate a clean 11.6 invoice, including only this customer's assigned address rows."""
+    last_product = LAST_PRODUCT_ROW if extended else FIRST_PRODUCT_ROW + STANDARD_PRODUCT_LINES - 1
+    total_row, note_row = last_product + 2, last_product + 4
     book = Workbook()
     sheet = book.active
     sheet.title = "星睿发票"
@@ -459,7 +493,8 @@ def blank_invoice(catalogue=None, *, layout=None):
         ("A3:H3", "01 发件人信息 / 订单资料"), ("I3:O3", "02 收件人信息 / 地址库自动填充"),
         ("A20:O20", "03 产品与货物申报资料 / CUSTOMS DECLARATION"),
         ("A21:O21", "在 L4 选择地址编码，在 D5 选择服务。每条产品明细填写所有星号字段，图片插入 O 列。"),
-        ("A54:E54", "合计"), ("A56:O56", "一份文件填写一票。按工作簿内的地址库匹配收件资料，提交后由星睿审核。"),
+        (f"A{total_row}:E{total_row}", "合计"),
+        (f"A{note_row}:O{note_row}", "一份文件填写一票。按工作簿内的地址库匹配收件资料，提交后由星睿审核。"),
     ):
         sheet.merge_cells(region)
         cell = sheet[region.split(":")[0]]
@@ -481,9 +516,10 @@ def blank_invoice(catalogue=None, *, layout=None):
         sheet.column_dimensions[cell.column_letter].width = 19
     sheet.column_dimensions["O"].width = 31
     sheet.row_dimensions[22].height = 36
-    for row in range(23, 53):
+    for row in range(FIRST_PRODUCT_ROW, last_product + 1):
         sheet[f"I{row}"] = f'=IF(OR(G{row}="",H{row}=""),"",ROUND(G{row}*H{row},2))'
-    sheet["F54"], sheet["G54"], sheet["H54"], sheet["I54"] = "总数量", "=SUM(H23:H52)", "总货值 (USD)", "=SUM(I23:I52)"
+    sheet[f"F{total_row}"], sheet[f"G{total_row}"] = "总数量", f"=SUM(H23:H{last_product})"
+    sheet[f"H{total_row}"], sheet[f"I{total_row}"] = "总货值 (USD)", f"=SUM(I23:I{last_product})"
 
     for row, field in ADDRESS_LOOKUPS.items():
         col = get_column_letter(ADDRESS_COLUMNS[field])
@@ -520,22 +556,22 @@ def blank_invoice(catalogue=None, *, layout=None):
         (("L4",), f"""INDIRECT("'地址库'!$B$2:$B${max(2, addresses.max_row)}")"""),
         (("D5",), """INDIRECT("'服务选项'!$A$2:$A$14")"""),
         (("D11",), '"普通报关,报关退税"'), (("D13",), '"包税,不包税"'),
-        (("D7:D10", "N23:N52"), '"是,否"'),
+        (("D7:D10", f"N23:N{last_product}"), '"是,否"'),
     ):
         picker = DataValidation(type="list", formula1=values, allow_blank=False, showErrorMessage=True)
         sheet.add_data_validation(picker)
         for cell_range in cells:
             picker.add(cell_range)
     if layout is not None:
-        copy_invoice_format(sheet, layout)
+        copy_invoice_format(sheet, layout, last_product)
     for field in ("D4", "D14", "D16", "L4"):
         sheet[field].number_format = "@"
-    for line in range(23, 53):
+    for line in range(FIRST_PRODUCT_ROW, last_product + 1):
         sheet[f"A{line}"].number_format = sheet[f"F{line}"].number_format = "@"
     return book
 
 
-def copy_invoice_format(sheet, raw):
+def copy_invoice_format(sheet, raw, last_product):
     # Only presentation is copied. Original values, notes, images and address rows never follow the layout.
     with workbook_from_bytes(raw) as (validated, _photos):
         if "星睿发票" not in validated or (validated["星睿发票"].max_row, validated["星睿发票"].max_column) != (56, 15):
@@ -548,11 +584,14 @@ def copy_invoice_format(sheet, raw):
             target = sheet.column_dimensions[key]
             target.width, target.min, target.max = dimension.width, dimension.min, dimension.max
         for key, dimension in source.row_dimensions.items():
-            sheet.row_dimensions[key].height = dimension.height
-        for row in source.iter_rows(min_row=1, max_row=56, max_col=15):
-            for original in row:
+            sheet.row_dimensions[key if key <= 52 else key + last_product - 52].height = dimension.height
+        for line in range(1, last_product + 5):
+            source_line = min(line, 52) if line <= last_product else line - last_product + 52
+            if 52 < line <= last_product:
+                sheet.row_dimensions[line].height = source.row_dimensions[52].height
+            for original in source[source_line][:15]:
                 if original.has_style:
-                    target = sheet[original.coordinate]
+                    target = sheet.cell(line, original.column)
                     for key in ("font", "fill", "border", "alignment", "number_format"):
                         setattr(target, key, copy(getattr(original, key)))
     finally:

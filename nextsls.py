@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 import carrier_http
+from tms_invoice import address_placeholders
 
 
 CAPABILITIES = {
@@ -175,6 +176,13 @@ def create_payload(invoice, code, reference, profile, sender, *, supplement=None
     """Translate a reviewed invoice; do not manufacture fields missing for the selected service."""
     if not CODE.fullmatch(code) or not CODE.fullmatch(reference):
         raise ProtocolError("渠道代码或系统对账参考号无效。")
+    suspicious = address_placeholders(invoice["address"])
+    review = invoice.get("destination_review", {})
+    verified = review.get("verified_optional", {})
+    if ({"mobile", "phone"}.intersection(suspicious)
+            or any(not (review.get("by") and review.get("at") and review.get("reason")
+                        and verified.get(key) == invoice["address"][key]) for key in suspicious)):
+        raise ProtocolError("收件地址含未经核对的历史模板占位值，请更正后再提交。")
     to_address = address_values({target: invoice["address"].get(source, "") for target, source in ADDRESS.items()})
     meta = invoice["metadata"]
     shipment = {

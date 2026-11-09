@@ -621,6 +621,21 @@ def xlsx(sheet_names_and_rows):
     return buffer
 
 
+def packing_draft(order):
+    invoice = order.invoice
+    boxes = [("货箱号", "申报箱重 (kg)", "箱长 (cm)", "箱宽 (cm)", "箱高 (cm)")]
+    boxes.extend((box["box_number"], *(Decimal(box[key]) for key in
+                                     ("weight_kg", "length_cm", "width_cm", "height_cm")))
+                 for box in invoice["boxes"])
+    products = [("货箱号", "中文品名", "英文品名", "数量", "单价 (USD)", "海关编码", "品牌", "型号")]
+    supplemental = order_supplement(order).get("declarations", {})
+    for index, item in enumerate(invoice["declarations"]):
+        details = supplemental.get(str(index), {})
+        products.append((item["box_number"], item["name_zh"], item["name_en"], item["quantity"],
+                         Decimal(item["unit_price_usd"]), item["hs_code"], details.get("brand"), details.get("model")))
+    return xlsx((("货箱", boxes), ("商品申报", products)))
+
+
 def measurement_export(order, link, snapshot, display_time):
     details = snapshot.details
     view = measurements.measurement_view(order.invoice, details, internal=True)

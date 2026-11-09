@@ -25,7 +25,11 @@
       <label>{{ label }}<input name="destination_{{ key }}" value="{{ request.form.get('destination_' ~ key, invoice.address.get(key, '')) }}" maxlength="{{ 2 if key == 'country' else (50 if key == 'warehouse_code' else 200) }}"{% if key in required_destination %} required{% endif %}></label>
       {% endfor %}
     </div>
-    <label>地址更正原因（仅管理端，更正时必填）<textarea name="destination_reason" maxlength="500">{{ request.form.get('destination_reason', '') }}</textarea></label>
+    <label>地址更正或核对依据（仅管理端，更正或保留疑似占位值时必填）<textarea name="destination_reason" maxlength="500">{{ request.form.get('destination_reason', '') }}</textarea></label>
+    {% if destination_placeholders %}
+    <p class="notice">以下字段含疑似历史占位值：{{ destination_placeholders | join('、') }}。请按真实收件资料更正。</p>
+    <label class="check-label"><input type="checkbox" name="destination_verify_73" value="yes">我已单独核实仍保留的 73 是真实地址资料，并已填写核对依据</label>
+    {% endif %}
     <label class="check-label"><input type="checkbox" name="destination_confirmed" value="yes" required>我已核对并确认本票收件地址</label>
   </fieldset>
   {% endif %}

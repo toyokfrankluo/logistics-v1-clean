@@ -427,6 +427,83 @@ class NextSLSTests(unittest.TestCase):
             request.assert_not_called()
         self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
 
+    def test_expanded_b888_mock_maps_each_product_and_staff_packing_draft(self):
+        self.profile(service_codes=["B888"])
+        self.sign_in(self.alice, "customer-a")
+        raw = fixture.expanded_workbook()
+        uploaded = self.upload(self.alice, raw)
+        self.assertEqual(uploaded.status_code, 302)
+        order_id = int(uploaded.location.rsplit("/", 1)[-1])
+        self.assertEqual(self.post(self.alice, uploaded.location + "/confirm", {"revision": 1}).status_code, 302)
+        self.staff_login()
+        self.assertEqual(self.decision(order_id, 2, decision="approve",
+                                       **self.pricing(agent_service="B888")).status_code, 302)
+        fields = {f"supplement_{index}_{key}": f"{key}-{index}" for index in range(36)
+                  for key in nextsls.SUPPLEMENTAL_DECLARATIONS}
+        link = "https://files.example.com/packing.xlsx"
+        self.assertEqual(self.action(order_id, "prepare", revision=3, packing_name="packing.xlsx",
+                                     packing_url=link, **fields).status_code, 302)
+        draft_path = f"/tms/admin/orders/{order_id}/supplier/packing-draft.xlsx"
+        self.assertEqual(self.get(self.alice, draft_path).status_code, 302)
+        response = self.get(self.staff, draft_path)
+        self.assertEqual(response.status_code, 200)
+        book = load_workbook(BytesIO(response.data), read_only=True)
+        self.assertEqual([sheet.max_row for sheet in book.worksheets], [22, 37])
+        self.assertEqual(sum(row[1] for row in book["货箱"].iter_rows(min_row=2, values_only=True)), 231)
+        self.assertEqual(book["商品申报"]["G37"].value, "brand-35")
+        book.close()
+        rule = SERVICE | {"code": "B888", "packing_list_required": 1,
+                          "require_declaration_list": ["amazon_ref_id", "brand", "model"]}
+        photos = []
+        requests = []
+
+        def publish(mime, data):
+            photos.append((mime, data))
+            return f"https://files.example.com/p/{len(photos) - 1}"
+
+        def transport(target, *, json, headers):
+            if target.api_url.endswith("/get_services"):
+                return success({"services": [rule]})
+            self.assertTrue(target.api_url.endswith("/create"))
+            requests.append(json["shipment"])
+            return success({"shipment": {"shipment_id": SUPPLIER_NUMBER}})
+
+        mock_send = partial(tms_carriers.send_order, transport=transport, photo_publisher=publish)
+        with patch.dict(app.config, TMS_NEXTSLS_CREATE_ENABLED=True,
+                        TMS_NEXTSLS_PACKING_ATTACHMENT_HOST="files.example.com"), patch(
+            "tms_carriers.send_order", side_effect=mock_send,
+        ):
+            self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 302)
+            self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 400)
+        shipment, = requests
+        self.assertEqual((shipment["reference_1"], shipment["reference_2"]), ("0000123", "DEMO-PO"))
+        self.assertEqual(shipment["parcel_count"], "21")
+        self.assertEqual(sum(box["client_weight"] for box in shipment["parcels"]), 231)
+        self.assertEqual(photos, fixture.product_photos(raw, fixture.parse_invoice(raw)))
+        for box in shipment["parcels"]:
+            for product in box["declarations"]:
+                index = int(product["name_en"].split("-")[1])
+                self.assertEqual(box["reference"], f"{index % 21 + 1:04}")
+                self.assertEqual(product["photo_url"], f"https://files.example.com/p/{index}")
+                self.assertEqual((product["qty"], product["unit_value"]), (index + 1, index + 0.25))
+                self.assertEqual([product[key] for key in nextsls.SUPPLEMENTAL_DECLARATIONS],
+                                 [f"{key}-{index}" for key in nextsls.SUPPLEMENTAL_DECLARATIONS])
+
+    def test_create_blocks_unreviewed_placeholder_on_historical_snapshot(self):
+        invoice = fixture.parse_invoice(fixture.workbook_bytes())
+        invoice["address"].update(street="73 Fictional Road", street2="73", mobile="73")
+        with self.assertRaisesRegex(nextsls.ProtocolError, "占位值"):
+            nextsls.create_payload(invoice, "TMS_DEMO", "XR-DEMO", SERVICE, {})
+        self.assertEqual(invoice["address"]["mobile"], "73")
+        invoice["address"]["mobile"] = ""
+        with self.assertRaisesRegex(nextsls.ProtocolError, "占位值"):
+            nextsls.create_payload(invoice, "TMS_DEMO", "XR-DEMO", SERVICE, {})
+        invoice["destination_review"] = {"by": 1, "at": "fixture", "reason": "fixture",
+                                         "verified_optional": {"street2": "73"}}
+        payload = nextsls.create_payload(invoice, "TMS_DEMO", "XR-DEMO", SERVICE, {})
+        self.assertEqual(payload["shipment"]["to_address"]["address_2"], "73")
+        self.assertEqual(payload["shipment"]["to_address"]["address_1"], "73 Fictional Road")
+
     def test_photo_url_requires_verified_reference_and_cannot_replace_photos(self):
         invoice = fixture.parse_invoice(fixture.workbook_bytes())
         profile = SERVICE | {"require_declaration_list": ["photo_url"]}

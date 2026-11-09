@@ -57,11 +57,13 @@
 | L4 / 地址库 B | `address_code` | 本地地址查找键；不作为 FBA 仓库代码发送 |
 | 地址库 D | `address.warehouse_code` | 已提供时发送 `to_warehouse_code` |
 | 地址库 E–O / L16 邮件 | `invoice.address` | `to_address.name/company/tel/mobile/address_1/address_2/address_3/city/state/country/postcode/email` |
-| A23–A52 箱号 | `boxes[].box_number` | FBA 箱号按文档作为 `number`；一般箱号保留在 `reference`，`number` 使用顺序号 |
+| 第 23 行起的 A 列箱号 | `boxes[].box_number` | FBA 箱号按文档作为 `number`；一般箱号保留在 `reference`，`number` 使用顺序号 |
 | B–H、N 产品申报 | `declarations` | 按箱归组，写入 `name_en/name_zh/material/usage/hscode/unit_value/qty/is_battery`；币种 `USD` |
 | I 申报总价 | `total_usd` | 本地复算；接口以单价和数量为准 |
 | J–M 箱重及尺寸 | 客户申报 `boxes` | `client_weight/client_length/client_width/client_height`；kg/cm |
-| O23–O52 商品图片 | 保留原发票，按行和原货箱号关联内嵌 PNG/JPEG | 隔离 Mock 验证了将原图片字节交给模拟文件服务，并把返回的 HTTPS `photo_url` 写入该箱对应的申报明细 |
+| 第 23 行起的 O 列商品图片 | 保留原发票，按行和原货箱号关联内嵌 PNG/JPEG | 隔离 Mock 验证了将原图片字节交给模拟文件服务，并把返回的 HTTPS `photo_url` 写入该箱对应的申报明细 |
+
+原 11.6 单票版的明细区为第 23–52 行。客户可下载相同栏位的 60 行扩展版，申报区为第 23–82 行，汇总公式相应延长。地址库为空的扩展版须复制客户已有模板中的地址库数据。每个箱号只计一次重量和体积，同箱各行的重量尺寸必须一致。上传上限为 8 MiB，ZIP 解压上限仍为 16 MiB，单图 2 MiB、合计 8 MiB、单图 1200 万像素。
 
 在管理员订单详情的「供应商下单 → 补充 NextSLS 下单资料」，逐条申报补充真实的 `amazon_ref_id`、`brand`、`model`。Amazon 参考号从对应 Amazon 发货资料取得，`reference_2` 继续使用发票 PO。补充资料绑定订单选定的代理和渠道。
 
@@ -72,6 +74,8 @@
 第 2 章创建请求支持 `shipment.attachments` 中的文件名、类型和链接。第 20 章上传附件支持 URL 或 Base64，但要求已有可识别的运单。对要求装箱单的渠道，系统先拦截。供应商确认接受创建请求内的 `file_type=order` 附件作为该渠道装箱单后，才可在 Render 配置 `TMS_NEXTSLS_PACKING_ATTACHMENT_HOST` 为获准的 HTTPS 文件域名，并为授权订单补充文件名和文件链接。
 
 bc 的 B888 上次渠道查询为 `packing_list_required=1`。第 11 章将其说明为「装箱单必填」，没有注明在哪个环节校验。Token 未确认轮换，未重新查询该账号。本次保留现有装箱单校验。
+
+后台可从已审核订单下载装箱单草稿，分表列出唯一货箱和逐条商品申报。草稿供管理员核对，附件提交规则仍按该渠道已确认的配置执行。旧发票地址库的疑似占位值会提示核对，收件地址更正保留原发票、原地址快照、操作人和原因。历史已审核订单的地址数据不自动改写。
 
 ## 实测、费用与利润
 
