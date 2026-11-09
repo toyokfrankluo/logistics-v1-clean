@@ -61,7 +61,11 @@
 | B–H、N 产品申报 | `declarations` | 按箱归组，写入 `name_en/name_zh/material/usage/hscode/unit_value/qty/is_battery`；币种 `USD` |
 | I 申报总价 | `total_usd` | 本地复算；接口以单价和数量为准 |
 | J–M 箱重及尺寸 | 客户申报 `boxes` | `client_weight/client_length/client_width/client_height`；kg/cm |
-| O 图片、原文件 | 私有导入附件 | 保留本地。没有授权的图片传输或附件 URL；需要图片或装箱单的渠道会阻止提交 |
+| O 图片、原文件 | 私有导入附件 | 保留在原发票中。NextSLS 的 `photos` 字符串编码及 `photo_url` 能否满足渠道要求仍待确认 |
+
+在管理员订单详情的「供应商下单 → 补充 NextSLS 下单资料」，逐条申报补充真实的 `amazon_ref_id`、`brand`、`model`。Amazon 参考号从对应 Amazon 发货资料取得，`reference_2` 继续使用发票 PO。补充资料绑定订单选定的代理和渠道。
+
+第 2 章创建请求支持 `shipment.attachments` 中的文件名、类型和链接。第 20 章上传附件支持 URL 或 Base64，但要求已有可识别的运单。对要求装箱单的渠道，系统先拦截。供应商确认接受创建请求内的 `file_type=order` 附件作为该渠道装箱单后，才可在 Render 配置 `TMS_NEXTSLS_PACKING_ATTACHMENT_HOST` 为获准的 HTTPS 文件域名，并为授权订单补充文件名和文件链接。
 
 ## 实测、费用与利润
 
@@ -74,4 +78,4 @@
 
 新增 `tms_agent_api`、`tms_supplier_order`、`tms_supplier_event`。复用现有代理密钥、原轨迹地址、已审核订单及其唯一 Shipment。新表通过 `python -m flask --app app tms-upgrade-v1 --confirm` 增量创建。先核对独立 Render 测试数据库目标并备份；应用启动不会自动迁移。迁移验证使用隔离 SQLite。PostgreSQL 在独立副本复核后再部署，回退时保留新表及审计。
 
-默认不开启 `TMS_NEXTSLS_READ_ENABLED` 或 `TMS_NEXTSLS_CREATE_ENABLED`。经过独立授权后，先核对账号 Token 权限、已知运单和所用渠道，再开启对应的只读验证；确认客户数据范围及供应商测试渠道后才考虑开启创建。后台每票须单独确认。提交请求前保存唯一记录；超时或异常不自动重试。先按唯一参考号查询，再由管理员记录供应商未创建的依据、解除锁，并重新确认下单。租户发生变化时需人工核对原提交记录。
+默认不开启 `TMS_NEXTSLS_READ_ENABLED` 或 `TMS_NEXTSLS_CREATE_ENABLED`。经授权，用新 Token 核对渠道、账号创建权限和只读对账。真实测试须将 `TMS_NEXTSLS_CREATE_ORDER_ID` 设为唯一授权订单 ID，启用只读对账，然后才打开创建开关。后台该票须单独确认。提交请求前保存唯一记录。超时或异常时按唯一参考号对账，经供应商确认未创建并记录依据后才可解除锁。测试结束时将创建开关恢复为 `0` 并移除单票 ID。租户变化时须人工核对原提交记录。

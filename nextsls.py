@@ -33,6 +33,9 @@ ADDRESS = {
 REQUIRED_ADDRESS = ("name", "address_1", "city", "country", "postcode")
 BOX_DIMENSIONS = {"weight": "weight_kg", "length": "length_cm", "width": "width_cm", "height": "height_cm"}
 DECLARATIONS = {"name_zh": "name_zh", "name_en": "name_en", "material": "material", "usage": "usage", "hscode": "hs_code"}
+SUPPLEMENTAL_DECLARATIONS = {
+    "amazon_ref_id": "Amazon 参考号", "brand": "品牌", "model": "型号",
+}
 
 
 class ProtocolError(ValueError):
@@ -153,7 +156,21 @@ def address_values(values):
     return {key: val for key, val in values.items() if val}
 
 
-def create_payload(invoice, code, reference, profile, sender):
+def packing_url_host(value):
+    try:
+        url = urlsplit(supplied_text(value, 500))
+        host = url.hostname or ""
+        if (url.scheme != "https" or not re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", host)
+                or url.port not in (None, 443) or url.username is not None or url.password is not None
+                or url.fragment or not url.path.strip("/") or any(char.isspace() for char in value)
+                or host.endswith((".local", ".internal", ".localhost"))):
+            raise ValueError()
+        return host
+    except ValueError:
+        raise ProtocolError("装箱单须使用经授权的 HTTPS 文件链接。") from None
+
+
+def create_payload(invoice, code, reference, profile, sender, *, supplement=None, packing_host=""):
     """Translate a reviewed invoice; do not manufacture fields missing for the selected service."""
     if not CODE.fullmatch(code) or not CODE.fullmatch(reference):
         raise ProtocolError("渠道代码或系统对账参考号无效。")
@@ -192,22 +209,38 @@ def create_payload(invoice, code, reference, profile, sender):
         if required_flag(profile, setting) and not shipment.get(field):
             raise ProtocolError(f"渠道要求 {field}。")
     sender_requirement = profile.get("from_address")
-    if sender_requirement not in ("yes", "no"):
+    if sender_requirement not in ("no", "optional", "required", "yes"):
         raise ProtocolError("渠道的发件地址规则待核实。")
-    if sender or sender_requirement == "yes":
+    if sender_requirement in ("required", "yes") or (sender_requirement == "optional" and sender):
         shipment["from_address"] = address_values(
             {**sender, "company": sender.get("company") or meta.get("sender", "")})
     requirements = profile.get("require_declaration_list")
     if not isinstance(requirements, list) or any(not isinstance(key, str) for key in requirements):
         raise ProtocolError("渠道的产品申报必填项待核实。")
-    supported = DECLARATIONS.keys() | {"unit_value", "qty", "is_battery"}
+    supplement = supplement or {}
+    supported = DECLARATIONS.keys() | SUPPLEMENTAL_DECLARATIONS.keys() | {"unit_value", "qty", "is_battery"}
     unsupported = sorted(set(requirements) - supported)
     blockers = []
     if required_flag(profile, "packing_list_required"):
-        blockers.append("渠道要求额外装箱单附件，附件传输规则待核实")
+        packing = supplement.get("packing_list")
+        if not packing_host:
+            blockers.append("渠道要求额外装箱单附件，待供应商确认创建时使用订单附件链接")
+        if not packing:
+            blockers.append("请在补充下单资料中填写装箱单")
+        elif packing_host:
+            if packing_url_host(packing["url"]) != packing_host:
+                blockers.append("装箱单链接与已授权的附件域名不一致")
+            else:
+                shipment["attachments"] = [{"name": packing["name"], "file_type": "order", "url": packing["url"]}]
     if unsupported:
         known = sorted(set(unsupported) & {"amazon_ref_id", "brand", "model", "photos", "weight", "size"})
         blockers.append("当前发票映射不支持该渠道的全部必填申报字段" + (f"（{', '.join(known)}）" if known else ""))
+    supplemental_rows = supplement.get("declarations", {})
+    missing_fields = [label for field, label in SUPPLEMENTAL_DECLARATIONS.items()
+                      if field in requirements and any(not supplemental_rows.get(str(index), {}).get(field)
+                                                       for index in range(len(invoice["declarations"])))]
+    if missing_fields:
+        blockers.append("请逐条补充申报：" + "、".join(missing_fields))
     if blockers:
         raise ProtocolError("；".join(blockers) + "。")
     parcels = {}
@@ -223,8 +256,12 @@ def create_payload(invoice, code, reference, profile, sender):
         parcels[number] = {"number": box_code, "reference": number, **dimensions, "declarations": []}
     if not parcels:
         raise ProtocolError("没有可提交的箱货数据。")
-    for item in invoice["declarations"]:
+    for index, item in enumerate(invoice["declarations"]):
         declaration = {target: supplied_text(item.get(source)) for target, source in DECLARATIONS.items()}
+        values = supplemental_rows.get(str(index), {})
+        for key in SUPPLEMENTAL_DECLARATIONS:
+            if values.get(key):
+                declaration[key] = supplied_text(values[key], 120)
         qty = item["quantity"]
         if type(qty) is not int or qty <= 0:
             raise ProtocolError("产品申报数量无效。")

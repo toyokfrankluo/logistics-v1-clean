@@ -162,9 +162,11 @@ def create_blockers(profile, agent, code, order_id):
         blockers.append("审核所选渠道未列入代理的已确认渠道代码")
     if not current_app.config.get("TMS_NEXTSLS_CREATE_ENABLED") and "系统未开放真实下单" not in blockers:
         blockers.append("系统未开放真实下单")
-    if (current_app.config.get("TMS_NEXTSLS_CREATE_ENABLED") and not current_app.config.get("ISOLATED_MODE")
-            and current_app.config.get("TMS_NEXTSLS_CREATE_ORDER_ID") != str(order_id)):
-        blockers.append("此订单不在本次真实下单授权范围内")
+    if current_app.config.get("TMS_NEXTSLS_CREATE_ENABLED") and not current_app.config.get("ISOLATED_MODE"):
+        if current_app.config.get("TMS_NEXTSLS_CREATE_ORDER_ID") != str(order_id):
+            blockers.append("此订单不在本次真实下单授权范围内")
+        if not available(profile, agent, "reconcile"):
+            blockers.append("真实下单前须启用只读对账")
     return blockers
 
 
@@ -256,7 +258,10 @@ def send_order(order, actor_id, *, transport=None):
             or shipment.shipment_id or (link and link.state != "new")):
         raise nextsls.ProtocolError("订单或代理配置已变化，请刷新后重新核对。")
     link = link or ensure_link(order)
-    payload = nextsls.create_payload(order.invoice, code, link.client_reference, service, profile.sender)
+    payload = nextsls.create_payload(
+        order.invoice, code, link.client_reference, service, profile.sender, supplement=order_supplement(order),
+        packing_host=current_app.config.get("TMS_NEXTSLS_PACKING_ATTACHMENT_HOST", ""),
+    )
     transition(link, "new", "sending", attempt_at=datetime.utcnow(), tenant_origin=origin)
     audit(link, "attempt", actor_id, {"state": "sending"})
     db.session.commit()  # Commit the one-order reservation before contacting the supplier.
@@ -282,6 +287,13 @@ def send_order(order, actor_id, *, transport=None):
         audit(link, "attempt", actor_id, {"state": "uncertain", "reason": reason})
         db.session.commit()
         return "uncertain"
+
+
+def order_supplement(order):
+    supplement = order.invoice.get("nextsls_supplement", {})
+    if (supplement.get("agent_id"), supplement.get("service")) == (order.agent_id, order.agent_service):
+        return supplement
+    return {}
 
 
 def reconcile_order(order, actor_id, *, transport=None):

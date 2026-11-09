@@ -53,6 +53,7 @@ AUDIT_LABELS = {
     "approve": "审核通过", "reject": "审核驳回", "pricing_draft": "保存收费草稿", "adjust": "调整销售条款",
     "settle": "确认最终应收",
     "supplier_channel": "更正未提交的代理渠道",
+    "supplier_prep": "保存下单补充资料",
 }
 BUSINESS_TIME = timezone(timedelta(hours=8))
 ORDER_FILTERS = {
@@ -84,6 +85,7 @@ def init_tms(app):
         TMS_NEXTSLS_READ_ENABLED=os.getenv("TMS_NEXTSLS_READ_ENABLED") == "1",
         TMS_NEXTSLS_CREATE_ENABLED=os.getenv("TMS_NEXTSLS_CREATE_ENABLED") == "1",
         TMS_NEXTSLS_CREATE_ORDER_ID=os.getenv("TMS_NEXTSLS_CREATE_ORDER_ID", ""),
+        TMS_NEXTSLS_PACKING_ATTACHMENT_HOST=os.getenv("TMS_NEXTSLS_PACKING_ATTACHMENT_HOST", "").strip().lower(),
     )
     if app.config["TMS_ENABLED"] and not app.config.get("ISOLATED_MODE"):
         app.config["SESSION_COOKIE_SECURE"] = True
@@ -702,11 +704,15 @@ def staff_detail(order, **context):
             if not tms_carriers.snapshot_matches(link, shipment, snapshot, order.agent_service):
                 snapshot = None
             cost = tms_carriers.latest_event(order.id, "cost")
+            unsubmitted = not shipment.shipment_id and (not link or (link.state == "new" and not link.attempt_at))
             supplier = {
                 "link": link, "snapshot": snapshot, "cost": cost, "supplier_number": shipment.shipment_id,
                 "last_attempt": (tms_carriers.latest_event(order.id, "attempt")
                                  if link and link.state == "uncertain" else None),
                 "agent_name": agent.name if agent else "—",
+                "can_prepare": bool(unsubmitted and profile and profile.provider == "nextsls"),
+                "supplement": tms_carriers.order_supplement(order),
+                "supplement_fields": nextsls.SUPPLEMENTAL_DECLARATIONS,
                 "channel_choices": ({code: name for code, name in tms_carriers.channel_catalogue(profile).items()
                                      if code != order.agent_service}
                                     if agent and agent.is_active and agent.supports_api and not shipment.shipment_id
@@ -748,7 +754,7 @@ def review(order_id):
 def supplier_action(order_id):
     order = reviewable_order(order_id)
     action = request.form.get("action")
-    if action not in {"create", "channel", "reconcile", "retry", "sync", "cost", "measurement_review"}:
+    if action not in {"create", "channel", "prepare", "reconcile", "retry", "sync", "cost", "measurement_review"}:
         abort(400)
     try:
         if action == "create":
@@ -762,6 +768,9 @@ def supplier_action(order_id):
         elif action == "channel":
             correct_supplier_channel(order)
             message = "已更正未提交的代理渠道。"
+        elif action == "prepare":
+            save_supplier_supplement(order, request.form)
+            message = "已保存下单补充资料。"
         elif action == "reconcile":
             state = tms_carriers.reconcile_order(order, current_user.id)
             message = ("已核对并保存供应商运单号。" if state == "linked"
@@ -811,11 +820,52 @@ def correct_supplier_channel(order):
     invoice = dict(order.invoice, supplier_channel={"code": code, "name": catalogue[code]}, supplier_channel_reviews=[
         *order.invoice.get("supplier_channel_reviews", []), review,
     ])
+    # A channel change requires a fresh review of the order's supplemental data.
+    invoice.pop("nextsls_supplement", None)
     update_order(order, {"agent_service": code, "invoice": invoice})
     receivable.agent_service = code
     if receivable.final_total is not None:
         receivable.details = dict(receivable.details, billing_state="review")
     history(order, "supplier_channel")
+    db.session.commit()
+
+
+def save_supplier_supplement(order, form):
+    db.session.refresh(order, with_for_update=True)
+    if form.get("revision", type=int) != order.revision:
+        raise nextsls.ProtocolError("订单已更新，请刷新后再填写资料。")
+    shipment, _ = tms_carriers.approved_shipment(order)
+    link = db.session.get(TmsSupplierOrder, order.id)
+    profile = tms_carriers.agent_profile(order.agent_id)
+    if (shipment.shipment_id or (link and (link.state != "new" or link.attempt_at)) or
+            not profile or profile.provider != "nextsls"):
+        raise nextsls.ProtocolError("仅可补充尚未提交的 NextSLS 订单。")
+    if not nextsls.CODE.fullmatch(order.agent_service or ""):
+        raise nextsls.ProtocolError("请先在订单中选择实际 NextSLS 渠道。")
+    rows = {}
+    for index, _ in enumerate(order.invoice["declarations"]):
+        values = {}
+        for field in nextsls.SUPPLEMENTAL_DECLARATIONS:
+            raw = form.get(f"supplement_{index}_{field}", "").strip()
+            if raw:
+                values[field] = nextsls.supplied_text(raw, 120)
+        if values:
+            rows[str(index)] = values
+    old = tms_carriers.order_supplement(order).get("packing_list", {})
+    packing_name = form.get("packing_name", "").strip()
+    packing_url = form.get("packing_url", "").strip()
+    packing = {}
+    if form.get("remove_packing") != "yes" and (packing_name or packing_url or old):
+        name = nextsls.supplied_text(packing_name or old.get("name"), 100)
+        if any(char in name for char in "/\\"):
+            raise nextsls.ProtocolError("装箱单名称不能包含目录。")
+        url = packing_url or old.get("url")
+        nextsls.packing_url_host(url)
+        packing = {"name": name, "url": url}
+    supplement = {"agent_id": order.agent_id, "service": order.agent_service, "declarations": rows,
+                  "packing_list": packing}
+    update_order(order, {"invoice": dict(order.invoice, nextsls_supplement=supplement)})
+    history(order, "supplier_prep")
     db.session.commit()
 
 
