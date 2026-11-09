@@ -45,6 +45,21 @@ def _configured_nextsls_tracks(profile, agent, shipment, *, verify=False):
     if db.session.scalar(select(Shipment.id).where(Shipment.agent_id == agent.id,
             Shipment.shipment_id == number, Shipment.id != shipment.id).limit(1)) is not None:
         return None, "同一代理存在重复供应商单号，无法核对轨迹归属"
+    if billing_available():
+        binding = db.session.execute(
+            select(TmsOrder.invoice["supplier_tenant_origin"].as_string(),
+                   TmsSupplierOrder.agent_id, TmsSupplierOrder.tenant_origin, TmsSupplierOrder.supplier_number)
+            .select_from(TmsReceivable).join(TmsOrder, TmsOrder.id == TmsReceivable.order_id)
+            .outerjoin(TmsSupplierOrder, TmsSupplierOrder.order_id == TmsOrder.id)
+            .where(TmsReceivable.shipment_id == shipment.id)
+        ).one_or_none()
+        if binding:
+            approved_origin, linked_agent, linked_origin, linked_number = binding
+            if ((approved_origin and approved_origin != profile.base_url)
+                    or (linked_origin and linked_origin != profile.base_url)
+                    or (linked_agent is not None and linked_agent != agent.id)
+                    or (linked_number and linked_number != number)):
+                return None, "代理账号、租户或供应商单号与原订单关联不符"
     try:
         data = nextsls.request_data(agent, profile.base_url, nextsls.CAPABILITIES["tracking"][1],
                                     {"shipment": {"shipment_id": number, "language": "zh"}})
@@ -393,6 +408,7 @@ def _save_agent_settings(agent, form, ready):
     profile = db.session.get(TmsAgentApi, agent.id) if ready else None
     was_managed = profile and profile.provider == "nextsls"
     old_url = (profile.base_url or agent.api_url) if was_managed else agent.api_url
+    old_origin = profile.base_url if was_managed else None
     if ready and "provider" in form and (profile or form["provider"] != "other" or form.get("base_url")):
         profile = tms_carriers.configure(agent.id, form)
     if active is not None:
@@ -404,6 +420,12 @@ def _save_agent_settings(agent, form, ready):
     agent.app_token = form.get("app_token", "").strip() or agent.app_token
     agent.customer_code = form.get("customer_code", "").strip() or agent.customer_code
     managed = profile and profile.provider == "nextsls"
+    if old_origin and (not managed or profile.base_url != old_origin):
+        has_supplier_history = db.session.scalar(select(TmsSupplierOrder.order_id).where(
+            TmsSupplierOrder.agent_id == agent.id, TmsSupplierOrder.tenant_origin.is_not(None),
+        ).limit(1))
+        if has_supplier_history is not None:
+            raise nextsls.ProtocolError("该代理已有供应商订单记录。接入不同租户请新增代理。")
     if managed and profile.base_url and not nextsls.legacy_tenant_matches(agent.api_url, profile.base_url):
         raise nextsls.ProtocolError("原有轨迹地址与基础域名租户不一致，请先核对两项配置。")
     new_url = profile.base_url if managed else agent.api_url

@@ -193,7 +193,10 @@ def operation_context(order, capability):
     if not agent or not any(available(profile, agent, key) for key in keys):
         raise nextsls.ProtocolError("该代理功能未启用、缺少凭据或尚未获准联网。")
     link = db.session.get(TmsSupplierOrder, order.id)
-    if link and (link.agent_id != agent.id or (link.tenant_origin and link.tenant_origin != profile.base_url)):
+    approved_origin = order.invoice.get("supplier_tenant_origin")
+    if ((approved_origin and approved_origin != profile.base_url)
+            or (link and (link.agent_id != agent.id
+                          or (link.tenant_origin and link.tenant_origin != profile.base_url)))):
         raise nextsls.ProtocolError("代理或租户已变化，须人工核对原提交记录。")
     return shipment, agent, profile, link
 

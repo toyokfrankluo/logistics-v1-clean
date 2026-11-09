@@ -822,13 +822,16 @@ def correct_supplier_channel(order):
     catalogue = tms_carriers.channel_catalogue(profile)
     if not agent or not agent.is_active or not agent.supports_api or code == order.agent_service or code not in catalogue:
         raise nextsls.ProtocolError("请选择此代理已配置且不同于当前值的渠道代码。")
+    if order.invoice.get("supplier_tenant_origin", profile.base_url) != profile.base_url:
+        raise nextsls.ProtocolError("代理租户已与审核记录不符，请核对原代理账号。")
     reason = nextsls.supplied_text(request.form.get("channel_reason"), 200)
     review = {"from": order.agent_service, "to": code, "reason": reason, "to_name": catalogue[code],
               "from_name": order.invoice.get("supplier_channel", {}).get("name"),
               "by": current_user.id, "at": datetime.now(timezone.utc).isoformat()}
-    invoice = dict(order.invoice, supplier_channel={"code": code, "name": catalogue[code]}, supplier_channel_reviews=[
-        *order.invoice.get("supplier_channel_reviews", []), review,
-    ])
+    invoice = dict(order.invoice, supplier_channel={"code": code, "name": catalogue[code]},
+                   supplier_tenant_origin=profile.base_url, supplier_channel_reviews=[
+                       *order.invoice.get("supplier_channel_reviews", []), review,
+                   ])
     # A channel change requires a fresh review of the order's supplemental data.
     invoice.pop("nextsls_supplement", None)
     update_order(order, {"agent_service": code, "invoice": invoice})
@@ -1037,7 +1040,8 @@ def save_pricing(order, decision):
             invoice = reviewed_invoice(invoice, form)
             changes["invoice"] = invoice
         if channel_name:
-            invoice = dict(invoice, supplier_channel={"code": service, "name": channel_name})
+            invoice = dict(invoice, supplier_channel={"code": service, "name": channel_name},
+                           supplier_tenant_origin=profile.base_url)
             changes["invoice"] = invoice
         db.session.get(Customer, order.customer_id, with_for_update=True)
         if legacy_duplicate(order.customer_id, order.number_key):
