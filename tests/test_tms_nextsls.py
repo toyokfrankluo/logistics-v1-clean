@@ -1,11 +1,12 @@
 """NextSLS fixtures use synthetic orders and an entirely simulated carrier transport."""
 from datetime import datetime, timedelta
 from functools import partial
+from hashlib import sha256
 from io import BytesIO
 import re
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from openpyxl import load_workbook
 
@@ -13,6 +14,7 @@ import carrier_http
 import nextsls
 import test_tms_portal as fixture
 import tms_carriers
+import tms_supplier_images
 from app import app
 from models import BankAccount, CarrierAgent, Customer, ManualTrack, Shipment, db
 from tms_models import TmsAccount, TmsAgentApi, TmsAudit, TmsOrder, TmsReceivable, TmsSupplierEvent, TmsSupplierOrder
@@ -457,6 +459,107 @@ class NextSLSTests(unittest.TestCase):
         self.assertTrue(transport.call_args.args[0].api_url.endswith("/shipment/get_services"))
         self.assertEqual(transport.call_count, 1)
         self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
+
+    def test_verified_channel_encoder_uses_private_storage_before_real_transport(self):
+        code = "B009-4"
+        rule = SERVICE | {"code": code, "name": "虚构搏诚渠道", "require_declaration_list": ["photos"]}
+        self.profile(service_codes=[code], rules={code: nextsls.preparation_rules(rule)})
+        self.sign_in(self.alice, "customer-a")
+        uploaded = self.upload(self.alice, fixture.floating_workbook(service="超级经济线卡派"))
+        self.assertEqual(uploaded.status_code, 302)
+        order_id = int(uploaded.location.rsplit("/", 1)[-1])
+        self.assertEqual(self.post(self.alice, uploaded.location + "/confirm", {"revision": 1}).status_code, 302)
+        self.staff_login()
+        self.assertEqual(self.decision(order_id, 2, decision="approve", **self.pricing(agent_service=code)).status_code, 302)
+        order = db.session.get(TmsOrder, order_id)
+        self.assertNotEqual(order.invoice["service"], rule["name"])
+        s3 = MagicMock()
+        s3.get_public_access_block.return_value = {"PublicAccessBlockConfiguration": dict.fromkeys(
+            ("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets"), True)}
+        # The fixture codec is deliberately artificial and exists only in this test.
+        url_root = "https://fixture-bucket.s3.us-east-1.amazonaws.com"
+        s3.generate_presigned_url.side_effect = lambda _op, Params, ExpiresIn, HttpMethod: (
+            f'{url_root}/{Params["Key"]}?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Expires={ExpiresIn}'
+            '&X-Amz-Signature=synthetic')
+        objects = {}
+        s3.put_object.side_effect = lambda **kwargs: objects.update({kwargs["Key"]: kwargs["Body"]})
+        reads = []
+        fail_read = True
+
+        def image_get(host, target, *, read_content):
+            self.assertEqual(host, "fixture-bucket.s3.us-east-1.amazonaws.com")
+            key = target.split("?", 1)[0][1:]
+            reads.append((key, read_content))
+            return ((200, "image/jpeg" if key.endswith(".jpg") else "image/png",
+                     b"not the uploaded image" if fail_read else objects[key])
+                    if read_content else (403, None, None))
+
+        requests = []
+
+        def api(target, *, json, headers):
+            self.assertEqual(headers["Authorization"], "Bearer " + TOKEN)
+            self.assertTrue(target.api_url.startswith(ORIGIN + "/api/v5/shipment/"))
+            if target.api_url.endswith("/get_services"):
+                return success({"services": [rule]})
+            self.assertTrue(target.api_url.endswith("/create"))
+            requests.append(json["shipment"])
+            return success({"shipment": {"shipment_id": SUPPLIER_NUMBER}})
+
+        config = dict(ISOLATED_MODE=False, TMS_NEXTSLS_CREATE_ENABLED=True, TMS_NEXTSLS_READ_ENABLED=True,
+                      TMS_NEXTSLS_CREATE_ORDER_ID=str(order_id), TMS_NEXTSLS_IMAGE_BUCKET="fixture-bucket",
+                      TMS_NEXTSLS_IMAGE_REGION="us-east-1", TMS_NEXTSLS_IMAGE_URL_TTL_SECONDS="900",
+                      TMS_NEXTSLS_IMAGE_SCOPE=f"{order.agent_id}|{ORIGIN}|{code}",
+                      TMS_NEXTSLS_IMAGE_ACCESS_KEY_ID="fixture-storage", TMS_NEXTSLS_IMAGE_SECRET_ACCESS_KEY="fixture-only")
+        codec = {(ORIGIN, code): lambda url: "fixture-encoding:" + url}
+        with patch.dict(app.config, config), patch.dict(tms_supplier_images.CONFIRMED_PHOTOS_ENCODERS, codec), patch(
+            "tms_supplier_images.s3_client", return_value=s3,
+        ), patch("tms_supplier_images.image_get", side_effect=image_get), patch("carrier_http.post", side_effect=api):
+            self.assertIn("已配置，提交时自动验证图片", self.get(
+                self.staff, f"/tms/admin/orders/{order_id}").get_data(as_text=True))
+            with patch.dict(app.config, TMS_NEXTSLS_IMAGE_SCOPE=f"{order.agent_id}|https://other.nextsls.com|{code}"):
+                blocked = self.action(order_id, "create", confirm="yes")
+                self.assertEqual(blocked.status_code, 400)
+                self.assertIn(nextsls.PHOTOS_PROTOCOL_BLOCKER, blocked.get_data(as_text=True))
+                self.assertFalse(reads)
+            with patch.object(s3, "get_public_access_block", return_value={"PublicAccessBlockConfiguration": {}}):
+                self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 400)
+                s3.put_object.assert_not_called()
+            self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 400)
+            self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
+            self.assertEqual(requests, [])
+            fail_read = False
+            with patch.object(s3, "generate_presigned_url", return_value="https://files.example.com/mock.png"):
+                blocked = self.action(order_id, "create", confirm="yes")
+                self.assertEqual(blocked.status_code, 400)
+                self.assertNotIn("files.example.com", blocked.get_data(as_text=True))
+            self.assertEqual(requests, [])
+            self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 302)
+            self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 400)
+        payload, = requests
+        self.assertEqual(payload["service"], code)
+        self.assertNotIn("attachments", payload)
+        rows = [row for box in payload["parcels"] for row in box["declarations"]]
+        for index, row in enumerate(rows):
+            digest = sha256(fixture.FLOATING_PHOTOS[index]).hexdigest()
+            self.assertRegex(row["photos"], rf"fixture-encoding:https://.*/{index}-{digest}\.(png|jpg)\?")
+            self.assertNotIn("photo_url", row)
+        self.assertEqual(db.session.get(TmsSupplierOrder, order_id).supplier_number, SUPPLIER_NUMBER)
+        self.assertCountEqual(objects.values(), fixture.FLOATING_PHOTOS)
+
+    def test_legacy_placeholders_are_omitted_without_changing_saved_source(self):
+        def mark_legacy(book):
+            for cell in ("C2", "H2", "J2", "K2"):
+                book["地址库"][cell] = "73"
+        raw = fixture.workbook_bytes(change=mark_legacy)
+        invoice = fixture.parse_invoice(raw)
+        order = SimpleNamespace(invoice=invoice, workbook=raw, file_sha256=sha256(raw).hexdigest())
+        prepared, omitted = tms_carriers.destination_for_create(order)
+        self.assertEqual(omitted, ["mobile", "street2", "street3"])
+        payload = nextsls.create_payload(prepared, "B009-4", "XR-FIXTURE", SERVICE, {})["shipment"]
+        self.assertTrue({"mobile", "address_2", "address_3"}.isdisjoint(payload["to_address"]))
+        self.assertTrue(all(invoice["address"][key] == "73" for key in omitted))
+        order.file_sha256 = "mismatching-fixture"
+        self.assertEqual(tms_carriers.destination_for_create(order), (invoice, []))
 
     def test_bc_no_model_and_channel_change_drop_unneeded_amazon_field(self):
         profile = self.profile(service_codes=["TMS_DEMO", "OTHER"])

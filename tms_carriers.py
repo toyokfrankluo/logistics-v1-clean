@@ -1,6 +1,7 @@
 """Carrier configuration, audited supplier operations, and internal reports."""
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
+from hashlib import sha256
 from io import BytesIO
 from uuid import uuid4
 
@@ -14,7 +15,8 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from models import CarrierAgent, Shipment, db
 import nextsls
 import tms_measurements as measurements
-from tms_invoice import InvoiceError, SERVICES, product_photos
+import tms_supplier_images as images
+from tms_invoice import InvoiceError, SERVICES, parse_invoice, product_photos
 from tms_models import TmsAgentApi, TmsReceivable, TmsSupplierEvent, TmsSupplierOrder
 
 
@@ -208,13 +210,34 @@ def supplier_blocker_groups(blockers):
     return {label: messages for label, messages in groups.items() if messages}
 
 
+def destination_for_create(order):
+    invoice = order.invoice
+    pending = set(nextsls.unverified_destination_fields(invoice)) & {"mobile", "street2", "street3"}
+    if not pending or invoice.get("address_source") != "workbook":
+        return invoice, []
+    raw = order.workbook
+    if not raw or sha256(raw).hexdigest() != order.file_sha256:
+        return invoice, []
+    try:
+        original = parse_invoice(raw)
+    except InvoiceError:
+        return invoice, []
+    if (original["address_code"] != invoice["address_code"]
+            or original["customer_number"] != invoice["customer_number"]):
+        return invoice, []
+    omitted = sorted(pending.intersection(original["legacy_optional_placeholders"]))
+    return dict(invoice, address={key: value for key, value in invoice["address"].items() if key not in omitted}), omitted
+
+
 def supplier_preparation(order, profile, agent):
     code = order.agent_service
     blockers = create_blockers(profile, agent, code, order.id)
     result = {"blockers": blockers, "missing": {}, "packing_required": None, "required_photo_fields": None,
               "allow_no_model": bool(profile and profile.provider == "nextsls" and profile.base_url == BC_ORIGIN),
               "image_count": sum(bool(item.get("image_part")) for item in order.invoice["declarations"])}
-    if nextsls.unverified_destination_fields(order.invoice):
+    invoice, omitted = destination_for_create(order)
+    result["omitted_address_fields"] = omitted
+    if nextsls.unverified_destination_fields(invoice):
         blockers.append(nextsls.DESTINATION_PLACEHOLDER_BLOCKER)
     if not profile or profile.provider != "nextsls":
         return result
@@ -231,10 +254,13 @@ def supplier_preparation(order, profile, agent):
     result["packing_required"] = nextsls.required_flag(rules, "packing_list_required")
     result["required_photo_fields"] = [field for field in ("photos", "photo_url")
                                        if field in rules["require_declaration_list"]]
+    store, encoders = images.image_delivery(order, profile, rules)
+    result["photo_delivery_ready"] = bool(store and set(result["required_photo_fields"]) <= encoders.keys())
     supplement = order_supplement(order)
     result["missing"] = nextsls.missing_supplements(order.invoice, supplement, rules)
     try:
-        nextsls.create_payload(order.invoice, code, "XR-PREFLIGHT", rules, profile.sender, supplement=supplement)
+        nextsls.create_payload(invoice, code, "XR-PREFLIGHT", rules, profile.sender, supplement=supplement,
+                               image_fields=encoders, preflight=True)
     except nextsls.PreparationError as exc:
         blockers.extend(exc.blockers)
     except nextsls.ProtocolError as exc:
@@ -313,6 +339,8 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
     if ((photo_publisher is not None or packing_publisher is not None)
             and (transport is None or not current_app.config.get("ISOLATED_MODE"))):
         raise nextsls.ProtocolError("商品图片和装箱单发送目前只允许在隔离模拟中验证。")
+    if transport is not None and not current_app.config.get("ISOLATED_MODE"):
+        raise nextsls.ProtocolError("真实环境禁止使用模拟供应商传输。")
     agent = db.session.get(CarrierAgent, order.agent_id) if order.agent_id else None
     blockers = create_blockers(agent_profile(order.agent_id) if agent else None, agent, order.agent_service, order.id)
     if blockers:
@@ -337,22 +365,33 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
         raise nextsls.ProtocolError("订单或代理配置已变化，请刷新后重新核对。")
     link = link or ensure_link(order)
 
-    def publish_photos():
+    rules = nextsls.preparation_rules(service)
+    store, encoders = images.image_delivery(order, profile, rules)
+    invoice, omitted = destination_for_create(order)
+
+    def order_photos():
         try:
-            photos = product_photos(order.workbook, order.invoice)
+            return product_photos(order.workbook, order.invoice)
         except InvoiceError as exc:
             raise nextsls.ProtocolError(str(exc)) from None
-        return [photo_publisher(mime, data) for mime, data in photos]
+
+    def publish_photos():
+        return [photo_publisher(mime, data) for mime, data in order_photos()]
 
     payload = nextsls.create_payload(
-        order.invoice, code, link.client_reference, service, profile.sender, supplement=order_supplement(order),
+        invoice, code, link.client_reference, rules, profile.sender, supplement=order_supplement(order),
         packing_host=current_app.config.get("TMS_NEXTSLS_PACKING_ATTACHMENT_HOST", ""),
         publish_photos=publish_photos if photo_publisher is not None else None,
+        image_fields=encoders,
+        publish_image_fields=(lambda: images.publish_images(store, order, profile, order_photos(), encoders))
+        if encoders else None,
         publish_packing=(lambda: packing_publisher(packing_draft(order).getvalue()))
         if packing_publisher is not None else None,
     )
     transition(link, "new", "sending", attempt_at=datetime.utcnow(), tenant_origin=origin)
-    audit(link, "attempt", actor_id, {"state": "sending"})
+    delivery_audit = {"image_rows_verified": len(order.invoice["declarations"]) if encoders else 0,
+                      "omitted_legacy_address_fields": omitted}
+    audit(link, "attempt", actor_id, {"state": "sending", **delivery_audit})
     db.session.commit()  # Commit the one-order reservation before contacting the supplier.
 
     try:
@@ -365,7 +404,7 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
         shipment.status = "代理已接单"
         if transport is None and not current_app.config.get("ISOLATED_MODE"):
             mark_verified(profile, {"create"})
-        audit(link, "attempt", actor_id, {"state": "linked"})
+        audit(link, "attempt", actor_id, {"state": "linked", **delivery_audit})
         db.session.commit()
         return "linked"
     except (nextsls.ProtocolError, IntegrityError) as error:

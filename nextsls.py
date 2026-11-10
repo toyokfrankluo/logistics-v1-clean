@@ -44,6 +44,7 @@ PHOTOS_PROTOCOL_BLOCKER = "渠道要求 photos，图片传输格式尚待供应�
 PHOTO_URL_PUBLICATION_BLOCKER = "商品图片链接传输尚未获准"
 PACKING_TRANSMISSION_BLOCKER = "渠道要求装箱单，创建时的自动传输方式尚待供应商确认"
 UNSUPPORTED_DECLARATION_BLOCKER = "当前发票映射不支持该渠道的全部必填申报字段"
+IMAGE_FIELDS = frozenset({"photo_url", "photos"})
 
 
 class ProtocolError(ValueError):
@@ -271,7 +272,8 @@ def unverified_destination_fields(invoice):
 
 
 def create_payload(invoice, code, reference, profile, sender, *, supplement=None, packing_host="",
-                   publish_photos=None, publish_packing=None):
+                   publish_photos=None, publish_packing=None, image_fields=(), publish_image_fields=None,
+                   preflight=False):
     """Translate a reviewed invoice; do not manufacture fields missing for the selected service."""
     if not CODE.fullmatch(code) or not CODE.fullmatch(reference):
         raise ProtocolError("渠道代码或系统对账参考号无效。")
@@ -328,16 +330,25 @@ def create_payload(invoice, code, reference, profile, sender, *, supplement=None
             blockers.append("请在代理配置中补齐有效发件地址")
     requirements = profile.get("require_declaration_list")
     supplement = supplement or {}
+    image_fields = frozenset(image_fields)
+    if publish_photos is not None:
+        if image_fields or publish_image_fields is not None:
+            raise ProtocolError("不能同时配置两种商品图片发布器。")
+        image_fields = frozenset({"photo_url"})
+        def publish_image_fields():
+            urls = publish_photos()
+            return [{"photo_url": url} for url in urls] if isinstance(urls, (list, tuple)) else None
+    if not image_fields <= IMAGE_FIELDS or (image_fields and publish_image_fields is None and not preflight):
+        raise ProtocolError("商品图片传输配置无效。")
     supported = DECLARATIONS.keys() | SUPPLEMENTAL_DECLARATIONS.keys() | {
-        "unit_value", "qty", "is_battery", "photo_url",
-    }
+        "unit_value", "qty", "is_battery",
+    } | IMAGE_FIELDS
     unsupported = sorted(set(requirements) - supported)
     packing_required = required_flag(profile, "packing_list_required")
     if packing_required and (publish_packing is None or not packing_host):
         blockers.append(PACKING_TRANSMISSION_BLOCKER)
-    if "photos" in unsupported:
+    if "photos" in requirements and "photos" not in image_fields:
         blockers.append(PHOTOS_PROTOCOL_BLOCKER)
-        unsupported.remove("photos")
     if unsupported:
         known = sorted(set(unsupported) & {"amazon_ref_id", "brand", "model", "photos", "weight", "size"})
         blockers.append(UNSUPPORTED_DECLARATION_BLOCKER + (f"（{', '.join(known)}）" if known else ""))
@@ -346,9 +357,9 @@ def create_payload(invoice, code, reference, profile, sender, *, supplement=None
                       if any(field in fields for fields in missing.values())]
     if missing_fields:
         blockers.append("请逐条补充申报：" + "、".join(missing_fields))
-    if "photo_url" in requirements and publish_photos is None:
+    if "photo_url" in requirements and "photo_url" not in image_fields:
         blockers.append(PHOTO_URL_PUBLICATION_BLOCKER)
-    if {"photos", "photo_url"}.intersection(requirements) and any(
+    if (IMAGE_FIELDS.intersection(requirements) or image_fields) and any(
         not item.get("image_part") for item in invoice["declarations"]
     ):
         blockers.append("原发票有申报行缺少内嵌商品图片")
@@ -378,7 +389,7 @@ def create_payload(invoice, code, reference, profile, sender, *, supplement=None
         declaration.update(unit_value=float(numeric(item["unit_price_usd"])), qty=qty,
                            is_battery=int(item.get("battery") is True))
         if any(key not in declaration or declaration[key] in (None, "")
-               for key in requirements if key != "photo_url"):
+               for key in requirements if key not in IMAGE_FIELDS):
             raise ProtocolError("发票缺少代理渠道要求的申报项，请核对渠道规则。")
         if item.get("box_number") not in parcels:
             raise ProtocolError("申报商品没有对应货箱。")
@@ -386,12 +397,20 @@ def create_payload(invoice, code, reference, profile, sender, *, supplement=None
         declarations.append(declaration)
     if any(not parcel["declarations"] for parcel in parcels.values()):
         raise ProtocolError("每个货箱至少需要一项申报。")
-    if publish_photos is not None:
-        urls = publish_photos()
-        if not isinstance(urls, (list, tuple)) or len(urls) != len(declarations):
+    if preflight:
+        return None
+    if image_fields:
+        references = publish_image_fields()
+        if not isinstance(references, (list, tuple)) or len(references) != len(declarations):
             raise ProtocolError("商品图片链接数量与申报行数不一致。")
-        for declaration, url in zip(declarations, urls):
-            declaration["photo_url"] = product_photo_url(url)
+        for declaration, values in zip(declarations, references):
+            if not isinstance(values, dict) or values.keys() != image_fields:
+                raise ProtocolError("商品图片发布结果与已确认的接口字段不符。")
+            for key, value in values.items():
+                declaration[key] = (product_photo_url(value) if key == "photo_url"
+                                    else supplied_text(value, 3 * 1024 * 1024))
+    if any(key not in row for row in declarations for key in requirements):
+        raise ProtocolError("商品图片未满足所选渠道的必填申报要求。")
     if packing_required:
         url = publish_packing()
         if packing_url_host(url) != packing_host:

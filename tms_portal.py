@@ -90,6 +90,10 @@ def init_tms(app):
         TMS_NEXTSLS_CREATE_ORDER_ID=os.getenv("TMS_NEXTSLS_CREATE_ORDER_ID", ""),
         TMS_NEXTSLS_PACKING_ATTACHMENT_HOST=os.getenv("TMS_NEXTSLS_PACKING_ATTACHMENT_HOST", "").strip().lower(),
     )
+    for suffix in ("SCOPE", "BUCKET", "REGION", "URL_TTL_SECONDS", "ACCESS_KEY_ID", "SECRET_ACCESS_KEY",
+                   "SESSION_TOKEN"):
+        key = "TMS_NEXTSLS_IMAGE_" + suffix
+        app.config[key] = os.getenv(key, "").strip()
     if app.config["TMS_ENABLED"] and not app.config.get("ISOLATED_MODE"):
         app.config["SESSION_COOKIE_SECURE"] = True
         app.config["SESSION_COOKIE_SAMESITE"] = "Lax"

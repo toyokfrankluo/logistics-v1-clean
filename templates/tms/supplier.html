@@ -17,7 +17,8 @@
     <div><dt>箱数</dt><dd>{{ invoice.boxes|length }}</dd></div>
     <div><dt>申报信息</dt><dd>{{ invoice.declarations|length }} 项 · {{ totals.value }} USD · {{ invoice.metadata.declaration_mode }}</dd></div>
     <div><dt>商品图片</dt><dd>从星睿 Excel 识别 {{ preparation.image_count }} / {{ invoice.declarations|length }} 张</dd></div>
-    <div><dt>图片传输配置</dt><dd>{% if preparation.required_photo_fields %}
+    <div><dt>图片传输配置</dt><dd>{% if preparation.photo_delivery_ready %}已配置，提交时自动验证图片
+      {% elif preparation.required_photo_fields %}
       {{ preparation.required_photo_fields|join('、') }} 为本渠道必填，真实传输未配置
       {% elif preparation.required_photo_fields is none %}等待当前渠道规则
       {% else %}当前渠道规则未要求图片字段{% endif %}</dd></div>
@@ -30,6 +31,7 @@
       {% else %}等待渠道规则确认{% endif %}</dd></div>
     <div><dt>目的地</dt><dd>{{ invoice.address.recipient }} · {{ [invoice.address.street, invoice.address.street2, invoice.address.street3, invoice.address.city, invoice.address.region, invoice.address.postal_code, invoice.address.country]|select|join(' · ') }}</dd></div>
   </dl>
+  {% if preparation.omitted_address_fields %}<p class="notice">原始发票可核实的可选地址占位值将在请求中省略（{{ preparation.omitted_address_fields|length }} 项），原资料保留。</p>{% endif %}
   <ul>{% for item in invoice.declarations %}<li>{{ item.box_number }} · {{ item.name_zh }} / {{ item.name_en }} · {{ item.quantity }} 件 · {{ item.total_usd }} USD</li>{% endfor %}</ul>
   {% if preparation.blockers %}
     <p class="notice">暂不能提交</p>

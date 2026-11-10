@@ -49,6 +49,7 @@ ADDRESS_LOOKUPS = {
     10: "city", 11: "region", 12: "postal_code", 13: "country", 14: "phone", 15: "mobile",
 }
 PLACEHOLDER_FIELDS = ("warehouse_code", "company", "phone", "mobile", "street2", "street3", "region")
+LEGACY_OMITTABLE_ADDRESS_FIELDS = ("mobile", "street2", "street3")
 REQUIRED_ADDRESS = {
     "recipient": "L5（收件人姓名）", "street": "L7（收件地址一）", "city": "L10（城市）",
     "region": "L11（省份 / 州）", "postal_code": "L12（邮编）", "country": "L13（国家二字代码）",
@@ -279,7 +280,12 @@ def workbook_address(book, code):
             match = row
     if match is None:
         raise InvoiceError("L4 地址编码在此工作簿的「地址库」中不存在。")
-    return address_values(validate_address_row(match))
+    # The old template filled C and all three originally blank optional cells with literal 73.
+    # Require the entire signature, including the historical string representation.
+    cells = [match[2], *(match[ADDRESS_COLUMNS[key] - 1] for key in LEGACY_OMITTABLE_ADDRESS_FIELDS)]
+    placeholders = (list(LEGACY_OMITTABLE_ADDRESS_FIELDS)
+                    if all(cell.data_type in {"s", "n"} and cell.value in ("73", 73) for cell in cells) else [])
+    return address_values(validate_address_row(match)), placeholders
 
 
 def comparable_address(value):
@@ -382,7 +388,7 @@ def parse_invoice(raw):
         if service not in SERVICES:
             raise InvoiceError("运输服务不在星睿的 13 种服务中。")
         address_code = identifier(rows[3][11], "地址库编码")
-        address = workbook_address(book, address_code)
+        address, legacy_placeholders = workbook_address(book, address_code)
         check_displayed_address(raw, rows, address)
         address["email"] = cell_text(rows[15][11], "收件邮箱", required=False)
         flags = {name: yes_no(rows[index][3], label) for index, name, label in (
@@ -420,6 +426,7 @@ def parse_invoice(raw):
         return {
             "customer_number": customer_number, "service": service,
             "address_code": address_code, "address": address, "address_source": "workbook", "flags": flags,
+            "legacy_optional_placeholders": legacy_placeholders,
             "metadata": metadata, "boxes": list(boxes.values()), "declarations": declarations,
         }
 
