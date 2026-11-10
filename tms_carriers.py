@@ -350,7 +350,10 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
         link = db.session.get(TmsSupplierOrder, order.id)
         transition(link, "sending", "uncertain")
         reason = str(error) if isinstance(error, nextsls.ProtocolError) else "供应商结果未能关联，请先对账。"
-        audit(link, "attempt", actor_id, {"state": "uncertain", "reason": reason})
+        details = {"state": "uncertain", "reason": reason}
+        if isinstance(error, nextsls.CreateRejected):
+            details["supplier_rejected"] = True
+        audit(link, "attempt", actor_id, details)
         db.session.commit()
         return "uncertain"
 

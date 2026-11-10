@@ -6,7 +6,7 @@
 <section class="panel" id="supplier-order">
   <h2>供应商下单</h2>
   {% set states = {'new':'待提交代理', 'sending':'提交中 · 已预留', 'uncertain':'待对账 · 提交结果未确认', 'not_found':'列表无匹配，待人工核实', 'linked':'代理已接单 · 单号已关联'} %}
-  <p><span class="badge">{{ states[link.state] if link else ('已录入供应商单号' if supplier.supplier_number else '待提交代理') }}</span>
+  <p><span class="badge">{% if supplier.last_attempt and supplier.last_attempt.details.supplier_rejected %}代理返回失败 · 待对账{% else %}{{ states[link.state] if link else ('已录入供应商单号' if supplier.supplier_number else '待提交代理') }}{% endif %}</span>
     {% if supplier.supplier_number %} · {{ supplier.supplier_number }}{% endif %}
     {% if link %} · 对账参考号 <code>{{ link.client_reference }}</code>{% endif %}</p>
   {% if preparation %}
@@ -39,6 +39,20 @@
     <label class="check-label"><input type="checkbox" name="confirm" value="yes" required>确认向审核选定的代理提交本票资料</label>
     <button name="action" value="create">提交代理下单</button>
   </form>
+  {% endif %}
+  {% if supplier.address_corrections %}
+  <details><summary>核对并更正收件地址占位值</summary>
+    <form method="post" action="{{ url_for('tms_staff.supplier_action', order_id=order.id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="revision" value="{{ order.revision }}">
+      {% for key, label in supplier.address_corrections %}
+      <label>{{ label }}<input name="address_{{ key }}" maxlength="200" placeholder="核对确无此资料后可留空"></label>
+      {% endfor %}
+      <label>核对依据<input name="address_reason" maxlength="500" required></label>
+      <label class="check-label"><input type="checkbox" name="address_confirmed" value="yes" required>已核对真实收件资料</label>
+      <button class="secondary" name="action" value="address">保存地址更正</button>
+    </form>
+  </details>
   {% endif %}
   {% endif %}
   {% if preparation.missing %}

@@ -15,7 +15,7 @@ import test_tms_portal as fixture
 import tms_carriers
 from app import app
 from models import BankAccount, CarrierAgent, Customer, ManualTrack, Shipment, db
-from tms_models import TmsAccount, TmsAgentApi, TmsOrder, TmsReceivable, TmsSupplierEvent, TmsSupplierOrder
+from tms_models import TmsAccount, TmsAgentApi, TmsAudit, TmsOrder, TmsReceivable, TmsSupplierEvent, TmsSupplierOrder
 
 
 ORIGIN = "https://demo.nextsls.com"
@@ -257,6 +257,72 @@ class NextSLSTests(unittest.TestCase):
             response = self.post(self.staff, "/track", {"numbers": "0000123"}, "/login")
             self.assertNotIn("错误归属", response.get_data(as_text=True))
             self.assertIn("归属或响应结构无法确认", response.get_data(as_text=True))
+
+    def test_create_rejection_reports_safe_fields_and_locks_duplicate_attempt(self):
+        order_id = self.approve()
+        self.profile()
+        rejection = SimpleNamespace(status_code=200, json=lambda: {
+            "status": 0, "info": "photos is required; 缺少必填字段：brand；synthetic-private-message",
+        })
+        with patch.dict(app.config, TMS_NEXTSLS_CREATE_ENABLED=True), patch(
+            "carrier_http.post", side_effect=[success({"services": [SERVICE]}), rejection],
+        ) as transport:
+            self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 302)
+            self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 400)
+        self.assertEqual([call.args[0].api_url.split("/")[-1] for call in transport.call_args_list],
+                         ["get_services", "create"])
+        link = db.session.get(TmsSupplierOrder, order_id)
+        self.assertEqual(link.state, "uncertain")
+        self.assertFalse(link.supplier_number)
+        attempt = TmsSupplierEvent.query.filter_by(order_id=order_id, kind="attempt").order_by(
+            TmsSupplierEvent.id.desc()).first()
+        self.assertTrue(attempt.details["supplier_rejected"])
+        body = self.get(self.staff, f"/tms/admin/orders/{order_id}").get_data(as_text=True)
+        for label in ("代理返回失败 · 待对账", "商品图片（photos）", "品牌"):
+            self.assertIn(label, body)
+        self.assertNotIn("synthetic-private-message", body)
+        self.assertNotIn("synthetic-private-message", str(attempt.details))
+
+    def test_only_staff_can_correct_unsubmitted_supplier_address_placeholders(self):
+        order_id = self.approve()
+        self.profile()
+        order = db.session.get(TmsOrder, order_id)
+        original_file = order.workbook
+        original_address = dict(order.invoice["address"], mobile="73", street2="73", street3="73")
+        invoice = dict(order.invoice, address=original_address)
+        invoice.pop("submitted_destination", None)
+        invoice.pop("destination_review", None)
+        order.invoice = invoice
+        db.session.commit()
+        revision = order.revision
+        path = f"/tms/admin/orders/{order_id}/supplier"
+        form = dict(revision=revision, address_confirmed="yes", address_reason="核对原始收件资料",
+                    address_mobile="", address_street2="Verified Suite", address_street3="")
+        self.assertIn('name="address_mobile"', self.get(self.staff, path.rsplit("/", 1)[0]).get_data(as_text=True))
+        self.assertEqual(self.staff.post(path, data={"action": "address", **form}).status_code, 400)
+        self.staff_login("tms-test-reader")
+        self.assertEqual(self.action(order_id, "address", **form).status_code, 403)
+        self.staff_login()
+        self.assertEqual(self.action(order_id, "address", **(form | {"revision": revision - 1})).status_code, 400)
+        self.assertEqual(self.action(order_id, "address", **(form | {"address_mobile": "73"})).status_code, 400)
+        self.assertEqual(self.action(order_id, "address", **form, address_street="Must not change").status_code, 302)
+        db.session.refresh(order)
+        self.assertEqual(order.workbook, original_file)
+        self.assertEqual(order.invoice["address"], original_address | {
+            "mobile": "", "street2": "Verified Suite", "street3": "",
+        })
+        self.assertEqual(nextsls.unverified_destination_fields(order.invoice), [])
+        self.assertEqual(order.invoice["supplier_address_reviews"][0]["before"], {
+            "mobile": "73", "street2": "73", "street3": "73",
+        })
+        self.assertEqual(order.invoice["submitted_destination"]["address"], original_address)
+        self.assertEqual(self.get(self.staff, path.rsplit("/", 1)[0]).status_code, 200)
+        self.assertEqual(TmsAudit.query.filter_by(order_id=order_id, action="supplier_address").count(), 1)
+        self.assign_supplier_number(order_id)
+        order.invoice = dict(order.invoice, address=original_address)
+        db.session.commit()
+        self.assertEqual(self.action(order_id, "address", **(form | {"revision": order.revision})).status_code, 400)
+        self.carrier_post.assert_not_called()
 
     def test_timeout_requires_reconciliation_never_blind_retry(self):
         order_id = self.approve()

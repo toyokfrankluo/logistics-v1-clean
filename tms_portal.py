@@ -55,6 +55,7 @@ AUDIT_LABELS = {
     "settle": "确认最终应收",
     "supplier_channel": "更正未提交的代理渠道",
     "supplier_prep": "保存下单补充资料",
+    "supplier_address": "更正下单收件地址",
 }
 BUSINESS_TIME = timezone(timedelta(hours=8))
 ORDER_FILTERS = {
@@ -67,6 +68,7 @@ DESTINATION_FIELDS = {
     "city": "城市", "region": "省份 / 州", "postal_code": "邮编", "country": "国家二字代码",
     "phone": "电话", "mobile": "手机", "email": "邮箱",
 }
+SUPPLIER_ADDRESS_CORRECTIONS = ("mobile", "street2", "street3")
 
 
 def account_name(value):
@@ -715,6 +717,8 @@ def staff_detail(order, **context):
                                  if link and link.state == "uncertain" else None),
                 "agent_name": agent.name if agent else "—",
                 "preparation": preparation, "agent_id": agent.id if agent else None,
+                "address_corrections": supplier_address_corrections(order)
+                if unsubmitted and profile and profile.provider == "nextsls" else [],
                 "supplement_fields": nextsls.SUPPLEMENTAL_DECLARATIONS,
                 "channel_choices": ({code: name for code, name in tms_carriers.channel_catalogue(profile).items()
                                      if code != order.agent_service}
@@ -762,7 +766,8 @@ def review(order_id):
 def supplier_action(order_id):
     order = reviewable_order(order_id)
     action = request.form.get("action")
-    if action not in {"create", "channel", "prepare", "reconcile", "retry", "sync", "cost", "measurement_review"}:
+    if action not in {"create", "channel", "prepare", "address", "reconcile", "retry", "sync", "cost",
+                      "measurement_review"}:
         abort(400)
     try:
         if action == "create":
@@ -772,13 +777,16 @@ def supplier_action(order_id):
                 raise nextsls.ProtocolError("订单已经更新，请重新核对本票下单资料。")
             state = tms_carriers.send_order(order, current_user.id)
             message = ("已保存供应商运单号。" if state == "linked"
-                       else "提交结果未确认。请先对账，系统不会自动重试。")
+                       else "未取得代理运单号。请先对账，系统不会自动重试。")
         elif action == "channel":
             correct_supplier_channel(order)
             message = "已更正未提交的代理渠道。"
         elif action == "prepare":
             save_supplier_supplement(order, request.form)
             message = "已保存下单补充资料。"
+        elif action == "address":
+            correct_supplier_address(order, request.form)
+            message = "已保存收件地址更正记录。"
         elif action == "reconcile":
             state = tms_carriers.reconcile_order(order, current_user.id)
             message = ("已核对并保存供应商运单号。" if state == "linked"
@@ -805,6 +813,49 @@ def supplier_action(order_id):
         abort(409, "代理数据未能保存。若已提交下单，请先对账。")
     flash(message, "success")
     return redirect(url_for("tms_staff.review", order_id=order.id))
+
+
+def supplier_address_corrections(order):
+    pending = nextsls.unverified_destination_fields(order.invoice)
+    return [(key, DESTINATION_FIELDS[key]) for key in SUPPLIER_ADDRESS_CORRECTIONS if key in pending]
+
+
+def correct_supplier_address(order, form):
+    db.session.refresh(order, with_for_update=True)
+    if form.get("revision", type=int) != order.revision:
+        raise nextsls.ProtocolError("订单已更新，请刷新后核对收件地址。")
+    shipment, _ = tms_carriers.approved_shipment(order)
+    link = db.session.get(TmsSupplierOrder, order.id)
+    profile = tms_carriers.agent_profile(order.agent_id)
+    if (shipment.shipment_id or (link and (link.state != "new" or link.attempt_at))
+            or not profile or profile.provider != "nextsls"):
+        raise nextsls.ProtocolError("仅可更正尚未提交的 NextSLS 订单。")
+    fields = supplier_address_corrections(order)
+    if not fields or form.get("address_confirmed") != "yes":
+        raise nextsls.ProtocolError("请按真实收件资料核对后确认更正。")
+    reason = nextsls.supplied_text(form.get("address_reason"), 500)
+    original = order.invoice["address"]
+    changes = {}
+    for key, label in fields:
+        values = form.getlist(f"address_{key}")
+        if len(values) != 1:
+            raise nextsls.ProtocolError(f"请核对「{label}」。")
+        value = values[0].strip()
+        if len(value) > 200 or value == "73" or any(ord(char) < 32 for char in value):
+            raise nextsls.ProtocolError(f"请填写真实的「{label}」，确认无此资料时可留空。")
+        changes[key] = value
+    previous_review = order.invoice.get("destination_review", {})
+    review = dict(previous_review)
+    review.update(by=current_user.id, at=datetime.now(timezone.utc).isoformat(), changed=True, reason=reason)
+    record = {"by": review["by"], "at": review["at"], "reason": reason,
+              "before": {key: original[key] for key in changes}, "after": changes,
+              "previous_review": previous_review}
+    invoice = dict(order.invoice, address=original | changes, destination_review=review,
+                   supplier_address_reviews=[*order.invoice.get("supplier_address_reviews", []), record])
+    invoice.setdefault("submitted_destination", {"address_code": invoice["address_code"], "address": original})
+    update_order(order, {"invoice": invoice})
+    history(order, "supplier_address")
+    db.session.commit()
 
 
 def correct_supplier_channel(order):

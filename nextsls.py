@@ -45,6 +45,10 @@ class ProtocolError(ValueError):
     pass
 
 
+class CreateRejected(ProtocolError):
+    pass
+
+
 class PreparationError(ProtocolError):
     def __init__(self, blockers):
         self.blockers = tuple(dict.fromkeys(blockers))
@@ -109,9 +113,36 @@ def request_data(agent, origin, path, payload, *, transport=None):
         raise ProtocolError("NextSLS 请求失败或响应不可解析。") from None
     if response.status_code != 200 or not isinstance(data, dict) or type(data.get("status")) is not int:
         raise ProtocolError("NextSLS 返回了无效响应。")
+    if path == "/shipment/create" and data["status"] == 0:
+        raise CreateRejected(create_rejection_message(data.get("info")))
     if data["status"] != 1:
         raise ProtocolError("NextSLS 拒绝请求，请核对账号权限及渠道必填项。")
     return object_value(data.get("data"))
+
+
+def create_rejection_message(info):
+    message = "供应商返回创建失败（status=0）"
+    if not isinstance(info, str):
+        return message + "，响应未明确指出缺少哪个字段。"
+    # Report only known field identifiers with explicit missing-field wording, never echo provider text.
+    labels = {"photos": "商品图片（photos）", "photo_url": "商品图片链接（photo_url）",
+              "attachments": "附件（attachments）", "packing_list": "装箱单（packing_list）",
+              "to_address": "收件地址（to_address）", "mobile": "收件手机（mobile）",
+              **SUPPLEMENTAL_DECLARATIONS}
+    fields = "|".join(labels)
+    mentioned = set()
+    for line in re.split(r"[;；\r\n]", info[:1000]):
+        missing = re.match(
+            rf"\s*(?:(?:字段\s*)?[\x60'\"“]?({fields})[\x60'\"”]?\s*[:：]?\s*"
+            rf"(?:必填|不能为空|缺失|(?:is\s+)?(?:required|missing)\b)"
+            rf"|(?:缺少(?:必填)?字段|missing(?: required)? field)\s*[:：]\s*[\x60'\"“]?({fields})\b)",
+            line, re.IGNORECASE,
+        )
+        if missing:
+            mentioned.add((missing[1] or missing[2]).lower())
+    if mentioned:
+        return message + "，响应指出缺少：" + "、".join(label for key, label in labels.items() if key in mentioned) + "。"
+    return message + "，响应未明确指出缺少哪个字段。"
 
 
 def object_value(value):
@@ -225,6 +256,15 @@ def packing_url_host(value):
         raise ProtocolError("装箱单须使用经授权的 HTTPS 文件链接。") from None
 
 
+def unverified_destination_fields(invoice):
+    suspicious = address_placeholders(invoice["address"])
+    review = invoice.get("destination_review", {})
+    verified = review.get("verified_optional", {})
+    return [key for key in suspicious if key in {"mobile", "phone"}
+            or not (review.get("by") and review.get("at") and review.get("reason")
+                    and verified.get(key) == invoice["address"][key])]
+
+
 def create_payload(invoice, code, reference, profile, sender, *, supplement=None, packing_host="",
                    publish_photos=None, publish_packing=None):
     """Translate a reviewed invoice; do not manufacture fields missing for the selected service."""
@@ -232,12 +272,7 @@ def create_payload(invoice, code, reference, profile, sender, *, supplement=None
         raise ProtocolError("渠道代码或系统对账参考号无效。")
     profile = preparation_rules(profile)
     blockers = []
-    suspicious = address_placeholders(invoice["address"])
-    review = invoice.get("destination_review", {})
-    verified = review.get("verified_optional", {})
-    if ({"mobile", "phone"}.intersection(suspicious)
-            or any(not (review.get("by") and review.get("at") and review.get("reason")
-                        and verified.get(key) == invoice["address"][key]) for key in suspicious)):
+    if unverified_destination_fields(invoice):
         blockers.append("收件地址含未经核对的历史模板占位值，请更正后再提交")
     to_address = {target: invoice["address"].get(source, "") for target, source in ADDRESS.items()}
     try:
