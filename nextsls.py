@@ -39,6 +39,11 @@ SUPPLEMENTAL_DECLARATIONS = {
 }
 REQUIRED_FLAGS = ("tel_required", "email_required", "company_required", "city_required",
                   "vat_number_required", "eori_required", "packing_list_required")
+DESTINATION_PLACEHOLDER_BLOCKER = "收件地址含未经核对的历史模板占位值，请更正后再提交"
+PHOTOS_PROTOCOL_BLOCKER = "渠道要求 photos，图片传输格式尚待供应商确认"
+PHOTO_URL_PUBLICATION_BLOCKER = "商品图片链接传输尚未获准"
+PACKING_TRANSMISSION_BLOCKER = "渠道要求装箱单，创建时的自动传输方式尚待供应商确认"
+UNSUPPORTED_DECLARATION_BLOCKER = "当前发票映射不支持该渠道的全部必填申报字段"
 
 
 class ProtocolError(ValueError):
@@ -273,7 +278,7 @@ def create_payload(invoice, code, reference, profile, sender, *, supplement=None
     profile = preparation_rules(profile)
     blockers = []
     if unverified_destination_fields(invoice):
-        blockers.append("收件地址含未经核对的历史模板占位值，请更正后再提交")
+        blockers.append(DESTINATION_PLACEHOLDER_BLOCKER)
     to_address = {target: invoice["address"].get(source, "") for target, source in ADDRESS.items()}
     try:
         to_address = address_values(to_address)
@@ -329,20 +334,20 @@ def create_payload(invoice, code, reference, profile, sender, *, supplement=None
     unsupported = sorted(set(requirements) - supported)
     packing_required = required_flag(profile, "packing_list_required")
     if packing_required and (publish_packing is None or not packing_host):
-        blockers.append("渠道要求装箱单，创建时的自动传输方式尚待供应商确认")
+        blockers.append(PACKING_TRANSMISSION_BLOCKER)
     if "photos" in unsupported:
-        blockers.append("渠道要求 photos，图片传输格式尚待供应商确认")
+        blockers.append(PHOTOS_PROTOCOL_BLOCKER)
         unsupported.remove("photos")
     if unsupported:
         known = sorted(set(unsupported) & {"amazon_ref_id", "brand", "model", "photos", "weight", "size"})
-        blockers.append("当前发票映射不支持该渠道的全部必填申报字段" + (f"（{', '.join(known)}）" if known else ""))
+        blockers.append(UNSUPPORTED_DECLARATION_BLOCKER + (f"（{', '.join(known)}）" if known else ""))
     missing = missing_supplements(invoice, supplement, profile)
     missing_fields = [label for field, label in SUPPLEMENTAL_DECLARATIONS.items()
                       if any(field in fields for fields in missing.values())]
     if missing_fields:
         blockers.append("请逐条补充申报：" + "、".join(missing_fields))
     if "photo_url" in requirements and publish_photos is None:
-        blockers.append("商品图片链接传输尚未获准")
+        blockers.append(PHOTO_URL_PUBLICATION_BLOCKER)
     if {"photos", "photo_url"}.intersection(requirements) and any(
         not item.get("image_part") for item in invoice["declarations"]
     ):

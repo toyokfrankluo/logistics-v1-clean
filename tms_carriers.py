@@ -27,6 +27,10 @@ COST_OWNERSHIP = {"payable": "属于星睿应付", "not_payable": "已确认无�
 CHANNEL_MAPPINGS = "sales_service_mappings"
 CHANNEL_CATALOGUE = "channel_catalogue"
 CHANNEL_CATALOGUE_TTL = timedelta(hours=24)
+CREATE_DISABLED = "系统未开放真实下单"
+READ_DISABLED = "系统未开放 NextSLS 只读请求"
+ORDER_NOT_AUTHORIZED = "此订单不在本次真实下单授权范围内"
+BC_IMAGE_PROTOCOL_BLOCKER = "该渠道的真实商品图片传输尚待供应商确认"
 BC_ORIGIN = "https://bckjkj.nextsls.com"
 
 
@@ -158,7 +162,7 @@ def capability_blockers(profile, agent, key):
         blockers.append("请先到代理编辑页刷新 NextSLS 渠道清单")
     switch = "TMS_NEXTSLS_CREATE_ENABLED" if key == "create" else "TMS_NEXTSLS_READ_ENABLED"
     if not current_app.config.get(switch):
-        blockers.append("系统未开放真实下单" if key == "create" else "系统未开放 NextSLS 只读请求")
+        blockers.append(CREATE_DISABLED if key == "create" else READ_DISABLED)
     return blockers
 
 
@@ -177,24 +181,41 @@ def create_blockers(profile, agent, code, order_id):
     catalogue = channel_catalogue(profile)
     if catalogue and code not in catalogue:
         blockers.append("审核所选渠道未列入代理的已确认渠道代码")
-    if not current_app.config.get("TMS_NEXTSLS_CREATE_ENABLED") and "系统未开放真实下单" not in blockers:
-        blockers.append("系统未开放真实下单")
+    if not current_app.config.get("TMS_NEXTSLS_CREATE_ENABLED") and CREATE_DISABLED not in blockers:
+        blockers.append(CREATE_DISABLED)
     if (profile and profile.base_url == BC_ORIGIN
             and code in {"B888", "B888-1", "B888-2"} and not current_app.config.get("ISOLATED_MODE")):
-        blockers.append("该渠道的真实商品图片传输尚待供应商确认")
+        blockers.append(BC_IMAGE_PROTOCOL_BLOCKER)
     if profile and profile.provider == "nextsls" and not current_app.config.get("ISOLATED_MODE"):
         if current_app.config.get("TMS_NEXTSLS_CREATE_ORDER_ID") != str(order_id):
-            blockers.append("此订单不在本次真实下单授权范围内")
+            blockers.append(ORDER_NOT_AUTHORIZED)
         blockers.extend(f"只读对账：{reason}" for reason in capability_blockers(profile, agent, "reconcile"))
     return blockers
+
+
+def supplier_blocker_groups(blockers):
+    groups = {"A. 管理员可修正的资料和代理配置": [], "B. 待供应商确认的协议": [], "C. 单票授权及系统开关": []}
+    admin, protocol, authorization = groups.values()
+    for message in dict.fromkeys(blockers):
+        if message in (CREATE_DISABLED, ORDER_NOT_AUTHORIZED, f"只读对账：{READ_DISABLED}"):
+            authorization.append(message)
+        elif (message in (BC_IMAGE_PROTOCOL_BLOCKER, nextsls.PHOTOS_PROTOCOL_BLOCKER,
+                          nextsls.PHOTO_URL_PUBLICATION_BLOCKER, nextsls.PACKING_TRANSMISSION_BLOCKER)
+              or message.startswith(nextsls.UNSUPPORTED_DECLARATION_BLOCKER)):
+            protocol.append(message)
+        else:
+            admin.append(message)
+    return {label: messages for label, messages in groups.items() if messages}
 
 
 def supplier_preparation(order, profile, agent):
     code = order.agent_service
     blockers = create_blockers(profile, agent, code, order.id)
-    result = {"blockers": blockers, "missing": {}, "packing_required": None,
+    result = {"blockers": blockers, "missing": {}, "packing_required": None, "required_photo_fields": None,
               "allow_no_model": bool(profile and profile.provider == "nextsls" and profile.base_url == BC_ORIGIN),
               "image_count": sum(bool(item.get("image_part")) for item in order.invoice["declarations"])}
+    if nextsls.unverified_destination_fields(order.invoice):
+        blockers.append(nextsls.DESTINATION_PLACEHOLDER_BLOCKER)
     if not profile or profile.provider != "nextsls":
         return result
     origin = order.invoice.get("supplier_tenant_origin")
@@ -208,6 +229,8 @@ def supplier_preparation(order, profile, agent):
         blockers.append("此渠道的完整必填规则尚未读取或已过期，请到代理设置刷新 NextSLS 渠道清单")
         return result
     result["packing_required"] = nextsls.required_flag(rules, "packing_list_required")
+    result["required_photo_fields"] = [field for field in ("photos", "photo_url")
+                                       if field in rules["require_declaration_list"]]
     supplement = order_supplement(order)
     result["missing"] = nextsls.missing_supplements(order.invoice, supplement, rules)
     try:

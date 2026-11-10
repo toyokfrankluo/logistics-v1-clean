@@ -17,6 +17,12 @@
     <div><dt>箱数</dt><dd>{{ invoice.boxes|length }}</dd></div>
     <div><dt>申报信息</dt><dd>{{ invoice.declarations|length }} 项 · {{ totals.value }} USD · {{ invoice.metadata.declaration_mode }}</dd></div>
     <div><dt>商品图片</dt><dd>从星睿 Excel 识别 {{ preparation.image_count }} / {{ invoice.declarations|length }} 张</dd></div>
+    <div><dt>图片传输配置</dt><dd>{% if preparation.required_photo_fields %}
+      {{ preparation.required_photo_fields|join('、') }} 为本渠道必填，真实传输未配置
+      {% elif preparation.required_photo_fields is none %}等待当前渠道规则
+      {% else %}当前渠道规则未要求图片字段{% endif %}</dd></div>
+    <div><dt>供应商读取图片</dt><dd>尚未验证</dd></div>
+    <div><dt>本票创建验收</dt><dd>未提交</dd></div>
     <div><dt>装箱单</dt><dd>{% if preparation.packing_required is true %}
       可由系统按审核后的箱货数据生成。创建传输待确认。
       <a href="{{ url_for('tms_staff.supplier_packing_draft', order_id=order.id) }}">下载草稿</a>
@@ -27,7 +33,10 @@
   <ul>{% for item in invoice.declarations %}<li>{{ item.box_number }} · {{ item.name_zh }} / {{ item.name_en }} · {{ item.quantity }} 件 · {{ item.total_usd }} USD</li>{% endfor %}</ul>
   {% if preparation.blockers %}
     <p class="notice">暂不能提交</p>
-    <ul>{% for blocker in preparation.blockers %}<li>{{ blocker }}</li>{% endfor %}</ul>
+    {% for label, messages in supplier.blocker_groups.items() %}
+    <h3>{{ label }}</h3>
+    <ul>{% for blocker in messages %}<li>{{ blocker }}</li>{% endfor %}</ul>
+    {% endfor %}
     {% if preparation.packing_required is none and supplier.agent_id %}
     <p><a href="{{ url_for('views.edit_agent', agent_id=supplier.agent_id, _anchor='channel-mapping') }}">前往代理设置核对渠道规则</a></p>
     {% endif %}
@@ -67,7 +76,7 @@
         <div class="pricing-grid">
         {% for key in fields %}
         <label>{{ supplier.supplement_fields[key] }}<input name="supplement_{{ row_index }}_{{ key }}" maxlength="120"
-          {% if key == 'amazon_ref_id' %}placeholder="使用对应 Amazon 货件的参考号"{% endif %}></label>
+          {% if key == 'amazon_ref_id' %}placeholder="从 Amazon 货件详情核对 Reference ID"{% endif %}></label>
         {% if key == 'model' and preparation.allow_no_model %}<label class="check-label"><input type="checkbox" name="supplement_{{ row_index }}_no_model" value="yes">无型号</label>{% endif %}
         {% endfor %}
         </div>

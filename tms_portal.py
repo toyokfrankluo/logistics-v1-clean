@@ -717,6 +717,7 @@ def staff_detail(order, **context):
                                  if link and link.state == "uncertain" else None),
                 "agent_name": agent.name if agent else "—",
                 "preparation": preparation, "agent_id": agent.id if agent else None,
+                "blocker_groups": tms_carriers.supplier_blocker_groups(preparation.get("blockers", [])),
                 "address_corrections": supplier_address_corrections(order)
                 if unsubmitted and profile and profile.provider == "nextsls" else [],
                 "supplement_fields": nextsls.SUPPLEMENTAL_DECLARATIONS,

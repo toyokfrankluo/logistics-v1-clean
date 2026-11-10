@@ -432,6 +432,32 @@ class NextSLSTests(unittest.TestCase):
         self.assertNotIn('name="supplement_0_model"', stale)
         self.carrier_post.assert_not_called()
 
+    def test_photo_required_channel_shows_separate_readiness_and_never_substitutes_photo_url(self):
+        code = "B009-4"
+        service = SERVICE | {"code": code, "require_declaration_list": ["amazon_ref_id", "photos"]}
+        self.profile(service_codes=[code], rules={code: nextsls.preparation_rules(service)})
+        order_id = self.pending_order()
+        self.assertEqual(self.decision(order_id, 2, decision="approve", **self.pricing(
+            agent_service=code)).status_code, 302)
+        path = f"/tms/admin/orders/{order_id}"
+        html = self.get(self.staff, path).get_data(as_text=True)
+        for label in ("A. 管理员可修正的资料和代理配置", "B. 待供应商确认的协议", "C. 单票授权及系统开关",
+                      "识别 3 / 3 张", "photos 为本渠道必填，真实传输未配置", "供应商读取图片", "尚未验证",
+                      "本票创建验收", "未提交", "本渠道无需单独装箱单", 'name="supplement_0_amazon_ref_id"'):
+            self.assertIn(label, html)
+        self.assertNotIn("渠道要求装箱单", html)
+        self.carrier_post.assert_not_called()
+
+        with patch.dict(app.config, TMS_NEXTSLS_CREATE_ENABLED=True), patch(
+            "carrier_http.post", return_value=success({"services": [service]}),
+        ) as transport:
+            result = self.action(order_id, "create", confirm="yes")
+        self.assertEqual(result.status_code, 400)
+        self.assertIn(nextsls.PHOTOS_PROTOCOL_BLOCKER, result.get_data(as_text=True))
+        self.assertTrue(transport.call_args.args[0].api_url.endswith("/shipment/get_services"))
+        self.assertEqual(transport.call_count, 1)
+        self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
+
     def test_bc_no_model_and_channel_change_drop_unneeded_amazon_field(self):
         profile = self.profile(service_codes=["TMS_DEMO", "OTHER"])
         profile.base_url = tms_carriers.BC_ORIGIN
