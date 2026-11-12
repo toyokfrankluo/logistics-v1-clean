@@ -73,11 +73,11 @@ D4 只有一个客户/FBA 订单号输入位，当前不单独记录 FBA Shipmen
 
 商品图片从原工作簿提取。只读取发票明细 O 列的一/双单元格浮动锚点及 WPS 内嵌图片公式，校验每行唯一、真实格式、像素及字节大小。其他工作表和表头图片不参与下单。发送前对照原发票重新核验申报顺序及关联，原工作簿不改写。
 
-第 2 章列出申报级的 `photo_url`（图片链接）和 `photos`（图片），均标注为可选字符串。bc 的 B009-4 实际渠道规则要求 `photos`，文档示例未提供非空编码。第 20 章针对已有运单附件，不能作为创建前商品图片的格式依据。真实 `photos` 编码只允许在代码中按供应商租户和渠道注册已有证据的实现。S3 配置不会替代这项确认，也不会开启真实创建。模拟图片链接只允许隔离测试使用。
+第 2 章列出申报级的 `photo_url`（图片链接）和 `photos`（图片），均标注为可选字符串。bc 的 B009-4 实际渠道规则要求 `photos`，文档示例未提供非空编码。第 20 章针对已有运单附件，不能作为创建前商品图片的格式依据。真实 `photos` 编码只允许在代码中按已验证的适用范围注册：供应商租户通用，或仅限已确认的特定渠道。S3 配置不会替代这项确认，也不会开启真实创建。模拟图片链接只允许隔离测试使用。
 
 真实图片发布需要单独配置私有 Amazon S3 桶。Render 环境变量如下：
 
-- `TMS_NEXTSLS_IMAGE_SCOPE`：`代理ID|HTTPS基础域名|渠道代码`，只启用匹配的账号与渠道。
+- `TMS_NEXTSLS_IMAGE_SCOPE`：`代理ID|HTTPS基础域名`，一次启用指定账号下所有适用渠道。旧三段值继续仅匹配原渠道。
 - `TMS_NEXTSLS_IMAGE_BUCKET`、`TMS_NEXTSLS_IMAGE_REGION`：私有桶名称与区域。桶名不含点，开启四项 Block Public Access，为 `nextsls/` 前缀配置合适的对象清理策略。
 - `TMS_NEXTSLS_IMAGE_ACCESS_KEY_ID`、`TMS_NEXTSLS_IMAGE_SECRET_ACCESS_KEY`，使用临时凭据时还需 `TMS_NEXTSLS_IMAGE_SESSION_TOKEN`。仅授予该桶的 `s3:GetBucketPublicAccessBlock` 及 `nextsls/` 对象的 `s3:PutObject`、`s3:GetObject`。
 - `TMS_NEXTSLS_IMAGE_URL_TTL_SECONDS`：300–604800 秒，必须按供应商确认的抓取与后续展示方式设置。若供应商只保留链接且需要长期读取，应先确认合适的供应商持久化方案。临时凭据到期时间会进一步限制链接寿命。

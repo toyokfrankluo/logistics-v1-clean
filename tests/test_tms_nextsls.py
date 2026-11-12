@@ -509,9 +509,9 @@ class NextSLSTests(unittest.TestCase):
         config = dict(ISOLATED_MODE=False, TMS_NEXTSLS_CREATE_ENABLED=True, TMS_NEXTSLS_READ_ENABLED=True,
                       TMS_NEXTSLS_IMAGE_BUCKET="fixture-bucket",
                       TMS_NEXTSLS_IMAGE_REGION="us-east-1", TMS_NEXTSLS_IMAGE_URL_TTL_SECONDS="900",
-                      TMS_NEXTSLS_IMAGE_SCOPE=f"{order.agent_id}|{ORIGIN}|{code}",
+                      TMS_NEXTSLS_IMAGE_SCOPE=f"{order.agent_id}|{ORIGIN}",
                       TMS_NEXTSLS_IMAGE_ACCESS_KEY_ID="fixture-storage", TMS_NEXTSLS_IMAGE_SECRET_ACCESS_KEY="fixture-only")
-        codec = {(ORIGIN, code): lambda url: "fixture-encoding:" + url}
+        codec = {(ORIGIN, None): lambda url: "fixture-encoding:" + url}
         with patch.dict(app.config, config), patch.dict(tms_supplier_images.CONFIRMED_PHOTOS_ENCODERS, codec), patch(
             "tms_supplier_images.s3_client", return_value=s3,
         ), patch("tms_supplier_images.image_get", side_effect=image_get), patch("carrier_http.post", side_effect=api):
@@ -563,30 +563,42 @@ class NextSLSTests(unittest.TestCase):
         self.assertEqual(tms_carriers.destination_for_create(order), (invoice, []))
 
     def test_bc_no_model_and_channel_change_drop_unneeded_amazon_field(self):
-        profile = self.profile(service_codes=["TMS_DEMO", "OTHER"])
+        profile = self.profile(service_codes=["B009-4", "B009-10", "B009-MD"])
         profile.base_url = tms_carriers.BC_ORIGIN
         self.agent.api_url = ""
-        both = SERVICE | {"require_declaration_list": ["amazon_ref_id", "model"]}
-        model_only = SERVICE | {"require_declaration_list": ["model"]}
-        tms_carriers.store_channel_catalogue(profile, {"TMS_DEMO": "原渠道", "OTHER": "新渠道"},
-            {"TMS_DEMO": nextsls.preparation_rules(both), "OTHER": nextsls.preparation_rules(model_only)})
+        both = SERVICE | {"require_declaration_list": ["amazon_ref_id", "model", "brand", "photos"]}
+        basic = SERVICE
+        packing = both | {"packing_list_required": 1}
+        tms_carriers.store_channel_catalogue(profile, {code: code for code in ("B009-4", "B009-10", "B009-MD")},
+            {code: nextsls.preparation_rules(rule) for code, rule in
+             (("B009-4", both), ("B009-10", basic), ("B009-MD", packing))})
         db.session.commit()
-        order_id = self.approve()
+        order_id = self.pending_order()
+        self.assertEqual(self.decision(order_id, 2, decision="approve",
+                                      **self.pricing(agent_service="B009-4")).status_code, 302)
         fields = {f"supplement_{index}_{key}": value for index in range(3)
-                  for key, value in (("amazon_ref_id", "FIXTURE-REF"), ("no_model", "yes"))}
+                  for key, value in (("amazon_ref_id", "FIXTURE-REF"), ("no_model", "yes"), ("brand", "Fixture Brand"))}
         self.assertEqual(self.action(order_id, "prepare", revision=3, **fields).status_code, 302)
-        self.assertEqual(self.action(order_id, "channel", revision=4, channel_code="OTHER").status_code, 302)
+        self.assertEqual(self.action(order_id, "channel", revision=4, channel_code="B009-10").status_code, 302)
         db.session.expire_all()
         order = db.session.get(TmsOrder, order_id)
-        payload = nextsls.create_payload(order.invoice, "OTHER", "XR-DEMO", model_only, {},
+        payload = nextsls.create_payload(order.invoice, "B009-10", "XR-DEMO", basic, {},
                                          supplement=tms_carriers.order_supplement(order))
         for box in payload["shipment"]["parcels"]:
             for row in box["declarations"]:
-                self.assertEqual(row["model"], "无")
+                self.assertTrue({"model", "brand", "photos", "photo_url"}.isdisjoint(row))
                 self.assertNotIn("amazon_ref_id", row)
         page = self.get(self.staff, f"/tms/admin/orders/{order_id}").get_data(as_text=True)
         self.assertNotIn('name="supplement_0_amazon_ref_id"', page)
         self.assertNotIn('name="supplement_0_model"', page)
+
+        for code, revision in (("B009-MD", 5), ("B009-4", 6)):
+            self.assertEqual(self.action(order_id, "channel", revision=revision, channel_code=code).status_code, 302)
+            db.session.refresh(order)
+            preparation = tms_carriers.supplier_preparation(order, profile, self.agent)
+            self.assertEqual(preparation["missing"], {})
+            self.assertIn(nextsls.PHOTOS_PROTOCOL_BLOCKER, preparation["blockers"])
+            self.assertEqual(nextsls.PACKING_TRANSMISSION_BLOCKER in preparation["blockers"], code == "B009-MD")
 
     def test_b888_invoice_to_mock_create_uses_confirmed_supplement_and_one_reservation(self):
         rule = SERVICE | {"code": "B888", "name": "超级经济线", "packing_list_required": 1,

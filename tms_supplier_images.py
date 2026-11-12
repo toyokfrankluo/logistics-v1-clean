@@ -12,7 +12,7 @@ import nextsls
 from tms_xlsx_images import MAX_PHOTO_BYTES, MAX_PHOTO_TOTAL_BYTES
 
 
-# Add a tenant/channel codec only after confirming its create-request contract.
+# Use (tenant, None) for a verified tenant-wide contract or (tenant, channel) for a verified exception.
 CONFIRMED_PHOTOS_ENCODERS = {}
 IMAGE_TYPES = {"image/png": "png", "image/jpeg": "jpg"}
 MEDIA_ERROR = "商品图片未能通过私有存储的 HTTPS 读取校验，未提交代理下单。"
@@ -36,12 +36,15 @@ def image_delivery(order, profile, rules):
     """Resolve only the configured account/channel and the fields it actually requires."""
     config = current_app.config
     required = nextsls.IMAGE_FIELDS.intersection(rules["require_declaration_list"])
-    scope = f"{order.agent_id}|{profile.base_url}|{order.agent_service}"
+    account_scope = f"{order.agent_id}|{profile.base_url}"
+    legacy_scope = f"{account_scope}|{order.agent_service}"
     if (not required or config.get("ISOLATED_MODE") or profile.provider != "nextsls"
-            or profile.agent_id != order.agent_id or config.get("TMS_NEXTSLS_IMAGE_SCOPE") != scope):
+            or profile.agent_id != order.agent_id or config.get("TMS_NEXTSLS_IMAGE_SCOPE") not in (account_scope, legacy_scope)):
         return None, {}
     encoders = {"photo_url": str} if "photo_url" in required else {}
-    encoder = CONFIRMED_PHOTOS_ENCODERS.get((profile.base_url, order.agent_service))
+    encoder = CONFIRMED_PHOTOS_ENCODERS.get(
+        (profile.base_url, order.agent_service), CONFIRMED_PHOTOS_ENCODERS.get((profile.base_url, None)),
+    )
     if "photos" in required and encoder is not None:
         encoders["photos"] = encoder
     bucket = config.get("TMS_NEXTSLS_IMAGE_BUCKET", "")

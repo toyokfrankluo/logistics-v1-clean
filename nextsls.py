@@ -379,9 +379,9 @@ def create_payload(invoice, code, reference, profile, sender, *, supplement=None
     if not parcels:
         raise ProtocolError("没有可提交的箱货数据。")
     declarations = []
+    fields = [key for key in SUPPLEMENTAL_DECLARATIONS if key in requirements]
     for index, item in enumerate(invoice["declarations"]):
         declaration = {target: supplied_text(item.get(source)) for target, source in DECLARATIONS.items()}
-        fields = [key for key in SUPPLEMENTAL_DECLARATIONS if key != "amazon_ref_id" or key in requirements]
         declaration.update(declaration_supplements(invoice, supplement, index, fields))
         qty = item["quantity"]
         if type(qty) is not int or qty <= 0:
