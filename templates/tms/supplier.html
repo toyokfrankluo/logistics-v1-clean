@@ -114,7 +114,9 @@
     {% endif %}
     {% if supplier.can_reconcile %}<form method="post" action="{{ url_for('tms_staff.supplier_action', order_id=order.id) }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="secondary" name="action" value="reconcile">按唯一参考号查询创建结果</button>
-    </form>{% endif %}
+    </form>{% else %}
+    <p class="notice">创建结果未确认，已锁定重复提交。请联系代理按上方唯一参考号核实；如需系统查询，可由管理员单独启用查询创建结果功能。</p>
+    {% endif %}
     {% if link.state == 'not_found' %}<details><summary>人工核实后解除重试锁</summary>
       <form method="post" action="{{ url_for('tms_staff.supplier_action', order_id=order.id) }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">

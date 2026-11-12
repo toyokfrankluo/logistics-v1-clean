@@ -191,7 +191,6 @@ def create_blockers(profile, agent, code, order_id):
     if profile and profile.provider == "nextsls" and not current_app.config.get("ISOLATED_MODE"):
         if current_app.config.get("TMS_NEXTSLS_CREATE_ORDER_ID") != str(order_id):
             blockers.append(ORDER_NOT_AUTHORIZED)
-        blockers.extend(f"只读对账：{reason}" for reason in capability_blockers(profile, agent, "reconcile"))
     return blockers
 
 
@@ -199,7 +198,7 @@ def supplier_blocker_groups(blockers):
     groups = {"A. 管理员可修正的资料和代理配置": [], "B. 待供应商确认的协议": [], "C. 单票授权及系统开关": []}
     admin, protocol, authorization = groups.values()
     for message in dict.fromkeys(blockers):
-        if message in (CREATE_DISABLED, ORDER_NOT_AUTHORIZED, f"只读对账：{READ_DISABLED}"):
+        if message in (CREATE_DISABLED, ORDER_NOT_AUTHORIZED):
             authorization.append(message)
         elif (message in (BC_IMAGE_PROTOCOL_BLOCKER, nextsls.PHOTOS_PROTOCOL_BLOCKER,
                           nextsls.PHOTO_URL_PUBLICATION_BLOCKER, nextsls.PACKING_TRANSMISSION_BLOCKER)
@@ -245,8 +244,6 @@ def supplier_preparation(order, profile, agent):
     if origin and origin != profile.base_url:
         blockers.append("代理租户已与审核记录不符")
         return result
-    if agent and current_app.config.get("ISOLATED_MODE"):
-        blockers.extend(f"只读对账：{reason}" for reason in capability_blockers(profile, agent, "reconcile"))
     rules = channel_rules(profile, code)
     if rules is None:
         blockers.append("此渠道的完整必填规则尚未读取或已过期，请到代理设置刷新 NextSLS 渠道清单")

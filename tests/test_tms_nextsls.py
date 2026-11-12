@@ -413,7 +413,8 @@ class NextSLSTests(unittest.TestCase):
             "packing_list": {"name": "old.xlsx", "url": "https://files.example.com/old.xlsx"}})
         db.session.commit()
         page = self.get(self.staff, f"/tms/admin/orders/{order_id}").get_data(as_text=True)
-        for message in ("系统未开放真实下单", "只读对账", "装箱单", "识别 3 / 3 张"):
+        self.assertNotIn("只读对账", page)
+        for message in ("系统未开放真实下单", "装箱单", "识别 3 / 3 张"):
             self.assertIn(message, page)
         self.assertNotIn('name="supplement_0_brand"', page)
         self.assertIn('name="supplement_0_amazon_ref_id"', page)
@@ -1068,6 +1069,73 @@ class NextSLSTests(unittest.TestCase):
         }, "/login").status_code, 302)
         db.session.expire_all()
         self.assertFalse(tms_carriers.channel_catalogue(profile))
+
+    def test_create_without_read_capability_succeeds_once(self):
+        # Synthetic business data; the HTTP boundary is mocked even in non-isolated mode.
+        code = "B009-10"
+        service = SERVICE | {"code": code, "require_declaration_list":
+                             ["hscode", "material", "name_zh", "qty", "unit_value", "usage"]}
+        profile = self.profile(enabled=["create"], service_codes=[code],
+                               rules={code: nextsls.preparation_rules(service)})
+        order_id = self.pending_order()
+        self.assertEqual(self.decision(order_id, 2, decision="approve",
+                                      **self.pricing(agent_service=code)).status_code, 302)
+        calls = []
+
+        def fake(target, *, json, headers):
+            path = target.api_url.rsplit("/", 1)[-1]
+            calls.append(path)
+            if path == "get_services":
+                return success({"services": [service]})
+            self.assertEqual(path, "create")
+            self.assertEqual(json["shipment"]["service"], code)
+            for parcel in json["shipment"]["parcels"]:
+                for row in parcel["declarations"]:
+                    for field in ("photos", "photo_url", "amazon_ref_id"):
+                        self.assertNotIn(field, row)
+            return success({"shipment": {"shipment_id": SUPPLIER_NUMBER}})
+
+        with patch.dict(app.config, ISOLATED_MODE=False, TMS_NEXTSLS_CREATE_ENABLED=True,
+                        TMS_NEXTSLS_READ_ENABLED=False, TMS_NEXTSLS_CREATE_ORDER_ID=str(order_id)), patch(
+                "carrier_http.post", side_effect=fake), patch(
+                "tms_supplier_images.publish_images") as publish:
+            page = self.get(self.staff, f"/tms/admin/orders/{order_id}").get_data(as_text=True)
+            self.assertIn('name="action" value="create"', page)
+            self.assertNotIn("只读对账", page)
+            self.assertNotIn('name="supplement_0_amazon_ref_id"', page)
+            self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 302)
+            self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 400)
+            publish.assert_not_called()
+        self.assertEqual(calls, ["get_services", "create"])
+        self.assertEqual(db.session.get(TmsSupplierOrder, order_id).state, "linked")
+        self.assertNotIn("reconcile", profile.verified)
+
+    def test_timeout_without_read_capability_stays_locked(self):
+        order_id = self.approve()
+        self.profile(enabled=["create"])
+        calls = []
+
+        def fake(target, *, json, headers):
+            path = target.api_url.rsplit("/", 1)[-1]
+            calls.append(path)
+            if path == "get_services":
+                return success({"services": [SERVICE]})
+            self.assertEqual(path, "create")
+            raise carrier_http.CarrierRequestError("synthetic-timeout")
+
+        with patch.dict(app.config, ISOLATED_MODE=False, TMS_NEXTSLS_CREATE_ENABLED=True,
+                        TMS_NEXTSLS_READ_ENABLED=False, TMS_NEXTSLS_CREATE_ORDER_ID=str(order_id)), patch(
+                "carrier_http.post", side_effect=fake):
+            self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 302)
+            self.assertEqual(db.session.get(TmsSupplierOrder, order_id).state, "uncertain")
+            self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 400)
+            self.assertEqual(self.action(order_id, "retry", confirm="yes", reason="test").status_code, 400)
+            self.assertEqual(self.action(order_id, "reconcile").status_code, 400)
+            page = self.get(self.staff, f"/tms/admin/orders/{order_id}").get_data(as_text=True)
+            self.assertIn("创建结果未确认，已锁定重复提交", page)
+            self.assertNotIn('name="action" value="create"', page)
+        self.assertEqual(calls, ["get_services", "create"])
+        self.assertEqual(db.session.get(TmsSupplierOrder, order_id).state, "uncertain")
 
     def test_real_create_switch_also_requires_the_explicit_order_id(self):
         order_id = self.approve()
