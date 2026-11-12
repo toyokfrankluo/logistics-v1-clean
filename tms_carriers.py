@@ -31,8 +31,6 @@ CHANNEL_CATALOGUE = "channel_catalogue"
 CHANNEL_CATALOGUE_TTL = timedelta(hours=24)
 CREATE_DISABLED = "系统未开放真实下单"
 READ_DISABLED = "系统未开放 NextSLS 只读请求"
-ORDER_NOT_AUTHORIZED = "此订单不在本次真实下单授权范围内"
-BC_IMAGE_PROTOCOL_BLOCKER = "该渠道的真实商品图片传输尚待供应商确认"
 BC_ORIGIN = "https://bckjkj.nextsls.com"
 
 
@@ -176,7 +174,7 @@ def available(profile, agent, key):
     return unavailable_reason(profile, agent, key) is None
 
 
-def create_blockers(profile, agent, code, order_id):
+def create_blockers(profile, agent, code):
     if not agent:
         return ["未找到订单所选代理"]
     blockers = capability_blockers(profile, agent, "create")
@@ -185,22 +183,16 @@ def create_blockers(profile, agent, code, order_id):
         blockers.append("审核所选渠道未列入代理的已确认渠道代码")
     if not current_app.config.get("TMS_NEXTSLS_CREATE_ENABLED") and CREATE_DISABLED not in blockers:
         blockers.append(CREATE_DISABLED)
-    if (profile and profile.base_url == BC_ORIGIN
-            and code in {"B888", "B888-1", "B888-2"} and not current_app.config.get("ISOLATED_MODE")):
-        blockers.append(BC_IMAGE_PROTOCOL_BLOCKER)
-    if profile and profile.provider == "nextsls" and not current_app.config.get("ISOLATED_MODE"):
-        if current_app.config.get("TMS_NEXTSLS_CREATE_ORDER_ID") != str(order_id):
-            blockers.append(ORDER_NOT_AUTHORIZED)
     return blockers
 
 
 def supplier_blocker_groups(blockers):
-    groups = {"A. 管理员可修正的资料和代理配置": [], "B. 待供应商确认的协议": [], "C. 单票授权及系统开关": []}
+    groups = {"A. 管理员可修正的资料和代理配置": [], "B. 待供应商确认的协议": [], "C. 站点创建开关": []}
     admin, protocol, authorization = groups.values()
     for message in dict.fromkeys(blockers):
-        if message in (CREATE_DISABLED, ORDER_NOT_AUTHORIZED):
+        if message == CREATE_DISABLED:
             authorization.append(message)
-        elif (message in (BC_IMAGE_PROTOCOL_BLOCKER, nextsls.PHOTOS_PROTOCOL_BLOCKER,
+        elif (message in (nextsls.PHOTOS_PROTOCOL_BLOCKER,
                           nextsls.PHOTO_URL_PUBLICATION_BLOCKER, nextsls.PACKING_TRANSMISSION_BLOCKER)
               or message.startswith(nextsls.UNSUPPORTED_DECLARATION_BLOCKER)):
             protocol.append(message)
@@ -230,7 +222,7 @@ def destination_for_create(order):
 
 def supplier_preparation(order, profile, agent):
     code = order.agent_service
-    blockers = create_blockers(profile, agent, code, order.id)
+    blockers = create_blockers(profile, agent, code)
     result = {"blockers": blockers, "missing": {}, "packing_required": None, "required_photo_fields": None,
               "allow_no_model": bool(profile and profile.provider == "nextsls" and profile.base_url == BC_ORIGIN),
               "image_count": sum(bool(item.get("image_part")) for item in order.invoice["declarations"])}
@@ -339,7 +331,7 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
     if transport is not None and not current_app.config.get("ISOLATED_MODE"):
         raise nextsls.ProtocolError("真实环境禁止使用模拟供应商传输。")
     agent = db.session.get(CarrierAgent, order.agent_id) if order.agent_id else None
-    blockers = create_blockers(agent_profile(order.agent_id) if agent else None, agent, order.agent_service, order.id)
+    blockers = create_blockers(agent_profile(order.agent_id) if agent else None, agent, order.agent_service)
     if blockers:
         raise nextsls.ProtocolError("；".join(blockers) + "。")
     shipment, agent, profile, link = operation_context(order, "create")

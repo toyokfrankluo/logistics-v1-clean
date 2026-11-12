@@ -444,7 +444,7 @@ class NextSLSTests(unittest.TestCase):
             agent_service=code)).status_code, 302)
         path = f"/tms/admin/orders/{order_id}"
         html = self.get(self.staff, path).get_data(as_text=True)
-        for label in ("A. 管理员可修正的资料和代理配置", "B. 待供应商确认的协议", "C. 单票授权及系统开关",
+        for label in ("A. 管理员可修正的资料和代理配置", "B. 待供应商确认的协议", "C. 站点创建开关",
                       "识别 3 / 3 张", "photos 为本渠道必填，真实传输未配置", "供应商读取图片", "尚未验证",
                       "本票创建验收", "未提交", "本渠道无需单独装箱单", 'name="supplement_0_amazon_ref_id"'):
             self.assertIn(label, html)
@@ -507,7 +507,7 @@ class NextSLSTests(unittest.TestCase):
             return success({"shipment": {"shipment_id": SUPPLIER_NUMBER}})
 
         config = dict(ISOLATED_MODE=False, TMS_NEXTSLS_CREATE_ENABLED=True, TMS_NEXTSLS_READ_ENABLED=True,
-                      TMS_NEXTSLS_CREATE_ORDER_ID=str(order_id), TMS_NEXTSLS_IMAGE_BUCKET="fixture-bucket",
+                      TMS_NEXTSLS_IMAGE_BUCKET="fixture-bucket",
                       TMS_NEXTSLS_IMAGE_REGION="us-east-1", TMS_NEXTSLS_IMAGE_URL_TTL_SECONDS="900",
                       TMS_NEXTSLS_IMAGE_SCOPE=f"{order.agent_id}|{ORIGIN}|{code}",
                       TMS_NEXTSLS_IMAGE_ACCESS_KEY_ID="fixture-storage", TMS_NEXTSLS_IMAGE_SECRET_ACCESS_KEY="fixture-only")
@@ -687,11 +687,9 @@ class NextSLSTests(unittest.TestCase):
         order.agent_service = "B888"
         db.session.commit()
         with patch.dict(app.config, ISOLATED_MODE=False, TMS_NEXTSLS_CREATE_ENABLED=True,
-                        TMS_NEXTSLS_READ_ENABLED=True, TMS_NEXTSLS_CREATE_ORDER_ID=str(order_id)), patch(
+                        TMS_NEXTSLS_READ_ENABLED=True), patch(
             "carrier_http.post",
         ) as request:
-            with self.assertRaisesRegex(nextsls.ProtocolError, "真实商品图片传输"):
-                tms_carriers.send_order(order, 1)
             with self.assertRaisesRegex(nextsls.ProtocolError, "隔离模拟"):
                 tms_carriers.send_order(order, 1, transport=request, photo_publisher=lambda *_: None)
             request.assert_not_called()
@@ -1075,11 +1073,18 @@ class NextSLSTests(unittest.TestCase):
         code = "B009-10"
         service = SERVICE | {"code": code, "require_declaration_list":
                              ["hscode", "material", "name_zh", "qty", "unit_value", "usage"]}
-        profile = self.profile(enabled=["create"], service_codes=[code],
-                               rules={code: nextsls.preparation_rules(service)})
+        profile = self.profile(enabled=["create"], service_codes=["TMS_DEMO", code],
+                               rules={code: nextsls.preparation_rules(service),
+                                      "TMS_DEMO": nextsls.preparation_rules(SERVICE)})
         order_id = self.pending_order()
         self.assertEqual(self.decision(order_id, 2, decision="approve",
-                                      **self.pricing(agent_service=code)).status_code, 302)
+                                      **self.pricing(agent_service="TMS_DEMO")).status_code, 302)
+        order = db.session.get(TmsOrder, order_id)
+        old_revision = order.revision
+        sale = order.invoice["service"]
+        self.assertEqual(self.action(order_id, "channel", revision=old_revision, channel_code=code).status_code, 302)
+        db.session.refresh(order)
+        self.assertEqual(order.invoice["service"], sale)
         calls = []
 
         def fake(target, *, json, headers):
@@ -1087,7 +1092,7 @@ class NextSLSTests(unittest.TestCase):
             calls.append(path)
             if path == "get_services":
                 return success({"services": [service]})
-            self.assertEqual(path, "create")
+            self.assertEqual(target.api_url, ORIGIN + "/api/v5/shipment/create")
             self.assertEqual(json["shipment"]["service"], code)
             for parcel in json["shipment"]["parcels"]:
                 for row in parcel["declarations"]:
@@ -1096,18 +1101,22 @@ class NextSLSTests(unittest.TestCase):
             return success({"shipment": {"shipment_id": SUPPLIER_NUMBER}})
 
         with patch.dict(app.config, ISOLATED_MODE=False, TMS_NEXTSLS_CREATE_ENABLED=True,
-                        TMS_NEXTSLS_READ_ENABLED=False, TMS_NEXTSLS_CREATE_ORDER_ID=str(order_id)), patch(
+                        TMS_NEXTSLS_READ_ENABLED=False), patch(
                 "carrier_http.post", side_effect=fake), patch(
                 "tms_supplier_images.publish_images") as publish:
             page = self.get(self.staff, f"/tms/admin/orders/{order_id}").get_data(as_text=True)
             self.assertIn('name="action" value="create"', page)
             self.assertNotIn("只读对账", page)
             self.assertNotIn('name="supplement_0_amazon_ref_id"', page)
-            self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 302)
+            self.assertEqual(self.action(order_id, "create", confirm="yes", revision=old_revision).status_code, 400)
+            result = self.action(order_id, "create", confirm="yes")
+            self.assertEqual(result.status_code, 302, re.findall(r'role="alert">([^<]+)', result.get_data(as_text=True)))
             self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 400)
             publish.assert_not_called()
         self.assertEqual(calls, ["get_services", "create"])
         self.assertEqual(db.session.get(TmsSupplierOrder, order_id).state, "linked")
+        shipment_id = db.session.get(TmsReceivable, order_id).shipment_id
+        self.assertEqual(db.session.get(Shipment, shipment_id).shipment_id, SUPPLIER_NUMBER)
         self.assertNotIn("reconcile", profile.verified)
 
     def test_timeout_without_read_capability_stays_locked(self):
@@ -1124,7 +1133,7 @@ class NextSLSTests(unittest.TestCase):
             raise carrier_http.CarrierRequestError("synthetic-timeout")
 
         with patch.dict(app.config, ISOLATED_MODE=False, TMS_NEXTSLS_CREATE_ENABLED=True,
-                        TMS_NEXTSLS_READ_ENABLED=False, TMS_NEXTSLS_CREATE_ORDER_ID=str(order_id)), patch(
+                        TMS_NEXTSLS_READ_ENABLED=False), patch(
                 "carrier_http.post", side_effect=fake):
             self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 302)
             self.assertEqual(db.session.get(TmsSupplierOrder, order_id).state, "uncertain")
@@ -1136,16 +1145,6 @@ class NextSLSTests(unittest.TestCase):
             self.assertNotIn('name="action" value="create"', page)
         self.assertEqual(calls, ["get_services", "create"])
         self.assertEqual(db.session.get(TmsSupplierOrder, order_id).state, "uncertain")
-
-    def test_real_create_switch_also_requires_the_explicit_order_id(self):
-        order_id = self.approve()
-        self.profile()
-        with patch.dict(app.config, ISOLATED_MODE=False, TMS_NEXTSLS_CREATE_ENABLED=True,
-                        TMS_NEXTSLS_CREATE_ORDER_ID=str(order_id + 1)):
-            response = self.action(order_id, "create", confirm="yes")
-            self.assertEqual(response.status_code, 400)
-            self.assertIn("此订单不在本次真实下单授权范围内", response.get_data(as_text=True))
-        self.carrier_post.assert_not_called()
 
     def test_snapshot_billing_needs_matching_unit_and_changes_require_review(self):
         order_id = self.approve(unit="cbm")
