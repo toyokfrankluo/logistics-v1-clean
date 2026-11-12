@@ -462,8 +462,8 @@ class NextSLSTests(unittest.TestCase):
         self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
 
     def test_verified_channel_encoder_uses_private_storage_before_real_transport(self):
-        code = "B009-4"
-        rule = SERVICE | {"code": code, "name": "虚构搏诚渠道", "require_declaration_list": ["photos"]}
+        code = "B009-MD"
+        rule = SERVICE | {"code": code, "name": "虚构搏诚渠道", "require_declaration_list": ["photos"], "packing_list_required": 1}
         self.profile(service_codes=[code], rules={code: nextsls.preparation_rules(rule)})
         self.sign_in(self.alice, "customer-a")
         uploaded = self.upload(self.alice, fixture.floating_workbook(service="超级经济线卡派"))
@@ -487,11 +487,12 @@ class NextSLSTests(unittest.TestCase):
         reads = []
         fail_read = True
 
-        def image_get(host, target, *, read_content):
+        def image_get(host, target, *, read_content, limit=None):
             self.assertEqual(host, "fixture-bucket.s3.us-east-1.amazonaws.com")
             key = target.split("?", 1)[0][1:]
             reads.append((key, read_content))
-            return ((200, "image/jpeg" if key.endswith(".jpg") else "image/png",
+            return ((200, (tms_supplier_images.PACKING_MIME if key.endswith(".xlsx") else
+                          "image/jpeg" if key.endswith(".jpg") else "image/png"),
                      b"not the uploaded image" if fail_read else objects[key])
                     if read_content else (403, None, None))
 
@@ -538,7 +539,13 @@ class NextSLSTests(unittest.TestCase):
             self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 400)
         payload, = requests
         self.assertEqual(payload["service"], code)
-        self.assertNotIn("attachments", payload)
+        attachment, = payload["attachments"]
+        self.assertEqual((attachment["name"], attachment["file_type"]), ("packing.xlsx", "order"))
+        key = attachment["url"].split("?", 1)[0].removeprefix(url_root + "/")
+        self.assertIn((key, True), reads)
+        packing = load_workbook(BytesIO(objects.pop(key)), read_only=True)
+        self.assertEqual(len(packing.sheetnames), 2)
+        packing.close()
         rows = [row for box in payload["parcels"] for row in box["declarations"]]
         for index, row in enumerate(rows):
             digest = sha256(fixture.FLOATING_PHOTOS[index]).hexdigest()
@@ -651,7 +658,7 @@ class NextSLSTests(unittest.TestCase):
             saved = self.action(order_id, "prepare", revision=3, **fields)
             self.assertEqual(saved.status_code, 302)
             response = self.action(order_id, "create", confirm="yes")
-            self.assertIn("创建时的自动传输方式尚待供应商确认", response.get_data(as_text=True))
+            self.assertIn(nextsls.PACKING_TRANSMISSION_BLOCKER, response.get_data(as_text=True))
             self.assertNotIn(attachment, response.get_data(as_text=True))
             self.assertEqual(photos, [])
             self.assertEqual(drafts, [])

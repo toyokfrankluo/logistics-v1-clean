@@ -42,7 +42,7 @@ REQUIRED_FLAGS = ("tel_required", "email_required", "company_required", "city_re
 DESTINATION_PLACEHOLDER_BLOCKER = "收件地址含未经核对的历史模板占位值，请更正后再提交"
 PHOTOS_PROTOCOL_BLOCKER = "渠道要求 photos，图片传输格式尚待供应商确认"
 PHOTO_URL_PUBLICATION_BLOCKER = "商品图片链接传输尚未获准"
-PACKING_TRANSMISSION_BLOCKER = "渠道要求装箱单，创建时的自动传输方式尚待供应商确认"
+PACKING_TRANSMISSION_BLOCKER = "渠道要求装箱单，自动发布所需的私有存储尚未配置"
 UNSUPPORTED_DECLARATION_BLOCKER = "当前发票映射不支持该渠道的全部必填申报字段"
 IMAGE_FIELDS = frozenset({"photo_url", "photos"})
 
@@ -345,7 +345,7 @@ def create_payload(invoice, code, reference, profile, sender, *, supplement=None
     } | IMAGE_FIELDS
     unsupported = sorted(set(requirements) - supported)
     packing_required = required_flag(profile, "packing_list_required")
-    if packing_required and (publish_packing is None or not packing_host):
+    if packing_required and (not packing_host or (publish_packing is None and not preflight)):
         blockers.append(PACKING_TRANSMISSION_BLOCKER)
     if "photos" in requirements and "photos" not in image_fields:
         blockers.append(PHOTOS_PROTOCOL_BLOCKER)

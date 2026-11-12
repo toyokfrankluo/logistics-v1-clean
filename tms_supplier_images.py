@@ -34,12 +34,9 @@ class ImageStore:
 
 def image_delivery(order, profile, rules):
     """Resolve only the configured account/channel and the fields it actually requires."""
-    config = current_app.config
     required = nextsls.IMAGE_FIELDS.intersection(rules["require_declaration_list"])
-    account_scope = f"{order.agent_id}|{profile.base_url}"
-    legacy_scope = f"{account_scope}|{order.agent_service}"
-    if (not required or config.get("ISOLATED_MODE") or profile.provider != "nextsls"
-            or profile.agent_id != order.agent_id or config.get("TMS_NEXTSLS_IMAGE_SCOPE") not in (account_scope, legacy_scope)):
+    store = media_store(order, profile) if required else None
+    if not store:
         return None, {}
     encoders = {"photo_url": str} if "photo_url" in required else {}
     encoder = CONFIRMED_PHOTOS_ENCODERS.get(
@@ -47,6 +44,17 @@ def image_delivery(order, profile, rules):
     )
     if "photos" in required and encoder is not None:
         encoders["photos"] = encoder
+    return store, encoders
+
+
+def media_store(order, profile):
+    config = current_app.config
+    account_scope = f"{order.agent_id}|{profile.base_url}"
+    legacy_scope = f"{account_scope}|{order.agent_service}"
+    if (config.get("ISOLATED_MODE") or profile.provider != "nextsls"
+            or profile.agent_id != order.agent_id
+            or config.get("TMS_NEXTSLS_IMAGE_SCOPE") not in (account_scope, legacy_scope)):
+        return None
     bucket = config.get("TMS_NEXTSLS_IMAGE_BUCKET", "")
     region = config.get("TMS_NEXTSLS_IMAGE_REGION", "")
     ttl = config.get("TMS_NEXTSLS_IMAGE_URL_TTL_SECONDS", "")
@@ -56,9 +64,9 @@ def image_delivery(order, profile, rules):
             or not re.fullmatch(r"[a-z]{2}(?:-[a-z0-9]+)+-\d", region)
             or not re.fullmatch(r"[0-9]{3,6}", ttl) or not 300 <= int(ttl) <= 604800
             or not key or not secret):
-        return None, {}
+        return None
     return ImageStore(bucket, region, int(ttl), key, secret,
-                      config.get("TMS_NEXTSLS_IMAGE_SESSION_TOKEN", "")), encoders
+                      config.get("TMS_NEXTSLS_IMAGE_SESSION_TOKEN", ""))
 
 
 def s3_client(store):
@@ -74,13 +82,13 @@ def s3_client(store):
     )
 
 
-def image_get(host, target, *, read_content):
+def image_get(host, target, *, read_content, limit=MAX_PHOTO_BYTES):
     connection = HTTPSConnection(host, timeout=5)
     try:
         connection.request("GET", target)
         response = connection.getresponse()
         return (response.status, response.getheader("Content-Type"),
-                response.read(MAX_PHOTO_BYTES + 1) if read_content and response.status == 200 else None)
+                response.read(limit + 1) if read_content and response.status == 200 else None)
     finally:
         connection.close()
 
@@ -94,6 +102,27 @@ def publish_images(store, order, profile, photos, encoders):
             or any(mime not in IMAGE_TYPES or type(data) is not bytes or not 0 < len(data) <= MAX_PHOTO_BYTES
                    for mime, data in photos) or sum(len(data) for _, data in photos) > MAX_PHOTO_TOTAL_BYTES):
         raise nextsls.ProtocolError(MEDIA_ERROR)
+    files = [(str(index), IMAGE_TYPES[mime], mime, data) for index, (mime, data) in enumerate(photos)]
+    urls = publish_files(store, order, profile, files, MEDIA_ERROR)
+    try:
+        return [{name: encoder(url) for name, encoder in encoders.items()} for url in urls]
+    except Exception:
+        raise nextsls.ProtocolError(MEDIA_ERROR) from None
+
+
+PACKING_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+PACKING_ERROR = "装箱单未通过私有存储的 HTTPS 读取校验，未提交代理下单。"
+
+
+def publish_packing(store, order, profile, data):
+    if not data or len(data) > MAX_PHOTO_TOTAL_BYTES:
+        raise nextsls.ProtocolError(PACKING_ERROR)
+    return publish_files(store, order, profile, [("packing", "xlsx", PACKING_MIME, data)], PACKING_ERROR)[0]
+
+
+def publish_files(store, order, profile, files, error):
+    if current_app.config.get("ISOLATED_MODE") or profile.agent_id != order.agent_id:
+        raise nextsls.ProtocolError(error)
     scope = f"{profile.base_url}|{order.agent_id}|{order.agent_service}|{order.id}|{order.revision}"
     prefix = sha256(scope.encode()).hexdigest()
     references = []
@@ -104,9 +133,9 @@ def publish_images(store, order, profile, photos, encoders):
                 "BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets",
             )):
                 raise ValueError("bucket public access is not blocked")
-            for index, (mime, data) in enumerate(photos):
+            for name, extension, mime, data in files:
                 digest = sha256(data).hexdigest()
-                key = f"nextsls/{prefix}/{index}-{digest}.{IMAGE_TYPES[mime]}"
+                key = f"nextsls/{prefix}/{name}-{digest}.{extension}"
                 client.put_object(Bucket=store.bucket, Key=key, Body=data, ContentType=mime,
                                   CacheControl="private, no-store", ServerSideEncryption="AES256")
                 if image_get(store.host, f"/{key}", read_content=False)[0] not in (403, 404):
@@ -120,10 +149,11 @@ def publish_images(store, order, profile, photos, encoders):
                         or query.get("X-Amz-Expires") != [str(store.ttl)]
                         or not query.get("X-Amz-Signature")):
                     raise ValueError("unexpected signed URL")
-                if image_get(store.host, f"{target.path}?{target.query}", read_content=True) != (200, mime, data):
+                read_options = {"limit": len(data)} if extension == "xlsx" else {}
+                if image_get(store.host, f"{target.path}?{target.query}", read_content=True, **read_options) != (200, mime, data):
                     raise ValueError("unexpected image content")
-                references.append({name: encoder(url) for name, encoder in encoders.items()})
+                references.append(url)
     except Exception:
         # Transport errors can contain a complete signed URL. Never propagate them to the web or audit log.
-        raise nextsls.ProtocolError(MEDIA_ERROR) from None
+        raise nextsls.ProtocolError(error) from None
     return references

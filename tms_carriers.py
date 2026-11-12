@@ -245,11 +245,13 @@ def supplier_preparation(order, profile, agent):
                                        if field in rules["require_declaration_list"]]
     store, encoders = images.image_delivery(order, profile, rules)
     result["photo_delivery_ready"] = bool(store and set(result["required_photo_fields"]) <= encoders.keys())
+    packing_store = images.media_store(order, profile) if result["packing_required"] else None
+    result["packing_delivery_ready"] = bool(packing_store)
     supplement = order_supplement(order)
     result["missing"] = nextsls.missing_supplements(order.invoice, supplement, rules)
     try:
         nextsls.create_payload(invoice, code, "XR-PREFLIGHT", rules, profile.sender, supplement=supplement,
-                               image_fields=encoders, preflight=True)
+                               image_fields=encoders, packing_host=packing_store.host if packing_store else "", preflight=True)
     except nextsls.PreparationError as exc:
         blockers.extend(exc.blockers)
     except nextsls.ProtocolError as exc:
@@ -356,6 +358,11 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
 
     rules = nextsls.preparation_rules(service)
     store, encoders = images.image_delivery(order, profile, rules)
+    packing_store = images.media_store(order, profile) if nextsls.required_flag(rules, "packing_list_required") else None
+    packing_host = current_app.config.get("TMS_NEXTSLS_PACKING_ATTACHMENT_HOST", "")
+    if packing_store:
+        packing_host = packing_store.host
+        packing_publisher = lambda data: images.publish_packing(packing_store, order, profile, data)
     invoice, omitted = destination_for_create(order)
 
     def order_photos():
@@ -369,7 +376,7 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
 
     payload = nextsls.create_payload(
         invoice, code, link.client_reference, rules, profile.sender, supplement=order_supplement(order),
-        packing_host=current_app.config.get("TMS_NEXTSLS_PACKING_ATTACHMENT_HOST", ""),
+        packing_host=packing_host,
         publish_photos=publish_photos if photo_publisher is not None else None,
         image_fields=encoders,
         publish_image_fields=(lambda: images.publish_images(store, order, profile, order_photos(), encoders))

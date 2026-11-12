@@ -25,7 +25,7 @@
     <div><dt>供应商读取图片</dt><dd>尚未验证</dd></div>
     <div><dt>本票创建验收</dt><dd>未提交</dd></div>
     <div><dt>装箱单</dt><dd>{% if preparation.packing_required is true %}
-      可由系统按审核后的箱货数据生成。创建传输待确认。
+      {% if preparation.packing_delivery_ready %}提交时自动生成并验证装箱单链接。{% else %}自动发布所需的私有存储尚未配置。{% endif %}
       <a href="{{ url_for('tms_staff.supplier_packing_draft', order_id=order.id) }}">下载草稿</a>
       {% elif preparation.packing_required is false %}本渠道无需单独装箱单
       {% else %}等待渠道规则确认{% endif %}</dd></div>
