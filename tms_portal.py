@@ -511,7 +511,7 @@ def download_invoice_template(catalogue, *, extended=False):
     layout_path = current_app.config.get("TMS_INVOICE_TEMPLATE_PATH")
     layout = read_configured_workbook(layout_path) if layout_path else None
     result = BytesIO()
-    workbook = blank_invoice(catalogue, layout=layout, extended=extended, product_details=True)
+    workbook = blank_invoice(catalogue, layout=layout, extended=extended, product_details=True, amazon_po=True)
     try:
         workbook.save(result)
     finally:
@@ -939,9 +939,30 @@ def save_supplier_supplement(order, form):
         raise nextsls.ProtocolError("渠道所需资料已变化，请刷新页面后补充。")
     if "confirm_amazon_d4" in form:
         raise nextsls.ProtocolError("FBA / 客户单号不能作为 Amazon 参考号。请刷新页面。")
+    candidates = {i: order.invoice["declarations"][i]["amazon_po_candidate"]
+                  for i, fields in missing.items()
+                  if "amazon_ref_id" in fields and order.invoice["declarations"][i].get("amazon_po_candidate")}
+    line_confirmations = dict(order.invoice.get("amazon_po_line_confirmations", {}))
+    line_prefixes = ("confirm_amazon_po_line_", "amazon_po_line_reason_")
+    line_fields = {f"{prefix}{i}" for i in candidates for prefix in line_prefixes}
+    if any(key.startswith(line_prefixes) and (key not in line_fields or len(form.getlist(key)) != 1)
+           for key in form):
+        raise nextsls.ProtocolError("待核实的申报行已变化，请刷新页面。")
+    for index, candidate in candidates.items():
+        check = form.getlist(f"confirm_amazon_po_line_{index}")
+        reason = form.get(f"amazon_po_line_reason_{index}", "").strip()
+        if not check and not reason:
+            continue
+        if check != ["yes"] or form.get(f"supplement_{index}_amazon_ref_id", "").strip():
+            raise nextsls.ProtocolError("请单独核实该申报行的 PO，或填写已核实的参考号。")
+        line_confirmations[str(index)] = {
+            "value": nextsls.supplemental_value(order.invoice, "amazon_ref_id", candidate, confirmed_po=True),
+            "reason": nextsls.supplied_text(reason, 200), "by": current_user.id,
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
     confirmation = None
     if "confirm_amazon_po" in form or form.get("amazon_po_reason", "").strip():
-        if (form.getlist("confirm_amazon_po") != ["yes"]
+        if (nextsls.has_line_amazon_po(order.invoice) or form.getlist("confirm_amazon_po") != ["yes"]
                 or not any("amazon_ref_id" in fields for fields in missing.values())
                 or any(form.get(f"supplement_{i}_amazon_ref_id", "").strip() for i in missing)):
             raise nextsls.ProtocolError("请单独确认 Amazon PO，或填写已核实的 Amazon 参考号。")
@@ -964,12 +985,15 @@ def save_supplier_supplement(order, form):
                 values[field] = nextsls.supplemental_value(order.invoice, field, raw)
         if values:
             rows[str(index)] = values
-    if rows == prior.get("declarations", {}) and not confirmation:
+    confirmed_lines_changed = line_confirmations != order.invoice.get("amazon_po_line_confirmations", {})
+    if rows == prior.get("declarations", {}) and not confirmation and not confirmed_lines_changed:
         raise nextsls.ProtocolError("请填写至少一项当前缺少的申报资料。")
     supplement = {**prior, "agent_id": order.agent_id, "service": order.agent_service, "declarations": rows}
     invoice = dict(order.invoice, nextsls_supplement=supplement)
     if confirmation:
         invoice["amazon_po_confirmation"] = confirmation
+    if confirmed_lines_changed:
+        invoice["amazon_po_line_confirmations"] = line_confirmations
     update_order(order, {"invoice": invoice})
     history(order, "supplier_prep")
     db.session.commit()

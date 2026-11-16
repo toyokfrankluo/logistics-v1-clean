@@ -77,7 +77,7 @@ def check_sheet_xml(xml, image_refs, *, invoice_photos=None):
     for cell in fromstring(xml).iter(XLSX_NS + "c"):
         coordinate = cell.get("r", "")
         if invoice_photos is not None:
-            match = re.fullmatch(r"[A-Q]([1-9]\d{0,2})", coordinate)
+            match = re.fullmatch(r"[A-R]([1-9]\d{0,2})", coordinate)
             if not match or int(match[1]) > MAX_INVOICE_ROW:
                 raise InvoiceError(f"发票超出版式范围。每票最多 {MAX_PRODUCT_LINES} 条申报。")
         formula = cell.find(XLSX_NS + "f")
@@ -320,18 +320,27 @@ def check_displayed_address(raw, rows, address):
             raise InvoiceError(f"L{line} 的收件资料与本工作簿地址库冲突。请核对 L4 并重新保存发票。")
 
 
-def required_fields(rows, photos, last_product, photo_column):
+def detail_column(column, amazon_po):
+    """Translate an existing detail column when the B-column PO field is present."""
+    return chr(ord(column) + 1) if amazon_po and column != "A" else column
+
+
+def required_fields(rows, photos, last_product, photo_column, amazon_po):
     missing = [
         f"{get_column_letter(col)}{line}（{label}）"
         for (line, col), label in REQUIRED_ORDER.items() if missing_value(rows[line - 1][col - 1])
     ]
     used_rows = []
+    total_index = ord(detail_column("I", amazon_po)) - ord("A")
     for line, row in enumerate(rows[FIRST_PRODUCT_ROW - 1:last_product], start=FIRST_PRODUCT_ROW):
-        if f"{photo_column}{line}" not in photos and all(missing_value(cell) for i, cell in enumerate(row) if i != 8):
+        if f"{photo_column}{line}" not in photos and all(
+                missing_value(cell) for i, cell in enumerate(row) if i != total_index):
             continue
         used_rows.append((line, row))
-        missing.extend(f"{col}{line}（{label}）" for col, label in REQUIRED_LINE.items()
-                       if missing_value(row[ord(col) - ord("A")]))
+        for old_column, label in REQUIRED_LINE.items():
+            column = detail_column(old_column, amazon_po)
+            if missing_value(row[ord(column) - ord("A")]):
+                missing.append(f"{column}{line}（{label}）")
         if f"{photo_column}{line}" not in photos:
             missing.append(f"{photo_column}{line}（产品图片，须内嵌 PNG 或 JPEG）")
     if missing:
@@ -341,16 +350,16 @@ def required_fields(rows, photos, last_product, photo_column):
     return used_rows
 
 
-def hs_code(cell, line):
+def hs_code(cell, line, column="F"):
     if cell.data_type == "n" and type(cell.value) is int:
         code = str(cell.value)
         number_format = cell.number_format
         if re.fullmatch(r"0{2,20}", number_format):
             code = code.zfill(len(number_format))
     else:
-        code = cell_text(cell, f"F{line}（海关编码 / HS Code）", limit=20)
+        code = cell_text(cell, f"{column}{line}（海关编码 / HS Code）", limit=20)
     if not re.fullmatch(r"[0-9]{1,20}", code):
-        raise InvoiceError(f"F{line}（海关编码 / HS Code）须填写数字编码。")
+        raise InvoiceError(f"{column}{line}（海关编码 / HS Code）须填写数字编码。")
     return code
 
 
@@ -359,40 +368,46 @@ def parse_invoice(raw):
         if set(book.sheetnames) != SHEETS:
             raise InvoiceError("请上传星睿三工作表单票模板。")
         sheet = book["星睿发票"]
-        if sheet.max_row is None or sheet.max_row > MAX_INVOICE_ROW or sheet.max_column is None or sheet.max_column > 17:
+        if sheet.max_row is None or sheet.max_row > MAX_INVOICE_ROW or sheet.max_column is None or sheet.max_column > 18:
             raise InvoiceError(f"请使用星睿 11.6 版单票模板。每票最多 {MAX_PRODUCT_LINES} 条申报。")
         sheet.reset_dimensions()
-        rows = list(islice(sheet.iter_rows(min_row=1, max_col=17), MAX_INVOICE_ROW + 1))
+        rows = list(islice(sheet.iter_rows(min_row=1, max_col=18), MAX_INVOICE_ROW + 1))
         if (
             not 56 <= len(rows) <= MAX_INVOICE_ROW
             or "订单号" not in str(rows[3][0].value)
             or "地址库编码" not in str(rows[3][8].value)
             or "货箱编号" not in str(rows[21][0].value)
-            or "英文品名" not in str(rows[21][1].value)
-            or "货箱重量" not in str(rows[21][9].value)
         ):
             raise InvoiceError("发票表头与星睿 11.6 模板不符。")
         headers = [str(cell.value or "").strip() for cell in rows[21]]
-        if headers[14:16] == ["产品品牌", "产品型号"] and "产品图片" in headers[16]:
+        amazon_po = headers[1] == "核实 Amazon PO"
+        shift = int(amazon_po)
+        if "英文品名" not in headers[1 + shift] or "货箱重量" not in headers[9 + shift]:
+            raise InvoiceError("发票表头与星睿模板不符。")
+        if amazon_po and headers[15:17] == ["产品品牌", "产品型号"] and "产品图片" in headers[17]:
+            photo_column = "R"
+        elif not amazon_po and headers[14:16] == ["产品品牌", "产品型号"] and "产品图片" in headers[16] and all(
+                missing_value(row[17]) for row in rows):
             photo_column = "Q"
-        elif "产品图片" in headers[14] and not any(headers[15:]) and all(
+        elif not amazon_po and "产品图片" in headers[14] and not any(headers[15:]) and all(
                 missing_value(cell) for row in rows for cell in row[15:]):
             photo_column = "O"
         else:
-            raise InvoiceError("商品表头须为旧版 O 列图片，或新版 O 列品牌、P 列型号、Q 列图片。")
+            raise InvoiceError("商品表头须使用星睿模板的 O、Q 或 R 列图片版式。")
         if any(not cell.startswith(photo_column) for cell in photos):
             raise InvoiceError(f"请将产品图片内嵌至本版模板的 {photo_column} 列。")
         # The total and note rows move together when product rows are inserted.
         last_product = len(rows) - 4
         total_row = rows[last_product + 1]
         if (not str(total_row[0].value).startswith(("合计", "申报汇总"))
-                or any(str(total_row[col].value).upper().replace("$", "") != f"=SUM({letter}23:{letter}{last_product})"
+                or any(str(total_row[col].value).upper().replace("$", "") !=
+                       f"=SUM({detail_column(letter, amazon_po)}23:{detail_column(letter, amazon_po)}{last_product})"
                        for col, letter in ((6, "H"), (8, "I")))
                 or any(not missing_value(cell) for i in (last_product, last_product + 2) for cell in rows[i])
                 or any(not missing_value(cell) for cell in rows[-1][1:])
                 or any(int(cell[1:]) > last_product for cell in photos)):
             raise InvoiceError("发票的申报区或汇总行已错位。请使用星睿扩展模板。")
-        used_rows = required_fields(rows, photos, last_product, photo_column)
+        used_rows = required_fields(rows, photos, last_product, photo_column, amazon_po)
         customer_number = identifier(rows[3][3], "客户单号")
         service = cell_text(rows[4][3], "运输服务")
         if service not in SERVICES:
@@ -414,8 +429,9 @@ def parse_invoice(raw):
         )}
         boxes = {}
         declarations = []
-        for line, row in used_rows:
-            box_key = parse_box(row, line, boxes)
+        for line, source_row in used_rows:
+            row = source_row[:1] + source_row[2:] if amazon_po else source_row
+            box_key = parse_box(row, line, boxes, amazon_po=amazon_po)
             unit_price = number(row[6], f"第 {line} 行申报单价")
             quantity = number(row[7], f"第 {line} 行申报数量", whole=True)
             total = (Decimal(unit_price) * quantity).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
@@ -423,19 +439,23 @@ def parse_invoice(raw):
                 "box_number": boxes[box_key]["box_number"],
                 "name_en": cell_text(row[1], f"第 {line} 行英文品名"),
                 "name_zh": cell_text(row[2], f"第 {line} 行中文品名"),
-                "material": cell_text(row[3], f"D{line}（材质）"),
-                "usage": cell_text(row[4], f"E{line}（用途）"),
-                "hs_code": hs_code(row[5], line),
+                "material": cell_text(row[3], f"{detail_column('D', amazon_po)}{line}（材质）"),
+                "usage": cell_text(row[4], f"{detail_column('E', amazon_po)}{line}（用途）"),
+                "hs_code": hs_code(row[5], line, detail_column("F", amazon_po)),
                 "unit_price_usd": unit_price, "quantity": quantity,
                 "total_usd": format(total, "f"),
                 "battery": yes_no(row[13], f"第 {line} 行是否带电"),
                 "image_part": photos[f"{photo_column}{line}"], "image_cell": f"{photo_column}{line}",
             })
-            if photo_column == "Q":
+            if photo_column != "O":
                 for column, field in ((14, "brand"), (15, "model")):
-                    value = cell_text(row[column], headers[column], required=False, limit=120)
+                    value = cell_text(row[column], headers[column + shift], required=False, limit=120)
                     if value:
                         declarations[-1][field] = value
+            if amazon_po:
+                po = cell_text(source_row[1], f"B{line}（核实 Amazon PO）", required=False, limit=120)
+                if po:
+                    declarations[-1]["amazon_po_candidate"] = po
         if number(rows[14][3], "D15（箱数）", whole=True) != len(boxes):
             raise InvoiceError("发票箱数与不同箱号的数量不一致。")
         return {
@@ -465,11 +485,11 @@ def product_photos(raw, invoice):
     return photos
 
 
-def parse_box(row, line, boxes):
+def parse_box(row, line, boxes, *, amazon_po=False):
     box_number = identifier(row[0], f"A{line}（货箱编号）")
     key = box_number.casefold()
     measures = {
-        field: number(cell, f"{col}{line}（{label}）")
+        field: number(cell, f"{detail_column(col, amazon_po)}{line}（{label}）")
         for field, col, label, cell in zip(
             ("weight_kg", "length_cm", "width_cm", "height_cm"), "JKLM",
             ("箱重", "箱长", "箱宽", "箱高"), row[9:13],
@@ -481,15 +501,17 @@ def parse_box(row, line, boxes):
     return key
 
 
-def blank_invoice(catalogue=None, *, layout=None, extended=False, product_details=False):
+def blank_invoice(catalogue=None, *, layout=None, extended=False, product_details=False, amazon_po=False):
     """Generate a clean 11.6 invoice, including only this customer's assigned address rows."""
     last_product = LAST_PRODUCT_ROW if extended else FIRST_PRODUCT_ROW + STANDARD_PRODUCT_LINES - 1
     total_row, note_row = last_product + 2, last_product + 4
     book = Workbook()
     sheet = book.active
     sheet.title = "星睿发票"
-    photo_column = "Q" if product_details else "O"
-    sheet.merge_cells(f"A1:{photo_column}2")
+    product_details = product_details or amazon_po
+    upper_column = "Q" if product_details else "O"
+    photo_column = detail_column(upper_column, amazon_po)
+    sheet.merge_cells(f"A1:{upper_column}2")
     sheet["A1"] = "星睿物流发票模板 / SHIPPING INVOICE"
     left = (
         "客户 / FBA 订单号 *", "运输服务 / 渠道 *", "发货公司", "是否带电 *",
@@ -509,15 +531,15 @@ def blank_invoice(catalogue=None, *, layout=None, extended=False, product_detail
     for index, label in enumerate(right, 4):
         if index < 17:
             sheet.merge_cells(f"I{index}:K{index}")
-            end_column = "N" if index == 4 else photo_column
+            end_column = "N" if index == 4 else upper_column
             sheet.merge_cells(f"L{index}:{end_column}{index}")
         sheet.cell(index, 9, label)
     for region, label in (
-        ("A3:H3", "01 发件人信息 / 订单资料"), (f"I3:{photo_column}3", "02 收件人信息 / 地址库自动填充"),
-        (f"A20:{photo_column}20", "03 产品与货物申报资料 / CUSTOMS DECLARATION"),
-        (f"A21:{photo_column}21", f"在 L4 选择地址编码，在 D5 选择服务。每条产品明细填写所有星号字段，图片插入 {photo_column} 列。"),
+        ("A3:H3", "01 发件人信息 / 订单资料"), (f"I3:{upper_column}3", "02 收件人信息 / 地址库自动填充"),
+        (f"A20:{upper_column}20", "03 产品与货物申报资料 / CUSTOMS DECLARATION"),
+        (f"A21:{upper_column}21", f"在 L4 选择地址编码，在 D5 选择服务。每条产品明细填写所有星号字段，图片插入 {photo_column} 列。"),
         (f"A{total_row}:E{total_row}", "合计"),
-        (f"A{note_row}:{photo_column}{note_row}", "一份文件填写一票。按工作簿内的地址库匹配收件资料，提交后由星睿审核。"),
+        (f"A{note_row}:{upper_column}{note_row}", "一份文件填写一票。按工作簿内的地址库匹配收件资料，提交后由星睿审核。"),
     ):
         sheet.merge_cells(region)
         cell = sheet[region.split(":")[0]]
@@ -525,15 +547,18 @@ def blank_invoice(catalogue=None, *, layout=None, extended=False, product_detail
         cell.font = Font(color="9C1F15", bold=True)
         cell.fill = PatternFill("solid", fgColor="EEEEEE")
     sheet.merge_cells("D17:H19")
-    sheet.merge_cells(f"L17:{photo_column}19")
+    sheet.merge_cells(f"L17:{upper_column}19")
     for column, label in REQUIRED_LINE.items():
-        sheet[f"{column}22"] = label + " *"
+        sheet[f"{detail_column(column, amazon_po)}22"] = label + " *"
     for column, label in {"F": "海关编码* / HS Code*", "G": "申报单价 (USD) *", "I": "总申报价值 (USD)",
                           "J": "货箱重量 (kg) *", "K": "箱长 (cm) *", "L": "箱宽 (cm) *",
-                          "M": "箱高 (cm) *", photo_column: "产品图片*"}.items():
-        sheet[f"{column}22"] = label
+                          "M": "箱高 (cm) *", upper_column: "产品图片*"}.items():
+        sheet[f"{detail_column(column, amazon_po)}22"] = label
     if product_details:
-        sheet["O22"], sheet["P22"] = "产品品牌", "产品型号"
+        sheet[f"{detail_column('O', amazon_po)}22"] = "产品品牌"
+        sheet[f"{detail_column('P', amazon_po)}22"] = "产品型号"
+    if amazon_po:
+        sheet["B22"] = "核实 Amazon PO"
     for cell in sheet[22]:
         cell.font = Font(color="9C1F15" if "*" in cell.value else "111111", bold=True)
         cell.fill = PatternFill("solid", fgColor="FFE69A")
@@ -541,16 +566,18 @@ def blank_invoice(catalogue=None, *, layout=None, extended=False, product_detail
         sheet.column_dimensions[cell.column_letter].width = 19
     sheet.column_dimensions[photo_column].width = 31
     sheet.row_dimensions[22].height = 36
+    unit_price, quantity, goods_total = (detail_column(column, amazon_po) for column in "GHI")
     for row in range(FIRST_PRODUCT_ROW, last_product + 1):
-        sheet[f"I{row}"] = f'=IF(OR(G{row}="",H{row}=""),"",ROUND(G{row}*H{row},2))'
-    sheet[f"F{total_row}"], sheet[f"G{total_row}"] = "总数量", f"=SUM(H23:H{last_product})"
-    sheet[f"H{total_row}"], sheet[f"I{total_row}"] = "总货值 (USD)", f"=SUM(I23:I{last_product})"
+        unit, qty = f"{unit_price}{row}", f"{quantity}{row}"
+        sheet[f"{goods_total}{row}"] = f'=IF(OR({unit}="",{qty}=""),"",ROUND({unit}*{qty},2))'
+    sheet[f"F{total_row}"], sheet[f"G{total_row}"] = "总数量", f"=SUM({quantity}23:{quantity}{last_product})"
+    sheet[f"H{total_row}"], sheet[f"I{total_row}"] = "总货值 (USD)", f"=SUM({goods_total}23:{goods_total}{last_product})"
 
     for row, field in ADDRESS_LOOKUPS.items():
         col = get_column_letter(ADDRESS_COLUMNS[field])
         result = f"INDEX(地址库!${col}$2:${col}$5000,MATCH($L$4,地址库!$B$2:$B$5000,0))"
         sheet[f"L{row}"] = f'=IF($L$4="","",IFERROR(IF({result}="","",{result})&"",""))'
-    sheet[f"{photo_column}4"] = '=IF(L4="","请输入编码",IF(COUNTIF(地址库!$B$2:$B$5000,L4)=1,"地址匹配成功","地址编码不存在或重复"))'
+    sheet[f"{upper_column}4"] = '=IF(L4="","请输入编码",IF(COUNTIF(地址库!$B$2:$B$5000,L4)=1,"地址匹配成功","地址编码不存在或重复"))'
     sheet["L17"] = ('=IF(L4="","",IF(L6="","",L6&CHAR(10))&L7&CHAR(10)&'
                     'IF(L8="","",L8&CHAR(10))&IF(L9="","",L9&CHAR(10))&L10&", "&L11&" "&L12&CHAR(10)&L13)')
     sheet["L17"].alignment = Alignment(wrap_text=True)
@@ -577,53 +604,76 @@ def blank_invoice(catalogue=None, *, layout=None, extended=False, product_detail
     services.append(("服务 / 运输渠道",))
     for service in SERVICES:
         services.append((service,))
+    battery_column = detail_column("N", amazon_po)
     for cells, values in (
         (("L4",), f"""INDIRECT("'地址库'!$B$2:$B${max(2, addresses.max_row)}")"""),
         (("D5",), """INDIRECT("'服务选项'!$A$2:$A$14")"""),
         (("D11",), '"普通报关,报关退税"'), (("D13",), '"包税,不包税"'),
-        (("D7:D10", f"N23:N{last_product}"), '"是,否"'),
+        (("D7:D10", f"{battery_column}23:{battery_column}{last_product}"), '"是,否"'),
     ):
         picker = DataValidation(type="list", formula1=values, allow_blank=False, showErrorMessage=True)
         sheet.add_data_validation(picker)
         for cell_range in cells:
             picker.add(cell_range)
     if layout is not None:
-        copy_invoice_format(sheet, layout, last_product, photo_column)
+        copy_invoice_format(sheet, layout, last_product, photo_column, upper_column, amazon_po)
     for field in ("D4", "D14", "D16", "L4"):
         sheet[field].number_format = "@"
+    text_columns = [detail_column(column, amazon_po) for column in ("AFOP" if product_details else "AF")]
+    if amazon_po:
+        text_columns.append("B")
     for line in range(FIRST_PRODUCT_ROW, last_product + 1):
-        sheet[f"A{line}"].number_format = sheet[f"F{line}"].number_format = "@"
-        if product_details:
-            sheet[f"O{line}"].number_format = sheet[f"P{line}"].number_format = "@"
+        for column in text_columns:
+            sheet[f"{column}{line}"].number_format = "@"
     return book
 
 
-def copy_invoice_format(sheet, raw, last_product, photo_column):
+def copy_invoice_format(sheet, raw, last_product, photo_column, upper_column, amazon_po):
     # Only presentation is copied. Original values, notes, images and address rows never follow the layout.
     with workbook_from_bytes(raw) as (validated, _photos):
-        if "星睿发票" not in validated or validated["星睿发票"].max_row != 56 or validated["星睿发票"].max_column not in (15, 17):
+        if ("星睿发票" not in validated or validated["星睿发票"].max_row != 56
+                or validated["星睿发票"].max_column not in (15, 17, 18)):
             raise InvoiceError("配置的模板版式须为星睿 11.6 单票模板。")
     source_book = load_workbook(BytesIO(raw), keep_links=False)
     try:
         source = source_book["星睿发票"]
-        source_photo = "Q" if source["Q22"].value else "O"
-        move_photo = source_photo != photo_column
+        source_has_po = source["B22"].value == "核实 Amazon PO"
+        source_upper = "Q" if source_has_po or source["Q22"].value else "O"
+        source_photo = detail_column(source_upper, source_has_po)
+
+        def map_detail(column):
+            if column == source_photo:
+                return photo_column
+            base = column
+            if source_has_po:
+                if column == "B":
+                    return "B" if amazon_po else None
+                if column != "A":
+                    base = chr(ord(column) - 1)
+            if base >= upper_column:
+                return None
+            return detail_column(base, amazon_po)
+
         for key, dimension in source.column_dimensions.items():
-            if move_photo and key in {"O", "P", "Q"} and key != source_photo:
-                continue
-            destination = photo_column if key == source_photo else key
-            sheet.column_dimensions[destination].width = dimension.width
+            destination = map_detail(key)
+            if destination is not None:
+                sheet.column_dimensions[destination].width = dimension.width
         for key, dimension in source.row_dimensions.items():
             sheet.row_dimensions[key if key <= 52 else key + last_product - 52].height = dimension.height
         for line in range(1, last_product + 5):
             source_line = min(line, 52) if line <= last_product else line - last_product + 52
             if 52 < line <= last_product:
                 sheet.row_dimensions[line].height = source.row_dimensions[52].height
-            for original in source[source_line][:17 if source_photo == "Q" else 15]:
-                if move_photo and original.column >= 15 and original.column != ord(source_photo) - 64:
-                    continue
-                if original.has_style:
-                    target = sheet[f"{photo_column}{line}"] if original.column == ord(source_photo) - 64 else sheet.cell(line, original.column)
+            for original in source[source_line][:ord(source_photo) - ord("A") + 1]:
+                column = get_column_letter(original.column)
+                if 22 <= line <= last_product:
+                    destination = map_detail(column)
+                else:
+                    destination = upper_column if column == source_upper else column if column < source_upper else None
+                    if destination and destination > upper_column:
+                        destination = None
+                if destination is not None and original.has_style:
+                    target = sheet[f"{destination}{line}"]
                     for key in ("font", "fill", "border", "alignment", "number_format"):
                         setattr(target, key, copy(getattr(original, key)))
     finally:

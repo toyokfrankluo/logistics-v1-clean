@@ -213,6 +213,8 @@ def supplemental_value(invoice, field, value, *, confirmed_po=False):
                    invoice["customer_number"].casefold()}
         if not confirmed_po:
             invalid.add(invoice["metadata"]["po_number"].casefold())
+            invalid.update(row["amazon_po_candidate"].casefold() for row in invoice["declarations"]
+                           if row.get("amazon_po_candidate"))
         invalid.update(box["box_number"].casefold() for box in invoice["boxes"])
         if value.casefold() in invalid or re.fullmatch(r"FBA[A-Z0-9]{9}", value, re.I):
             raise ProtocolError("Amazon 参考号须来自 Amazon 货件资料。PO 需单独核实，客户单号、FBA 单号、箱号和占位值不可使用。")
@@ -231,14 +233,22 @@ def declaration_supplements(invoice, supplement, index, fields):
             except ProtocolError:
                 continue
     if "amazon_ref_id" in fields and "amazon_ref_id" not in result:
-        confirmation = invoice.get("amazon_po_confirmation", {})
-        po = invoice["metadata"]["po_number"]
+        if has_line_amazon_po(invoice):
+            confirmation = invoice.get("amazon_po_line_confirmations", {}).get(str(index), {})
+            po = declared.get("amazon_po_candidate")
+        else:
+            confirmation = invoice.get("amazon_po_confirmation", {})
+            po = invoice["metadata"]["po_number"]
         if po and confirmation.get("value") == po and confirmation.get("by") and confirmation.get("reason"):
             try:
                 result["amazon_ref_id"] = supplemental_value(invoice, "amazon_ref_id", po, confirmed_po=True)
             except ProtocolError:
                 pass
     return result
+
+
+def has_line_amazon_po(invoice):
+    return any(row.get("amazon_po_candidate") for row in invoice["declarations"])
 
 
 def missing_supplements(invoice, supplement, rules):

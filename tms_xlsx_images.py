@@ -14,7 +14,7 @@ ART_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
 FIRST_PRODUCT_ROW = 23
 MAX_PRODUCT_LINES = 60
 LAST_PRODUCT_ROW = FIRST_PRODUCT_ROW + MAX_PRODUCT_LINES - 1
-PHOTO_CELL = re.compile(r"[OQ](?:2[3-9]|[3-7][0-9]|8[0-2])\Z")
+PHOTO_CELL = re.compile(r"[OQR](?:2[3-9]|[3-7][0-9]|8[0-2])\Z")
 MEDIA_PART = re.compile(r"xl/media/[A-Za-z0-9_.-]+\.(?:png|jpe?g)\Z", re.IGNORECASE)
 WPS_IMAGE_FORMULA = re.compile(r'(?:_xlfn\.)?DISPIMG\(\s*"(ID_[A-Za-z0-9_-]{1,64})"\s*,\s*[12]\s*\)\Z',
                                re.IGNORECASE)
@@ -141,7 +141,7 @@ def anchored_images(archive, sheet_part):
                 continue
             start = anchor.find(DRAWING_NS + "from")
             pictures = anchor.findall(DRAWING_NS + "pic")
-            column = {"14": "O", "16": "Q"}.get(start.findtext(DRAWING_NS + "col")) if start is not None else None
+            column = {"14": "O", "16": "Q", "17": "R"}.get(start.findtext(DRAWING_NS + "col")) if start is not None else None
             if not column or not pictures:
                 continue
             row = start.findtext(DRAWING_NS + "row", "")

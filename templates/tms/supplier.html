@@ -11,7 +11,13 @@
     {% if link %} · 对账参考号 <code>{{ link.client_reference }}</code>{% endif %}</p>
   {% if preparation %}
   <dl class="fields">
-    <div><dt>客户单号</dt><dd>{{ invoice.customer_number }}</dd></div>
+    <div><dt>客户 / FBA 单号</dt><dd>{{ invoice.customer_number }}</dd></div>
+    {% if invoice.metadata.po_number %}
+    <div><dt>原发票 D14 PO</dt><dd>{{ invoice.metadata.po_number }} ·
+      {% if invoice.amazon_po_confirmation and invoice.amazon_po_confirmation.value == invoice.metadata.po_number %}
+      已核实为 Amazon Reference ID
+      {% else %}尚未核实为 Amazon Reference ID{% endif %}</dd></div>
+    {% endif %}
     <div><dt>代理</dt><dd>{{ supplier.agent_name }}</dd></div>
     <div><dt>实际代理渠道</dt><dd>{{ invoice.supplier_channel.name ~ ' · ' if invoice.supplier_channel else '' }}{{ order.agent_service }}</dd></div>
     <div><dt>箱数</dt><dd>{{ invoice.boxes|length }}</dd></div>
@@ -87,6 +93,10 @@
         {% for key in fields %}
         <label>{{ supplier.supplement_fields[key] }}<input name="supplement_{{ row_index }}_{{ key }}" maxlength="120"
           {% if key == 'amazon_ref_id' %}placeholder="从 Amazon 货件详情核对 Reference ID"{% endif %}></label>
+        {% if key == 'amazon_ref_id' and row.amazon_po_candidate %}
+        <label class="check-label"><input type="checkbox" name="confirm_amazon_po_line_{{ row_index }}" value="yes">已在 Seller Central 核实本行 PO {{ row.amazon_po_candidate }} 为参考号</label>
+        <label>本行核对依据<input name="amazon_po_line_reason_{{ row_index }}" maxlength="200"></label>
+        {% endif %}
         {% if key == 'model' and preparation.allow_no_model %}<label class="check-label"><input type="checkbox" name="supplement_{{ row_index }}_no_model" value="yes">无型号</label>{% endif %}
         {% endfor %}
         </div>

@@ -23,7 +23,7 @@ os.environ["LOGISTICS_ISOLATED"] = "1"
 from werkzeug.security import check_password_hash, generate_password_hash
 from app import app, User
 from models import BankAccount, CarrierAgent, Customer, Shipment, db
-from tms_invoice import MAX_UPLOAD_BYTES, InvoiceError, SERVICES, blank_invoice, parse_invoice, product_photos
+from tms_invoice import MAX_UPLOAD_BYTES, InvoiceError, SERVICES, blank_invoice, detail_column, parse_invoice, product_photos
 from tms_models import (TmsAccount, TmsAddressBook, TmsAgentApi, TmsAudit, TmsChargeAdjustment, TmsOrder, TmsReceivable,
                         TmsSupplierEvent, TmsSupplierOrder)
 from tms_xlsx_images import XLSX_NS
@@ -43,8 +43,8 @@ ART_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 
 
 def workbook_bytes(order_number="0000123", code="DEMO-A", *, change=None, recipient="虚构地址甲",
-                   pictures=(23, 24, 25), extended=False, product_details=False):
-    book = blank_invoice(extended=extended, product_details=product_details)
+                   pictures=(23, 24, 25), extended=False, product_details=False, amazon_po=False):
+    book = blank_invoice(extended=extended, product_details=product_details, amazon_po=amazon_po)
     address_sheet = book["地址库"]
     address_sheet.append(("虚构仓库", code, "", "", recipient, "", "", "", "1 Fictional Way",
                           "", "", "Test City", "CA", "US", "00001"))
@@ -59,12 +59,13 @@ def workbook_bytes(order_number="0000123", code="DEMO-A", *, change=None, recipi
         "A25": "0002", "B25": "Third item", "C25": "虚构另一箱", "G25": 2,
         "H25": 1, "J25": 1, "K25": 10, "L25": 10, "M25": 10, "N25": "否",
     }.items():
-        sheet[cell] = value
+        column, row = cell[0], cell[1:]
+        sheet[f"{detail_column(column, amazon_po and int(row) >= 23)}{row}"] = value
     for line in (23, 24, 25):
         for col, value in {"D": "Paper", "E": "Demo", "F": "00123456"}.items():
-            sheet[f"{col}{line}"] = value
+            sheet[f"{detail_column(col, amazon_po)}{line}"] = value
         if line in pictures:
-            photo_column = "Q" if product_details else "O"
+            photo_column = "R" if amazon_po else "Q" if product_details else "O"
             sheet[f"{photo_column}{line}"] = '=_xlfn.DISPIMG("ID_DEMO",1)'
     if change:
         change(book)
@@ -655,9 +656,9 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         book = load_workbook(io.BytesIO(response.data))
         self.assertEqual(book.sheetnames, ["星睿发票", "地址库", "服务选项"])
-        self.assertEqual(book["星睿发票"]["G84"].value, "=SUM(H23:H82)")
-        self.assertEqual(book["星睿发票"]["I82"].value,
-                         '=IF(OR(G82="",H82=""),"",ROUND(G82*H82,2))')
+        self.assertEqual(book["星睿发票"]["G84"].value, "=SUM(I23:I82)")
+        self.assertEqual(book["星睿发票"]["J82"].value,
+                         '=IF(OR(H82="",I82=""),"",ROUND(H82*I82,2))')
         self.assertEqual(book["地址库"]["B2"].value, "DEMO-A")
         book.close()
         raw = expanded_workbook(large=True)
@@ -714,7 +715,11 @@ class PortalTests(unittest.TestCase):
         self.assertIn("L4:N4", sheet.merged_cells)
         self.assertIn("地址库!", sheet["L7"].value)
         self.assertTrue(any("L4" in item and "地址库" in item.formula1 for item in sheet.data_validations.dataValidation))
-        self.assertEqual([sheet[f"{col}22"].value for col in "OPQ"], ["产品品牌", "产品型号", "产品图片*"])
+        self.assertEqual([sheet[f"{col}22"].value for col in "BPQR"], ["核实 Amazon PO", "产品品牌", "产品型号", "产品图片*"])
+        self.assertEqual(sheet["Q4"].data_type, "f")
+        self.assertEqual(sheet["G54"].value, "=SUM(I23:I52)")
+        self.assertEqual(sheet["I54"].value, "=SUM(J23:J52)")
+        self.assertTrue(any("O23" in item and "O52" in item for item in sheet.data_validations.dataValidation))
         self.assertIsNone(sheet["D4"].value)
         self.assertIsNone(sheet["O23"].value)
 
@@ -730,6 +735,26 @@ class PortalTests(unittest.TestCase):
         row = order.invoice["declarations"][0]
         self.assertEqual((row["brand"], row["model"], row["image_cell"]), ("无", "无", "Q23"))
         self.assertEqual(product_photos(order.workbook, order.invoice)[0], ("image/png", PNG))
+
+    def test_amazon_po_invoice_upload_preserves_row_candidates_and_wps_pictures(self):
+        def fill(book):
+            sheet = book["星睿发票"]
+            sheet["B23"], sheet["B25"] = "PO-001", "PO-003"
+            sheet["P23"], sheet["Q23"] = "无", "无"
+
+        raw = workbook_bytes(amazon_po=True, change=fill, extended=True)
+        self.sign_in(self.alice, "customer-a")
+        uploaded = self.upload(self.alice, raw)
+        self.assertEqual(uploaded.status_code, 302)
+        order = db.session.get(TmsOrder, int(uploaded.location.rsplit("/", 1)[-1]))
+        self.assertEqual(order.invoice["customer_number"], "0000123")
+        self.assertEqual(order.invoice["metadata"]["po_number"], "DEMO-PO")
+        products = order.invoice["declarations"]
+        self.assertEqual([row.get("amazon_po_candidate") for row in products], ["PO-001", None, "PO-003"])
+        self.assertEqual([row["image_cell"] for row in products], ["R23", "R24", "R25"])
+        self.assertEqual((products[0]["brand"], products[0]["model"]), ("无", "无"))
+        self.assertTrue(all("amazon_ref_id" not in row for row in products))
+        self.assertEqual(product_photos(order.workbook, order.invoice), [("image/png", PNG)] * 3)
 
     def test_database_catalogue_workflow_without_filesystem(self):
         path = f"/tms/admin/accounts/{self.customer_a.id}/address-book"

@@ -458,6 +458,34 @@ class NextSLSTests(unittest.TestCase):
                 for row in parcel["declarations"]:
                     self.assertEqual(row.get("amazon_ref_id"), po if rules is rule else None)
 
+    def test_each_workbook_po_requires_own_review(self):
+        rule = SERVICE | {"require_declaration_list": ["amazon_ref_id"]}
+        self.profile(rules={"TMS_DEMO": nextsls.preparation_rules(rule)})
+        order_id = self.approve()
+        order = db.session.get(TmsOrder, order_id)
+        # Two rows from separate Amazon shipments, plus a row with no B-column candidate.
+        rows = [dict(row) for row in order.invoice["declarations"]]
+        rows[0]["amazon_po_candidate"], rows[1]["amazon_po_candidate"] = "TEST-PO-A", "TEST-PO-B"
+        order.invoice = dict(order.invoice, declarations=rows)
+        db.session.commit()
+        self.assertEqual(self.action(order_id, "prepare", revision=3, confirm_amazon_po="yes",
+                                     amazon_po_reason="不能对多货件使用整票 PO").status_code, 400)
+        self.assertEqual(self.action(order_id, "prepare", revision=3,
+                                     supplement_2_amazon_ref_id="TEST-PO-A").status_code, 400)
+        self.assertEqual(self.action(order_id, "prepare", revision=3, confirm_amazon_po_line_0="yes",
+                                     amazon_po_line_reason_0="模拟核实货件 A").status_code, 302)
+        db.session.refresh(order)
+        self.assertEqual(set(nextsls.missing_supplements(order.invoice, {}, rule)), {1, 2})
+        self.assertEqual(self.action(order_id, "prepare", revision=4, confirm_amazon_po_line_1="yes",
+                                     amazon_po_line_reason_1="模拟核实货件 B",
+                                     supplement_2_amazon_ref_id="TEST-REFERENCE-C").status_code, 302)
+        db.session.refresh(order)
+        payload = nextsls.create_payload(order.invoice, "TMS_DEMO", "XR-DEMO", rule, {},
+                                         supplement=tms_carriers.order_supplement(order))["shipment"]
+        self.assertEqual([row["amazon_ref_id"] for box in payload["parcels"] for row in box["declarations"]],
+                         ["TEST-PO-A", "TEST-PO-B", "TEST-REFERENCE-C"])
+        self.carrier_post.assert_not_called()
+
     def test_save_verified_brand_while_channel_rules_are_stale(self):
         order_id = self.approve()
         profile = self.profile()

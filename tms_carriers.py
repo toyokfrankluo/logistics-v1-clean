@@ -291,7 +291,8 @@ def supplier_preparation(order, profile, agent):
     result["packing_delivery_ready"] = bool(packing_store)
     supplement = order_supplement(order)
     result["missing"] = nextsls.missing_supplements(order.invoice, supplement, rules)
-    result["amazon_po_candidate"] = any("amazon_ref_id" in fields for fields in result["missing"].values())
+    result["amazon_po_candidate"] = (not nextsls.has_line_amazon_po(order.invoice)
+                                     and any("amazon_ref_id" in fields for fields in result["missing"].values()))
     try:
         nextsls.create_payload(invoice, code, "XR-PREFLIGHT", rules, profile.sender, supplement=supplement,
                                image_fields=encoders, packing_host=packing_store.host if packing_store else "",
