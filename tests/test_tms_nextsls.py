@@ -464,7 +464,10 @@ class NextSLSTests(unittest.TestCase):
     def test_verified_channel_encoder_uses_private_storage_before_real_transport(self):
         code = "B009-MD"
         rule = SERVICE | {"code": code, "name": "虚构搏诚渠道", "require_declaration_list": ["photos"], "packing_list_required": 1}
-        self.profile(service_codes=[code], rules={code: nextsls.preparation_rules(rule)})
+        origin = tms_carriers.BC_ORIGIN
+        self.profile(base_url=origin, service_codes=[code], rules={code: nextsls.preparation_rules(rule)})
+        self.agent.api_url = ""
+        db.session.commit()
         self.sign_in(self.alice, "customer-a")
         uploaded = self.upload(self.alice, fixture.floating_workbook(service="超级经济线卡派"))
         self.assertEqual(uploaded.status_code, 302)
@@ -477,7 +480,6 @@ class NextSLSTests(unittest.TestCase):
         s3 = MagicMock()
         s3.get_public_access_block.return_value = {"PublicAccessBlockConfiguration": dict.fromkeys(
             ("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets"), True)}
-        # The fixture codec is deliberately artificial and exists only in this test.
         url_root = "https://fixture-bucket.s3.us-east-1.amazonaws.com"
         s3.generate_presigned_url.side_effect = lambda _op, Params, ExpiresIn, HttpMethod: (
             f'{url_root}/{Params["Key"]}?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Expires={ExpiresIn}'
@@ -500,7 +502,7 @@ class NextSLSTests(unittest.TestCase):
 
         def api(target, *, json, headers):
             self.assertEqual(headers["Authorization"], "Bearer " + TOKEN)
-            self.assertTrue(target.api_url.startswith(ORIGIN + "/api/v5/shipment/"))
+            self.assertTrue(target.api_url.startswith(origin + "/api/v5/shipment/"))
             if target.api_url.endswith("/get_services"):
                 return success({"services": [rule]})
             self.assertTrue(target.api_url.endswith("/create"))
@@ -510,10 +512,9 @@ class NextSLSTests(unittest.TestCase):
         config = dict(ISOLATED_MODE=False, TMS_NEXTSLS_CREATE_ENABLED=True, TMS_NEXTSLS_READ_ENABLED=True,
                       TMS_NEXTSLS_IMAGE_BUCKET="fixture-bucket",
                       TMS_NEXTSLS_IMAGE_REGION="us-east-1", TMS_NEXTSLS_IMAGE_URL_TTL_SECONDS="900",
-                      TMS_NEXTSLS_IMAGE_SCOPE=f"{order.agent_id}|{ORIGIN}",
+                      TMS_NEXTSLS_IMAGE_SCOPE=f"{order.agent_id}|{origin}",
                       TMS_NEXTSLS_IMAGE_ACCESS_KEY_ID="fixture-storage", TMS_NEXTSLS_IMAGE_SECRET_ACCESS_KEY="fixture-only")
-        codec = {(ORIGIN, None): lambda url: "fixture-encoding:" + url}
-        with patch.dict(app.config, config), patch.dict(tms_supplier_images.CONFIRMED_PHOTOS_ENCODERS, codec), patch(
+        with patch.dict(app.config, config), patch(
             "tms_supplier_images.s3_client", return_value=s3,
         ), patch("tms_supplier_images.image_get", side_effect=image_get), patch("carrier_http.post", side_effect=api):
             self.assertIn("已配置，提交时自动验证图片", self.get(
@@ -521,7 +522,8 @@ class NextSLSTests(unittest.TestCase):
             with patch.dict(app.config, TMS_NEXTSLS_IMAGE_SCOPE=f"{order.agent_id}|https://other.nextsls.com|{code}"):
                 blocked = self.action(order_id, "create", confirm="yes")
                 self.assertEqual(blocked.status_code, 400)
-                self.assertIn(nextsls.PHOTOS_PROTOCOL_BLOCKER, blocked.get_data(as_text=True))
+                self.assertIn(nextsls.PHOTOS_STORAGE_BLOCKER, blocked.get_data(as_text=True))
+                self.assertNotIn(nextsls.PHOTOS_PROTOCOL_BLOCKER, blocked.get_data(as_text=True))
                 self.assertFalse(reads)
             with patch.object(s3, "get_public_access_block", return_value={"PublicAccessBlockConfiguration": {}}):
                 self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 400)
@@ -549,7 +551,7 @@ class NextSLSTests(unittest.TestCase):
         rows = [row for box in payload["parcels"] for row in box["declarations"]]
         for index, row in enumerate(rows):
             digest = sha256(fixture.FLOATING_PHOTOS[index]).hexdigest()
-            self.assertRegex(row["photos"], rf"fixture-encoding:https://.*/{index}-{digest}\.(png|jpg)\?")
+            self.assertRegex(row["photos"], rf"^https://.*/{index}-{digest}\.(png|jpg)\?.*&X-Amz-Signature=synthetic$")
             self.assertNotIn("photo_url", row)
         self.assertEqual(db.session.get(TmsSupplierOrder, order_id).supplier_number, SUPPLIER_NUMBER)
         self.assertCountEqual(objects.values(), fixture.FLOATING_PHOTOS)
@@ -604,7 +606,8 @@ class NextSLSTests(unittest.TestCase):
             db.session.refresh(order)
             preparation = tms_carriers.supplier_preparation(order, profile, self.agent)
             self.assertEqual(preparation["missing"], {})
-            self.assertIn(nextsls.PHOTOS_PROTOCOL_BLOCKER, preparation["blockers"])
+            self.assertIn(nextsls.PHOTOS_STORAGE_BLOCKER, preparation["blockers"])
+            self.assertNotIn(nextsls.PHOTOS_PROTOCOL_BLOCKER, preparation["blockers"])
             self.assertEqual(nextsls.PACKING_TRANSMISSION_BLOCKER in preparation["blockers"], code == "B009-MD")
 
     def test_b888_invoice_to_mock_create_uses_confirmed_supplement_and_one_reservation(self):

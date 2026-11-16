@@ -22,6 +22,9 @@
       {{ preparation.required_photo_fields|join('、') }} 为本渠道必填，真实传输未配置
       {% elif preparation.required_photo_fields is none %}等待当前渠道规则
       {% else %}当前渠道规则未要求图片字段{% endif %}</dd></div>
+    {% if preparation.photos_protocol_confirmed and (preparation.required_photo_fields is none or 'photos' in preparation.required_photo_fields) %}
+    <div><dt>图片协议</dt><dd>已确认：photos 接受签名 HTTPS 图片链接</dd></div>
+    {% endif %}
     <div><dt>供应商读取图片</dt><dd>尚未验证</dd></div>
     <div><dt>本票创建验收</dt><dd>未提交</dd></div>
     <div><dt>装箱单</dt><dd>{% if preparation.packing_required is true %}

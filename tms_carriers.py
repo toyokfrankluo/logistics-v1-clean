@@ -193,7 +193,7 @@ def supplier_blocker_groups(blockers):
         if message == CREATE_DISABLED:
             authorization.append(message)
         elif (message in (nextsls.PHOTOS_PROTOCOL_BLOCKER,
-                          nextsls.PHOTO_URL_PUBLICATION_BLOCKER, nextsls.PACKING_TRANSMISSION_BLOCKER)
+                          nextsls.PHOTO_URL_PUBLICATION_BLOCKER)
               or message.startswith(nextsls.UNSUPPORTED_DECLARATION_BLOCKER)):
             protocol.append(message)
         else:
@@ -236,6 +236,7 @@ def supplier_preparation(order, profile, agent):
     if origin and origin != profile.base_url:
         blockers.append("代理租户已与审核记录不符")
         return result
+    result["photos_protocol_confirmed"] = images.photos_encoder(profile, code) is not None
     rules = channel_rules(profile, code)
     if rules is None:
         blockers.append("此渠道的完整必填规则尚未读取或已过期，请到代理设置刷新 NextSLS 渠道清单")
@@ -251,7 +252,9 @@ def supplier_preparation(order, profile, agent):
     result["missing"] = nextsls.missing_supplements(order.invoice, supplement, rules)
     try:
         nextsls.create_payload(invoice, code, "XR-PREFLIGHT", rules, profile.sender, supplement=supplement,
-                               image_fields=encoders, packing_host=packing_store.host if packing_store else "", preflight=True)
+                               image_fields=encoders, packing_host=packing_store.host if packing_store else "",
+                               photos_protocol_confirmed=result["photos_protocol_confirmed"],
+                               preflight=True)
     except nextsls.PreparationError as exc:
         blockers.extend(exc.blockers)
     except nextsls.ProtocolError as exc:
@@ -379,6 +382,7 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
         packing_host=packing_host,
         publish_photos=publish_photos if photo_publisher is not None else None,
         image_fields=encoders,
+        photos_protocol_confirmed=images.photos_encoder(profile, code) is not None,
         publish_image_fields=(lambda: images.publish_images(store, order, profile, order_photos(), encoders))
         if encoders else None,
         publish_packing=(lambda: packing_publisher(packing_draft(order).getvalue()))

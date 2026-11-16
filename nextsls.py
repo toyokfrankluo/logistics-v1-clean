@@ -41,6 +41,7 @@ REQUIRED_FLAGS = ("tel_required", "email_required", "company_required", "city_re
                   "vat_number_required", "eori_required", "packing_list_required")
 DESTINATION_PLACEHOLDER_BLOCKER = "收件地址含未经核对的历史模板占位值，请更正后再提交"
 PHOTOS_PROTOCOL_BLOCKER = "渠道要求 photos，图片传输格式尚待供应商确认"
+PHOTOS_STORAGE_BLOCKER = "渠道要求 photos，请配置用于发布签名 HTTPS 图片链接的私有存储"
 PHOTO_URL_PUBLICATION_BLOCKER = "商品图片链接传输尚未获准"
 PACKING_TRANSMISSION_BLOCKER = "渠道要求装箱单，自动发布所需的私有存储尚未配置"
 UNSUPPORTED_DECLARATION_BLOCKER = "当前发票映射不支持该渠道的全部必填申报字段"
@@ -273,7 +274,7 @@ def unverified_destination_fields(invoice):
 
 def create_payload(invoice, code, reference, profile, sender, *, supplement=None, packing_host="",
                    publish_photos=None, publish_packing=None, image_fields=(), publish_image_fields=None,
-                   preflight=False):
+                   photos_protocol_confirmed=False, preflight=False):
     """Translate a reviewed invoice; do not manufacture fields missing for the selected service."""
     if not CODE.fullmatch(code) or not CODE.fullmatch(reference):
         raise ProtocolError("渠道代码或系统对账参考号无效。")
@@ -348,7 +349,7 @@ def create_payload(invoice, code, reference, profile, sender, *, supplement=None
     if packing_required and (not packing_host or (publish_packing is None and not preflight)):
         blockers.append(PACKING_TRANSMISSION_BLOCKER)
     if "photos" in requirements and "photos" not in image_fields:
-        blockers.append(PHOTOS_PROTOCOL_BLOCKER)
+        blockers.append(PHOTOS_STORAGE_BLOCKER if photos_protocol_confirmed else PHOTOS_PROTOCOL_BLOCKER)
     if unsupported:
         known = sorted(set(unsupported) & {"amazon_ref_id", "brand", "model", "photos", "weight", "size"})
         blockers.append(UNSUPPORTED_DECLARATION_BLOCKER + (f"（{', '.join(known)}）" if known else ""))

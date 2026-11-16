@@ -13,7 +13,7 @@ from tms_xlsx_images import MAX_PHOTO_BYTES, MAX_PHOTO_TOTAL_BYTES
 
 
 # Use (tenant, None) for a verified tenant-wide contract or (tenant, channel) for a verified exception.
-CONFIRMED_PHOTOS_ENCODERS = {}
+CONFIRMED_PHOTOS_ENCODERS = {("https://bckjkj.nextsls.com", None): nextsls.product_photo_url}
 IMAGE_TYPES = {"image/png": "png", "image/jpeg": "jpg"}
 MEDIA_ERROR = "商品图片未能通过私有存储的 HTTPS 读取校验，未提交代理下单。"
 
@@ -39,12 +39,16 @@ def image_delivery(order, profile, rules):
     if not store:
         return None, {}
     encoders = {"photo_url": str} if "photo_url" in required else {}
-    encoder = CONFIRMED_PHOTOS_ENCODERS.get(
-        (profile.base_url, order.agent_service), CONFIRMED_PHOTOS_ENCODERS.get((profile.base_url, None)),
-    )
+    encoder = photos_encoder(profile, order.agent_service)
     if "photos" in required and encoder is not None:
         encoders["photos"] = encoder
     return store, encoders
+
+
+def photos_encoder(profile, channel):
+    return CONFIRMED_PHOTOS_ENCODERS.get(
+        (profile.base_url, channel), CONFIRMED_PHOTOS_ENCODERS.get((profile.base_url, None)),
+    )
 
 
 def media_store(order, profile):
