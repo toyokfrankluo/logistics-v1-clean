@@ -14,7 +14,7 @@ ART_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
 FIRST_PRODUCT_ROW = 23
 MAX_PRODUCT_LINES = 60
 LAST_PRODUCT_ROW = FIRST_PRODUCT_ROW + MAX_PRODUCT_LINES - 1
-PHOTO_CELL = re.compile(r"O(?:2[3-9]|[3-7][0-9]|8[0-2])\Z")
+PHOTO_CELL = re.compile(r"[OQ](?:2[3-9]|[3-7][0-9]|8[0-2])\Z")
 MEDIA_PART = re.compile(r"xl/media/[A-Za-z0-9_.-]+\.(?:png|jpe?g)\Z", re.IGNORECASE)
 WPS_IMAGE_FORMULA = re.compile(r'(?:_xlfn\.)?DISPIMG\(\s*"(ID_[A-Za-z0-9_-]{1,64})"\s*,\s*[12]\s*\)\Z',
                                re.IGNORECASE)
@@ -141,15 +141,16 @@ def anchored_images(archive, sheet_part):
                 continue
             start = anchor.find(DRAWING_NS + "from")
             pictures = anchor.findall(DRAWING_NS + "pic")
-            if start is None or not pictures or start.findtext(DRAWING_NS + "col") != "14":
+            column = {"14": "O", "16": "Q"}.get(start.findtext(DRAWING_NS + "col")) if start is not None else None
+            if not column or not pictures:
                 continue
             row = start.findtext(DRAWING_NS + "row", "")
             if not re.fullmatch(r"\d{1,7}", row):
                 continue
             line = int(row) + 1
             if line > LAST_PRODUCT_ROW:
-                raise PhotoError(f"O{line}（产品图片）超出申报区。")
-            cell = f"O{line}"
+                raise PhotoError(f"{column}{line}（产品图片）超出申报区。")
+            cell = f"{column}{line}"
             if PHOTO_CELL.fullmatch(cell):
                 if cell in photos or len(pictures) != 1:
                     raise PhotoError(f"{cell}（产品图片）有多张浮动图片，请保留一张。")

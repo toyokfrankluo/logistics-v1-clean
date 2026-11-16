@@ -228,6 +228,13 @@ def declaration_supplements(invoice, supplement, index, fields):
                 break
             except ProtocolError:
                 continue
+    # Only the separate, audited administrator confirmation can authorize D4.
+    if "amazon_ref_id" in fields and "amazon_ref_id" not in result:
+        candidate = invoice.get("customer_number")
+        confirmation = invoice.get("amazon_d4_confirmation", {})
+        if (candidate and confirmation.get("value") == candidate
+                and confirmation.get("by") and confirmation.get("reason")):
+            result["amazon_ref_id"] = supplied_text(candidate, 120)
     return result
 
 

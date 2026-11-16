@@ -1,4 +1,4 @@
-"""Customer ordering and administrator review. This module performs no carrier calls."""
+"""Customer ordering and administrator review."""
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from hashlib import sha256
@@ -511,7 +511,7 @@ def download_invoice_template(catalogue, *, extended=False):
     layout_path = current_app.config.get("TMS_INVOICE_TEMPLATE_PATH")
     layout = read_configured_workbook(layout_path) if layout_path else None
     result = BytesIO()
-    workbook = blank_invoice(catalogue, layout=layout, extended=extended)
+    workbook = blank_invoice(catalogue, layout=layout, extended=extended, product_details=True)
     try:
         workbook.save(result)
     finally:
@@ -687,10 +687,16 @@ def staff_detail(order, **context):
     channels = {}
     mapped_channels = {}
     if order.status != "approved" and agents and tms_carriers.carrier_schema():
+        by_id = {agent.id: agent for agent in agents if agent.supports_api}
         profiles = db.session.scalars(
             select(TmsAgentApi).where(TmsAgentApi.provider == "nextsls",
-                                     TmsAgentApi.agent_id.in_([agent.id for agent in agents])))
+                                     TmsAgentApi.agent_id.in_(by_id))).all()
         for profile in profiles:
+            if request.method == "GET":
+                agent = by_id[profile.agent_id]
+                error = tms_carriers.refresh_expired_channel_catalogue(profile, agent)
+                if error:
+                    flash(f"{agent.name} 渠道自动刷新失败：{error}", "danger")
             channels[profile.agent_id] = tms_carriers.channel_catalogue(profile)
             mapping = tms_carriers.channel_mappings(profile).get(order.invoice["service"])
             if mapping:
@@ -713,7 +719,13 @@ def staff_detail(order, **context):
                 snapshot = None
             cost = tms_carriers.latest_event(order.id, "cost")
             unsubmitted = not shipment.shipment_id and (not link or (link.state == "new" and not link.attempt_at))
+            refresh_error = None
+            if (unsubmitted and request.method == "GET" and profile
+                    and order.invoice.get("supplier_tenant_origin", profile.base_url) == profile.base_url):
+                refresh_error = tms_carriers.refresh_expired_channel_catalogue(profile, agent)
             preparation = tms_carriers.supplier_preparation(order, profile, agent) if unsubmitted else {}
+            if refresh_error:
+                preparation["blockers"].append(f"渠道自动刷新失败：{refresh_error}")
             supplier = {
                 "link": link, "snapshot": snapshot, "cost": cost, "supplier_number": shipment.shipment_id,
                 "last_attempt": (tms_carriers.latest_event(order.id, "attempt")
@@ -925,6 +937,22 @@ def save_supplier_supplement(order, form):
         allowed.update(f"supplement_{index}_no_model" for index, fields in missing.items() if "model" in fields)
     if any(key.startswith("supplement_") and (key not in allowed or len(form.getlist(key)) != 1) for key in form):
         raise nextsls.ProtocolError("渠道所需资料已变化，请刷新页面后补充。")
+    confirmation = None
+    if "confirm_amazon_d4" in form or form.get("amazon_d4_reason", "").strip():
+        if (form.getlist("confirm_amazon_d4") != ["yes"]
+                or not any("amazon_ref_id" in fields for fields in missing.values())
+                or any(form.get(f"supplement_{i}_amazon_ref_id", "").strip() for i in missing)):
+            raise nextsls.ProtocolError("请单独确认 D4，或填写实际 Amazon 参考号。")
+        reason = nextsls.supplied_text(form.get("amazon_d4_reason"), 200)
+        raw = order.workbook
+        try:
+            candidate = parse_invoice(raw)["customer_number"] if raw and sha256(raw).hexdigest() == order.file_sha256 else None
+        except InvoiceError:
+            candidate = None
+        if not candidate or candidate != order.invoice["customer_number"]:
+            raise nextsls.ProtocolError("无法核实原发票 D4，请填写已核实的 Amazon 参考号。")
+        confirmation = {"value": candidate, "by": current_user.id, "reason": reason,
+                        "at": datetime.now(timezone.utc).isoformat()}
     rows = dict(prior.get("declarations", {}))
     for index, fields in missing.items():
         values = dict(rows.get(str(index), {}))
@@ -939,10 +967,13 @@ def save_supplier_supplement(order, form):
                 values[field] = nextsls.supplemental_value(order.invoice, field, raw)
         if values:
             rows[str(index)] = values
-    if rows == prior.get("declarations", {}):
+    if rows == prior.get("declarations", {}) and not confirmation:
         raise nextsls.ProtocolError("请填写至少一项当前缺少的申报资料。")
     supplement = {**prior, "agent_id": order.agent_id, "service": order.agent_service, "declarations": rows}
-    update_order(order, {"invoice": dict(order.invoice, nextsls_supplement=supplement)})
+    invoice = dict(order.invoice, nextsls_supplement=supplement)
+    if confirmation:
+        invoice["amazon_d4_confirmation"] = confirmation
+    update_order(order, {"invoice": invoice})
     history(order, "supplier_prep")
     db.session.commit()
 

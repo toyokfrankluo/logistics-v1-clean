@@ -43,8 +43,8 @@ ART_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 
 
 def workbook_bytes(order_number="0000123", code="DEMO-A", *, change=None, recipient="虚构地址甲",
-                   pictures=(23, 24, 25), extended=False):
-    book = blank_invoice(extended=extended)
+                   pictures=(23, 24, 25), extended=False, product_details=False):
+    book = blank_invoice(extended=extended, product_details=product_details)
     address_sheet = book["地址库"]
     address_sheet.append(("虚构仓库", code, "", "", recipient, "", "", "", "1 Fictional Way",
                           "", "", "Test City", "CA", "US", "00001"))
@@ -64,7 +64,8 @@ def workbook_bytes(order_number="0000123", code="DEMO-A", *, change=None, recipi
         for col, value in {"D": "Paper", "E": "Demo", "F": "00123456"}.items():
             sheet[f"{col}{line}"] = value
         if line in pictures:
-            sheet[f"O{line}"] = '=_xlfn.DISPIMG("ID_DEMO",1)'
+            photo_column = "Q" if product_details else "O"
+            sheet[f"{photo_column}{line}"] = '=_xlfn.DISPIMG("ID_DEMO",1)'
     if change:
         change(book)
     stream = io.BytesIO()
@@ -713,9 +714,22 @@ class PortalTests(unittest.TestCase):
         self.assertIn("L4:N4", sheet.merged_cells)
         self.assertIn("地址库!", sheet["L7"].value)
         self.assertTrue(any("L4" in item and "地址库" in item.formula1 for item in sheet.data_validations.dataValidation))
-        self.assertEqual(sheet["O22"].value, "产品图片*")
+        self.assertEqual([sheet[f"{col}22"].value for col in "OPQ"], ["产品品牌", "产品型号", "产品图片*"])
         self.assertIsNone(sheet["D4"].value)
         self.assertIsNone(sheet["O23"].value)
+
+    def test_new_invoice_upload_preserves_brand_model_and_wps_picture(self):
+        def fill(book):
+            sheet = book["星睿发票"]
+            sheet["O23"], sheet["P23"] = "虚构品牌", "00123"
+        raw = workbook_bytes(product_details=True, change=fill)
+        self.sign_in(self.alice, "customer-a")
+        uploaded = self.upload(self.alice, raw)
+        self.assertEqual(uploaded.status_code, 302)
+        order = db.session.get(TmsOrder, int(uploaded.location.rsplit("/", 1)[-1]))
+        row = order.invoice["declarations"][0]
+        self.assertEqual((row["brand"], row["model"], row["image_cell"]), ("虚构品牌", "00123", "Q23"))
+        self.assertEqual(product_photos(order.workbook, order.invoice)[0], ("image/png", PNG))
 
     def test_database_catalogue_workflow_without_filesystem(self):
         path = f"/tms/admin/accounts/{self.customer_a.id}/address-book"

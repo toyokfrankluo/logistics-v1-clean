@@ -495,16 +495,7 @@ def edit_agent(agent_id):
         if channel_action not in {"load", "save"}:
             abort(400)
         try:
-            origin = profile.base_url if profile else None
-            token = a.app_token
-            catalogue, rules = tms_carriers.read_channel_catalogue(profile, a)
-            db.session.refresh(a, with_for_update=True)
-            db.session.refresh(profile, with_for_update=True)
-            if (profile.provider != "nextsls" or "create" not in profile.enabled or profile.base_url != origin
-                    or a.app_token != token or not a.is_active or not a.supports_api
-                    or not nextsls.legacy_tenant_matches(a.api_url, origin)):
-                raise nextsls.ProtocolError("代理配置已经变更，请重新读取渠道。")
-            tms_carriers.store_channel_catalogue(profile, catalogue, rules)
+            catalogue = tms_carriers.refresh_channel_catalogue(profile, a)
             if channel_action == "save":
                 tms_carriers.save_channel_mapping(profile, catalogue, request.form.get("sales_service", ""),
                                                   request.form.get("supplier_channel_code", ""))
@@ -550,6 +541,10 @@ def edit_agent(agent_id):
             legacy_url = None
     except ValueError:
         legacy_url = None
+    if request.method == "GET":
+        error = tms_carriers.refresh_expired_channel_catalogue(profile, a)
+        if error:
+            flash(f"渠道自动刷新失败：{error}", "danger")
     return render_template("edit_agent.html", agent=a, legacy_url=legacy_url,
                            integration_ready=ready, profile=profile, providers=tms_carriers.PROVIDERS,
                            capabilities=nextsls.CAPABILITIES, endpoints=endpoints, blocked=blocked,

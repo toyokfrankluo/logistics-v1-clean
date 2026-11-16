@@ -77,7 +77,7 @@ def check_sheet_xml(xml, image_refs, *, invoice_photos=None):
     for cell in fromstring(xml).iter(XLSX_NS + "c"):
         coordinate = cell.get("r", "")
         if invoice_photos is not None:
-            match = re.fullmatch(r"[A-O]([1-9]\d{0,2})", coordinate)
+            match = re.fullmatch(r"[A-Q]([1-9]\d{0,2})", coordinate)
             if not match or int(match[1]) > MAX_INVOICE_ROW:
                 raise InvoiceError(f"发票超出版式范围。每票最多 {MAX_PRODUCT_LINES} 条申报。")
         formula = cell.find(XLSX_NS + "f")
@@ -320,20 +320,20 @@ def check_displayed_address(raw, rows, address):
             raise InvoiceError(f"L{line} 的收件资料与本工作簿地址库冲突。请核对 L4 并重新保存发票。")
 
 
-def required_fields(rows, photos, last_product):
+def required_fields(rows, photos, last_product, photo_column):
     missing = [
         f"{get_column_letter(col)}{line}（{label}）"
         for (line, col), label in REQUIRED_ORDER.items() if missing_value(rows[line - 1][col - 1])
     ]
     used_rows = []
     for line, row in enumerate(rows[FIRST_PRODUCT_ROW - 1:last_product], start=FIRST_PRODUCT_ROW):
-        if f"O{line}" not in photos and all(missing_value(cell) for i, cell in enumerate(row) if i != 8):
+        if f"{photo_column}{line}" not in photos and all(missing_value(cell) for i, cell in enumerate(row) if i != 8):
             continue
         used_rows.append((line, row))
         missing.extend(f"{col}{line}（{label}）" for col, label in REQUIRED_LINE.items()
                        if missing_value(row[ord(col) - ord("A")]))
-        if f"O{line}" not in photos:
-            missing.append(f"O{line}（产品图片，须内嵌 PNG 或 JPEG）")
+        if f"{photo_column}{line}" not in photos:
+            missing.append(f"{photo_column}{line}（产品图片，须内嵌 PNG 或 JPEG）")
     if missing:
         raise InvoiceError("请补齐以下必填项：" + "、".join(missing) + "。")
     if not used_rows:
@@ -359,10 +359,10 @@ def parse_invoice(raw):
         if set(book.sheetnames) != SHEETS:
             raise InvoiceError("请上传星睿三工作表单票模板。")
         sheet = book["星睿发票"]
-        if sheet.max_row is None or sheet.max_row > MAX_INVOICE_ROW or sheet.max_column is None or sheet.max_column > 15:
+        if sheet.max_row is None or sheet.max_row > MAX_INVOICE_ROW or sheet.max_column is None or sheet.max_column > 17:
             raise InvoiceError(f"请使用星睿 11.6 版单票模板。每票最多 {MAX_PRODUCT_LINES} 条申报。")
         sheet.reset_dimensions()
-        rows = list(islice(sheet.iter_rows(min_row=1, max_col=15), MAX_INVOICE_ROW + 1))
+        rows = list(islice(sheet.iter_rows(min_row=1, max_col=17), MAX_INVOICE_ROW + 1))
         if (
             not 56 <= len(rows) <= MAX_INVOICE_ROW
             or "订单号" not in str(rows[3][0].value)
@@ -372,6 +372,16 @@ def parse_invoice(raw):
             or "货箱重量" not in str(rows[21][9].value)
         ):
             raise InvoiceError("发票表头与星睿 11.6 模板不符。")
+        headers = [str(cell.value or "").strip() for cell in rows[21]]
+        if headers[14:16] == ["产品品牌", "产品型号"] and "产品图片" in headers[16]:
+            photo_column = "Q"
+        elif "产品图片" in headers[14] and not any(headers[15:]) and all(
+                missing_value(cell) for row in rows for cell in row[15:]):
+            photo_column = "O"
+        else:
+            raise InvoiceError("商品表头须为旧版 O 列图片，或新版 O 列品牌、P 列型号、Q 列图片。")
+        if any(not cell.startswith(photo_column) for cell in photos):
+            raise InvoiceError(f"请将产品图片内嵌至本版模板的 {photo_column} 列。")
         # The total and note rows move together when product rows are inserted.
         last_product = len(rows) - 4
         total_row = rows[last_product + 1]
@@ -382,7 +392,7 @@ def parse_invoice(raw):
                 or any(not missing_value(cell) for cell in rows[-1][1:])
                 or any(int(cell[1:]) > last_product for cell in photos)):
             raise InvoiceError("发票的申报区或汇总行已错位。请使用星睿扩展模板。")
-        used_rows = required_fields(rows, photos, last_product)
+        used_rows = required_fields(rows, photos, last_product, photo_column)
         customer_number = identifier(rows[3][3], "客户单号")
         service = cell_text(rows[4][3], "运输服务")
         if service not in SERVICES:
@@ -419,8 +429,13 @@ def parse_invoice(raw):
                 "unit_price_usd": unit_price, "quantity": quantity,
                 "total_usd": format(total, "f"),
                 "battery": yes_no(row[13], f"第 {line} 行是否带电"),
-                "image_part": photos[f"O{line}"], "image_cell": f"O{line}",
+                "image_part": photos[f"{photo_column}{line}"], "image_cell": f"{photo_column}{line}",
             })
+            if photo_column == "Q":
+                for column, field in ((14, "brand"), (15, "model")):
+                    value = cell_text(row[column], headers[column], required=False, limit=120)
+                    if value:
+                        declarations[-1][field] = value
         if number(rows[14][3], "D15（箱数）", whole=True) != len(boxes):
             raise InvoiceError("发票箱数与不同箱号的数量不一致。")
         return {
@@ -466,14 +481,15 @@ def parse_box(row, line, boxes):
     return key
 
 
-def blank_invoice(catalogue=None, *, layout=None, extended=False):
+def blank_invoice(catalogue=None, *, layout=None, extended=False, product_details=False):
     """Generate a clean 11.6 invoice, including only this customer's assigned address rows."""
     last_product = LAST_PRODUCT_ROW if extended else FIRST_PRODUCT_ROW + STANDARD_PRODUCT_LINES - 1
     total_row, note_row = last_product + 2, last_product + 4
     book = Workbook()
     sheet = book.active
     sheet.title = "星睿发票"
-    sheet.merge_cells("A1:O2")
+    photo_column = "Q" if product_details else "O"
+    sheet.merge_cells(f"A1:{photo_column}2")
     sheet["A1"] = "星睿物流发票模板 / SHIPPING INVOICE"
     left = (
         "客户 / FBA 订单号 *", "运输服务 / 渠道 *", "发货公司", "是否带电 *",
@@ -493,15 +509,15 @@ def blank_invoice(catalogue=None, *, layout=None, extended=False):
     for index, label in enumerate(right, 4):
         if index < 17:
             sheet.merge_cells(f"I{index}:K{index}")
-            end_column = "N" if index == 4 else "O"
+            end_column = "N" if index == 4 else photo_column
             sheet.merge_cells(f"L{index}:{end_column}{index}")
         sheet.cell(index, 9, label)
     for region, label in (
-        ("A3:H3", "01 发件人信息 / 订单资料"), ("I3:O3", "02 收件人信息 / 地址库自动填充"),
-        ("A20:O20", "03 产品与货物申报资料 / CUSTOMS DECLARATION"),
-        ("A21:O21", "在 L4 选择地址编码，在 D5 选择服务。每条产品明细填写所有星号字段，图片插入 O 列。"),
+        ("A3:H3", "01 发件人信息 / 订单资料"), (f"I3:{photo_column}3", "02 收件人信息 / 地址库自动填充"),
+        (f"A20:{photo_column}20", "03 产品与货物申报资料 / CUSTOMS DECLARATION"),
+        (f"A21:{photo_column}21", f"在 L4 选择地址编码，在 D5 选择服务。每条产品明细填写所有星号字段，图片插入 {photo_column} 列。"),
         (f"A{total_row}:E{total_row}", "合计"),
-        (f"A{note_row}:O{note_row}", "一份文件填写一票。按工作簿内的地址库匹配收件资料，提交后由星睿审核。"),
+        (f"A{note_row}:{photo_column}{note_row}", "一份文件填写一票。按工作簿内的地址库匹配收件资料，提交后由星睿审核。"),
     ):
         sheet.merge_cells(region)
         cell = sheet[region.split(":")[0]]
@@ -509,19 +525,21 @@ def blank_invoice(catalogue=None, *, layout=None, extended=False):
         cell.font = Font(color="9C1F15", bold=True)
         cell.fill = PatternFill("solid", fgColor="EEEEEE")
     sheet.merge_cells("D17:H19")
-    sheet.merge_cells("L17:O19")
+    sheet.merge_cells(f"L17:{photo_column}19")
     for column, label in REQUIRED_LINE.items():
         sheet[f"{column}22"] = label + " *"
     for column, label in {"F": "海关编码* / HS Code*", "G": "申报单价 (USD) *", "I": "总申报价值 (USD)",
                           "J": "货箱重量 (kg) *", "K": "箱长 (cm) *", "L": "箱宽 (cm) *",
-                          "M": "箱高 (cm) *", "O": "产品图片*"}.items():
+                          "M": "箱高 (cm) *", photo_column: "产品图片*"}.items():
         sheet[f"{column}22"] = label
+    if product_details:
+        sheet["O22"], sheet["P22"] = "产品品牌", "产品型号"
     for cell in sheet[22]:
         cell.font = Font(color="9C1F15" if "*" in cell.value else "111111", bold=True)
         cell.fill = PatternFill("solid", fgColor="FFE69A")
         cell.alignment = Alignment(wrap_text=True, vertical="center")
         sheet.column_dimensions[cell.column_letter].width = 19
-    sheet.column_dimensions["O"].width = 31
+    sheet.column_dimensions[photo_column].width = 31
     sheet.row_dimensions[22].height = 36
     for row in range(FIRST_PRODUCT_ROW, last_product + 1):
         sheet[f"I{row}"] = f'=IF(OR(G{row}="",H{row}=""),"",ROUND(G{row}*H{row},2))'
@@ -532,7 +550,7 @@ def blank_invoice(catalogue=None, *, layout=None, extended=False):
         col = get_column_letter(ADDRESS_COLUMNS[field])
         result = f"INDEX(地址库!${col}$2:${col}$5000,MATCH($L$4,地址库!$B$2:$B$5000,0))"
         sheet[f"L{row}"] = f'=IF($L$4="","",IFERROR(IF({result}="","",{result})&"",""))'
-    sheet["O4"] = '=IF(L4="","请输入编码",IF(COUNTIF(地址库!$B$2:$B$5000,L4)=1,"地址匹配成功","地址编码不存在或重复"))'
+    sheet[f"{photo_column}4"] = '=IF(L4="","请输入编码",IF(COUNTIF(地址库!$B$2:$B$5000,L4)=1,"地址匹配成功","地址编码不存在或重复"))'
     sheet["L17"] = ('=IF(L4="","",IF(L6="","",L6&CHAR(10))&L7&CHAR(10)&'
                     'IF(L8="","",L8&CHAR(10))&IF(L9="","",L9&CHAR(10))&L10&", "&L11&" "&L12&CHAR(10)&L13)')
     sheet["L17"].alignment = Alignment(wrap_text=True)
@@ -570,35 +588,42 @@ def blank_invoice(catalogue=None, *, layout=None, extended=False):
         for cell_range in cells:
             picker.add(cell_range)
     if layout is not None:
-        copy_invoice_format(sheet, layout, last_product)
+        copy_invoice_format(sheet, layout, last_product, photo_column)
     for field in ("D4", "D14", "D16", "L4"):
         sheet[field].number_format = "@"
     for line in range(FIRST_PRODUCT_ROW, last_product + 1):
         sheet[f"A{line}"].number_format = sheet[f"F{line}"].number_format = "@"
+        if product_details:
+            sheet[f"O{line}"].number_format = sheet[f"P{line}"].number_format = "@"
     return book
 
 
-def copy_invoice_format(sheet, raw, last_product):
+def copy_invoice_format(sheet, raw, last_product, photo_column):
     # Only presentation is copied. Original values, notes, images and address rows never follow the layout.
     with workbook_from_bytes(raw) as (validated, _photos):
-        if "星睿发票" not in validated or (validated["星睿发票"].max_row, validated["星睿发票"].max_column) != (56, 15):
+        if "星睿发票" not in validated or validated["星睿发票"].max_row != 56 or validated["星睿发票"].max_column not in (15, 17):
             raise InvoiceError("配置的模板版式须为星睿 11.6 单票模板。")
     source_book = load_workbook(BytesIO(raw), keep_links=False)
     try:
         source = source_book["星睿发票"]
-        sheet.column_dimensions.clear()
+        source_photo = "Q" if source["Q22"].value else "O"
+        move_photo = source_photo != photo_column
         for key, dimension in source.column_dimensions.items():
-            target = sheet.column_dimensions[key]
-            target.width, target.min, target.max = dimension.width, dimension.min, dimension.max
+            if move_photo and key in {"O", "P", "Q"} and key != source_photo:
+                continue
+            destination = photo_column if key == source_photo else key
+            sheet.column_dimensions[destination].width = dimension.width
         for key, dimension in source.row_dimensions.items():
             sheet.row_dimensions[key if key <= 52 else key + last_product - 52].height = dimension.height
         for line in range(1, last_product + 5):
             source_line = min(line, 52) if line <= last_product else line - last_product + 52
             if 52 < line <= last_product:
                 sheet.row_dimensions[line].height = source.row_dimensions[52].height
-            for original in source[source_line][:15]:
+            for original in source[source_line][:17 if source_photo == "Q" else 15]:
+                if move_photo and original.column >= 15 and original.column != ord(source_photo) - 64:
+                    continue
                 if original.has_style:
-                    target = sheet.cell(line, original.column)
+                    target = sheet[f"{photo_column}{line}"] if original.column == ord(source_photo) - 64 else sheet.cell(line, original.column)
                     for key in ("font", "fill", "border", "alignment", "number_format"):
                         setattr(target, key, copy(getattr(original, key)))
     finally:

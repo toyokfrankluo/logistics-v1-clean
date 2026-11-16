@@ -435,6 +435,48 @@ class NextSLSTests(unittest.TestCase):
         self.assertNotIn('name="supplement_0_model"', stale)
         self.carrier_post.assert_not_called()
 
+    def test_d4_requires_audited_confirmation_and_is_only_sent_if_required(self):
+        rule = SERVICE | {"require_declaration_list": ["amazon_ref_id"]}
+        self.profile(rules={"TMS_DEMO": nextsls.preparation_rules(rule)})
+        order_id = self.approve()
+        order = db.session.get(TmsOrder, order_id)
+        self.assertEqual(order.invoice["customer_number"], "0000123")
+        self.assertTrue(nextsls.missing_supplements(order.invoice, {}, rule))
+        self.assertEqual(self.action(order_id, "prepare", revision=3, confirm_amazon_d4="yes").status_code, 400)
+        self.assertEqual(self.action(order_id, "prepare", revision=3, confirm_amazon_d4="yes",
+                                     amazon_d4_reason="已核对模拟 Amazon 货件资料").status_code, 302)
+        db.session.refresh(order)
+        self.assertEqual(order.revision, 4)
+        self.assertEqual(order.invoice["amazon_d4_confirmation"]["value"], "0000123")
+        for rules in (rule, SERVICE):
+            payload = nextsls.create_payload(order.invoice, "TMS_DEMO", "XR-DEMO", rules, {})["shipment"]
+            for parcel in payload["parcels"]:
+                for row in parcel["declarations"]:
+                    self.assertEqual(row.get("amazon_ref_id"), "0000123" if rules is rule else None)
+
+    def test_stale_order_refresh_is_scoped_and_does_not_require_read_switch(self):
+        order_id = self.approve()
+        profile = self.profile()
+        cached = profile.verified[tms_carriers.CHANNEL_CATALOGUE]
+        profile.verified = {tms_carriers.CHANNEL_CATALOGUE: dict(cached, fetched_at="2000-01-01T00:00:00")}
+        db.session.commit()
+        path = f"/tms/admin/orders/{order_id}"
+        with patch.dict(app.config, TMS_NEXTSLS_READ_ENABLED=False), patch(
+            "carrier_http.post", side_effect=carrier_http.CarrierRequestError("private transport detail"),
+        ) as failed:
+            body = self.get(self.staff, path).get_data(as_text=True)
+            self.assertIn("渠道自动刷新失败", body)
+            self.assertNotIn("private transport detail", body)
+            failed.assert_called_once()
+        self.assertFalse(tms_carriers.channel_catalogue(profile))
+        with patch("carrier_http.post", return_value=success({"services": [SERVICE]})) as transport:
+            response = self.get(self.staff, path)
+            self.assertEqual(response.status_code, 200)
+            transport.assert_called_once()
+            self.assertEqual(transport.call_args.args[0].api_url, ORIGIN + "/api/v5/shipment/get_services")
+        db.session.refresh(profile)
+        self.assertIn("TMS_DEMO", tms_carriers.channel_catalogue(profile))
+
     def test_photo_required_channel_shows_separate_readiness_and_never_substitutes_photo_url(self):
         code = "B009-4"
         service = SERVICE | {"code": code, "require_declaration_list": ["amazon_ref_id", "photos"]}

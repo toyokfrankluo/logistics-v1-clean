@@ -78,19 +78,25 @@ def channel_mappings(profile):
     return {sale: mapping for sale, mapping in mappings.items() if mapping["code"] in catalogue}
 
 
-def channel_catalogue(profile):
+def fresh_channel_cache(profile):
     if not profile or profile.provider != "nextsls" or "create" not in profile.enabled:
-        return {}
+        return None
     cache = profile.verified.get(CHANNEL_CATALOGUE)
     if not cache:
-        return {}
+        return None
     age = datetime.utcnow() - datetime.fromisoformat(cache["fetched_at"])
-    return cache["channels"] if timedelta(0) <= age < CHANNEL_CATALOGUE_TTL else {}
+    return cache if timedelta(0) <= age < CHANNEL_CATALOGUE_TTL else None
+
+
+def channel_catalogue(profile):
+    cache = fresh_channel_cache(profile)
+    return cache["channels"] if cache is not None else {}
 
 
 def store_channel_catalogue(profile, catalogue, rules=None):
     profile.verified = {**profile.verified, CHANNEL_CATALOGUE: {
         "fetched_at": datetime.utcnow().isoformat(), "channels": catalogue, "rules": rules or {},
+        "auto_refresh": True,
     }}
 
 
@@ -123,6 +129,39 @@ def read_channel_catalogue(profile, agent):
             # A selectable service may return no rules. Keep it visible, but require verification.
             continue
     return catalogue, rules
+
+
+def refresh_channel_catalogue(profile, agent):
+    """Fetch an account's catalogue and discard it if credentials changed during the request."""
+    origin = profile.base_url if profile else None
+    token = agent.app_token
+    catalogue, rules = read_channel_catalogue(profile, agent)
+    db.session.refresh(agent, with_for_update=True)
+    db.session.refresh(profile, with_for_update=True)
+    if (profile.provider != "nextsls" or "create" not in profile.enabled or profile.base_url != origin
+            or agent.app_token != token or not agent.is_active or not agent.supports_api
+            or not nextsls.legacy_tenant_matches(agent.api_url, origin)):
+        raise nextsls.ProtocolError("代理配置已经变更，请重新读取渠道。")
+    store_channel_catalogue(profile, catalogue, rules)
+    return catalogue
+
+
+def refresh_expired_channel_catalogue(profile, agent):
+    if (profile and agent and profile.provider == "nextsls" and "create" in profile.enabled
+            and CHANNEL_CATALOGUE in profile.verified and fresh_channel_cache(profile) is None):
+        cache = profile.verified[CHANNEL_CATALOGUE]
+        if not cache.get("auto_refresh"):
+            return "请核对当前凭据，手动刷新一次渠道清单后启用自动刷新。"
+        try:
+            refresh_channel_catalogue(profile, agent)
+            db.session.commit()
+        except nextsls.ProtocolError as error:
+            db.session.rollback()
+            return str(error)
+        except SQLAlchemyError:
+            db.session.rollback()
+            return "渠道清单暂时无法保存，请重试。"
+    return None
 
 
 def save_channel_mapping(profile, catalogue, sale, code):
@@ -250,6 +289,7 @@ def supplier_preparation(order, profile, agent):
     result["packing_delivery_ready"] = bool(packing_store)
     supplement = order_supplement(order)
     result["missing"] = nextsls.missing_supplements(order.invoice, supplement, rules)
+    result["amazon_d4_candidate"] = any("amazon_ref_id" in fields for fields in result["missing"].values())
     try:
         nextsls.create_payload(invoice, code, "XR-PREFLIGHT", rules, profile.sender, supplement=supplement,
                                image_fields=encoders, packing_host=packing_store.host if packing_store else "",
