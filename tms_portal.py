@@ -929,7 +929,7 @@ def save_supplier_supplement(order, form):
         raise nextsls.ProtocolError("装箱单由系统生成，请刷新页面后补充申报资料。")
     rules = tms_carriers.channel_rules(profile, order.agent_service)
     if rules is None:
-        raise nextsls.ProtocolError("此渠道的完整必填规则尚未读取或已过期，请刷新代理渠道。")
+        rules = tms_carriers.BRAND_ONLY_RULES
     prior = tms_carriers.order_supplement(order)
     missing = nextsls.missing_supplements(order.invoice, prior, rules)
     allowed = {f"supplement_{index}_{field}" for index, fields in missing.items() for field in fields}
@@ -937,21 +937,18 @@ def save_supplier_supplement(order, form):
         allowed.update(f"supplement_{index}_no_model" for index, fields in missing.items() if "model" in fields)
     if any(key.startswith("supplement_") and (key not in allowed or len(form.getlist(key)) != 1) for key in form):
         raise nextsls.ProtocolError("渠道所需资料已变化，请刷新页面后补充。")
+    if "confirm_amazon_d4" in form:
+        raise nextsls.ProtocolError("FBA / 客户单号不能作为 Amazon 参考号。请刷新页面。")
     confirmation = None
-    if "confirm_amazon_d4" in form or form.get("amazon_d4_reason", "").strip():
-        if (form.getlist("confirm_amazon_d4") != ["yes"]
+    if "confirm_amazon_po" in form or form.get("amazon_po_reason", "").strip():
+        if (form.getlist("confirm_amazon_po") != ["yes"]
                 or not any("amazon_ref_id" in fields for fields in missing.values())
                 or any(form.get(f"supplement_{i}_amazon_ref_id", "").strip() for i in missing)):
-            raise nextsls.ProtocolError("请单独确认 D4，或填写实际 Amazon 参考号。")
-        reason = nextsls.supplied_text(form.get("amazon_d4_reason"), 200)
-        raw = order.workbook
-        try:
-            candidate = parse_invoice(raw)["customer_number"] if raw and sha256(raw).hexdigest() == order.file_sha256 else None
-        except InvoiceError:
-            candidate = None
-        if not candidate or candidate != order.invoice["customer_number"]:
-            raise nextsls.ProtocolError("无法核实原发票 D4，请填写已核实的 Amazon 参考号。")
-        confirmation = {"value": candidate, "by": current_user.id, "reason": reason,
+            raise nextsls.ProtocolError("请单独确认 Amazon PO，或填写已核实的 Amazon 参考号。")
+        reason = nextsls.supplied_text(form.get("amazon_po_reason"), 200)
+        po = nextsls.supplemental_value(order.invoice, "amazon_ref_id",
+                                        order.invoice["metadata"]["po_number"], confirmed_po=True)
+        confirmation = {"value": po, "by": current_user.id, "reason": reason,
                         "at": datetime.now(timezone.utc).isoformat()}
     rows = dict(prior.get("declarations", {}))
     for index, fields in missing.items():
@@ -972,7 +969,7 @@ def save_supplier_supplement(order, form):
     supplement = {**prior, "agent_id": order.agent_id, "service": order.agent_service, "declarations": rows}
     invoice = dict(order.invoice, nextsls_supplement=supplement)
     if confirmation:
-        invoice["amazon_d4_confirmation"] = confirmation
+        invoice["amazon_po_confirmation"] = confirmation
     update_order(order, {"invoice": invoice})
     history(order, "supplier_prep")
     db.session.commit()

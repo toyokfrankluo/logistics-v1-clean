@@ -435,24 +435,48 @@ class NextSLSTests(unittest.TestCase):
         self.assertNotIn('name="supplement_0_model"', stale)
         self.carrier_post.assert_not_called()
 
-    def test_d4_requires_audited_confirmation_and_is_only_sent_if_required(self):
+    def test_po_requires_audited_confirmation_and_is_only_sent_if_required(self):
         rule = SERVICE | {"require_declaration_list": ["amazon_ref_id"]}
         self.profile(rules={"TMS_DEMO": nextsls.preparation_rules(rule)})
         order_id = self.approve()
         order = db.session.get(TmsOrder, order_id)
         self.assertEqual(order.invoice["customer_number"], "0000123")
         self.assertTrue(nextsls.missing_supplements(order.invoice, {}, rule))
-        self.assertEqual(self.action(order_id, "prepare", revision=3, confirm_amazon_d4="yes").status_code, 400)
         self.assertEqual(self.action(order_id, "prepare", revision=3, confirm_amazon_d4="yes",
-                                     amazon_d4_reason="已核对模拟 Amazon 货件资料").status_code, 302)
+                                     amazon_d4_reason="旧表单").status_code, 400)
+        po = order.invoice["metadata"]["po_number"]
+        self.assertEqual(self.action(order_id, "prepare", revision=3, supplement_0_amazon_ref_id=po).status_code, 400)
+        self.assertEqual(self.action(order_id, "prepare", revision=3, confirm_amazon_po="yes").status_code, 400)
+        self.assertEqual(self.action(order_id, "prepare", revision=3, confirm_amazon_po="yes",
+                                     amazon_po_reason="已核对模拟 Amazon 货件资料").status_code, 302)
         db.session.refresh(order)
         self.assertEqual(order.revision, 4)
-        self.assertEqual(order.invoice["amazon_d4_confirmation"]["value"], "0000123")
+        self.assertEqual(order.invoice["amazon_po_confirmation"]["value"], po)
         for rules in (rule, SERVICE):
             payload = nextsls.create_payload(order.invoice, "TMS_DEMO", "XR-DEMO", rules, {})["shipment"]
             for parcel in payload["parcels"]:
                 for row in parcel["declarations"]:
-                    self.assertEqual(row.get("amazon_ref_id"), "0000123" if rules is rule else None)
+                    self.assertEqual(row.get("amazon_ref_id"), po if rules is rule else None)
+
+    def test_save_verified_brand_while_channel_rules_are_stale(self):
+        order_id = self.approve()
+        profile = self.profile()
+        order = db.session.get(TmsOrder, order_id)
+        original = order.workbook
+        order.invoice = dict(order.invoice, nextsls_supplement={
+            "agent_id": order.agent_id, "service": order.agent_service, "declarations": {"0": {"model": "无"}},
+        })
+        cache = profile.verified[tms_carriers.CHANNEL_CATALOGUE]
+        profile.verified = {tms_carriers.CHANNEL_CATALOGUE: dict(cache, fetched_at="2000-01-01T00:00:00",
+                                                               auto_refresh=False)}
+        db.session.commit()
+        self.assertEqual(self.action(order_id, "prepare", revision=3, supplement_0_brand="无").status_code, 302)
+        db.session.refresh(order)
+        self.assertEqual(order.revision, 4)
+        self.assertEqual(order.workbook, original)
+        self.assertEqual(tms_carriers.order_supplement(order)["declarations"]["0"], {"brand": "无", "model": "无"})
+        self.assertEqual(TmsAudit.query.filter_by(order_id=order_id, action="supplier_prep").count(), 1)
+        self.carrier_post.assert_not_called()
 
     def test_stale_order_refresh_is_scoped_and_does_not_require_read_switch(self):
         order_id = self.approve()

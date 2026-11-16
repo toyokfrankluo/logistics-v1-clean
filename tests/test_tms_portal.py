@@ -721,14 +721,14 @@ class PortalTests(unittest.TestCase):
     def test_new_invoice_upload_preserves_brand_model_and_wps_picture(self):
         def fill(book):
             sheet = book["星睿发票"]
-            sheet["O23"], sheet["P23"] = "虚构品牌", "00123"
+            sheet["O23"], sheet["P23"] = "无", "无"
         raw = workbook_bytes(product_details=True, change=fill)
         self.sign_in(self.alice, "customer-a")
         uploaded = self.upload(self.alice, raw)
         self.assertEqual(uploaded.status_code, 302)
         order = db.session.get(TmsOrder, int(uploaded.location.rsplit("/", 1)[-1]))
         row = order.invoice["declarations"][0]
-        self.assertEqual((row["brand"], row["model"], row["image_cell"]), ("虚构品牌", "00123", "Q23"))
+        self.assertEqual((row["brand"], row["model"], row["image_cell"]), ("无", "无", "Q23"))
         self.assertEqual(product_photos(order.workbook, order.invoice)[0], ("image/png", PNG))
 
     def test_database_catalogue_workflow_without_filesystem(self):

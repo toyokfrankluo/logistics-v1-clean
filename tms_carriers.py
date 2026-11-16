@@ -28,6 +28,7 @@ COST_BASES = {"estimated": "预估费用", "actual": "实际费用"}
 COST_OWNERSHIP = {"payable": "属于星睿应付", "not_payable": "已确认无星睿应付"}
 CHANNEL_MAPPINGS = "sales_service_mappings"
 CHANNEL_CATALOGUE = "channel_catalogue"
+BRAND_ONLY_RULES = {"require_declaration_list": ["brand"]}
 CHANNEL_CATALOGUE_TTL = timedelta(hours=24)
 CREATE_DISABLED = "系统未开放真实下单"
 READ_DISABLED = "系统未开放 NextSLS 只读请求"
@@ -279,6 +280,7 @@ def supplier_preparation(order, profile, agent):
     rules = channel_rules(profile, code)
     if rules is None:
         blockers.append("此渠道的完整必填规则尚未读取或已过期，请到代理设置刷新 NextSLS 渠道清单")
+        result["missing"] = nextsls.missing_supplements(order.invoice, order_supplement(order), BRAND_ONLY_RULES)
         return result
     result["packing_required"] = nextsls.required_flag(rules, "packing_list_required")
     result["required_photo_fields"] = [field for field in ("photos", "photo_url")
@@ -289,7 +291,7 @@ def supplier_preparation(order, profile, agent):
     result["packing_delivery_ready"] = bool(packing_store)
     supplement = order_supplement(order)
     result["missing"] = nextsls.missing_supplements(order.invoice, supplement, rules)
-    result["amazon_d4_candidate"] = any("amazon_ref_id" in fields for fields in result["missing"].values())
+    result["amazon_po_candidate"] = any("amazon_ref_id" in fields for fields in result["missing"].values())
     try:
         nextsls.create_payload(invoice, code, "XR-PREFLIGHT", rules, profile.sender, supplement=supplement,
                                image_fields=encoders, packing_host=packing_store.host if packing_store else "",

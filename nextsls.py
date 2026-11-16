@@ -206,14 +206,16 @@ def preparation_rules(profile):
             "from_address": sender, "require_declaration_list": sorted(set(fields))}
 
 
-def supplemental_value(invoice, field, value):
+def supplemental_value(invoice, field, value, *, confirmed_po=False):
     value = supplied_text(value, 120)
     if field == "amazon_ref_id":
         invalid = {"无", "暂无", "不适用", "未知", "none", "n/a", "na", "null", "unknown", "-", "0",
-                   invoice["metadata"]["po_number"].casefold(), invoice["customer_number"].casefold()}
+                   invoice["customer_number"].casefold()}
+        if not confirmed_po:
+            invalid.add(invoice["metadata"]["po_number"].casefold())
         invalid.update(box["box_number"].casefold() for box in invoice["boxes"])
-        if value.casefold() in invalid:
-            raise ProtocolError("Amazon 参考号须使用真实资料，不能使用占位值、PO、客户订单号或箱号")
+        if value.casefold() in invalid or re.fullmatch(r"FBA[A-Z0-9]{9}", value, re.I):
+            raise ProtocolError("Amazon 参考号须来自 Amazon 货件资料。PO 需单独核实，客户单号、FBA 单号、箱号和占位值不可使用。")
     return value
 
 
@@ -228,13 +230,14 @@ def declaration_supplements(invoice, supplement, index, fields):
                 break
             except ProtocolError:
                 continue
-    # Only the separate, audited administrator confirmation can authorize D4.
     if "amazon_ref_id" in fields and "amazon_ref_id" not in result:
-        candidate = invoice.get("customer_number")
-        confirmation = invoice.get("amazon_d4_confirmation", {})
-        if (candidate and confirmation.get("value") == candidate
-                and confirmation.get("by") and confirmation.get("reason")):
-            result["amazon_ref_id"] = supplied_text(candidate, 120)
+        confirmation = invoice.get("amazon_po_confirmation", {})
+        po = invoice["metadata"]["po_number"]
+        if po and confirmation.get("value") == po and confirmation.get("by") and confirmation.get("reason"):
+            try:
+                result["amazon_ref_id"] = supplemental_value(invoice, "amazon_ref_id", po, confirmed_po=True)
+            except ProtocolError:
+                pass
     return result
 
 

@@ -70,14 +70,14 @@
   {% endif %}
   {% endif %}
   {% if preparation.missing %}
-  <details open><summary>补齐本渠道缺少的申报资料</summary>
+  <details open><summary>{{ "保存已核实的产品品牌" if preparation.packing_required is none else "补齐本渠道缺少的申报资料" }}</summary>
     <form method="post" action="{{ url_for('tms_staff.supplier_action', order_id=order.id) }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <input type="hidden" name="revision" value="{{ order.revision }}">
-      {% if preparation.amazon_d4_candidate %}
-      <p>原发票 D4 为 {{ invoice.customer_number }}。只有在 Amazon 货件资料确认该值就是 Reference ID 时才能使用。</p>
-      <label class="check-label"><input type="checkbox" name="confirm_amazon_d4" value="yes">确认此 D4 值为本票真实 Amazon Reference ID</label>
-      <label>核对依据<input name="amazon_d4_reason" maxlength="200"></label>
+      {% if preparation.amazon_po_candidate %}
+      <p>FBA / 客户单号 {{ invoice.customer_number }} 独立保存。仅当 Amazon Seller Central 确认 PO {{ invoice.metadata.po_number }} 就是本票 Reference ID 时，才勾选下方确认。</p>
+      <label class="check-label"><input type="checkbox" name="confirm_amazon_po" value="yes">已在 Amazon Seller Central 核实此 PO 是本票 Amazon Reference ID</label>
+      <label>核对依据<input name="amazon_po_reason" maxlength="200"></label>
       {% endif %}
       {% for row_index, fields in preparation.missing.items() %}
       {% set row = invoice.declarations[row_index] %}
