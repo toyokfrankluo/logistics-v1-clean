@@ -1,5 +1,6 @@
 """Prepare traceable, explicitly labelled copies of an authorized sample. Never send shipments."""
 from copy import deepcopy
+from collections import Counter
 from hashlib import sha256
 from io import BytesIO
 import re
@@ -44,14 +45,26 @@ def sample_copy(raw, reference):
 
 def candidate(invoice, agent, profile, prefer_photos):
     options = []
+    blockers=Counter()
+    photo_blockers=Counter()
+    photo_total=sum("photos" in nextsls.declaration_requirements(tms_carriers.channel_rules(profile,code) or {})
+                    for code in tms_carriers.channel_catalogue(profile))
+    matching_photos=0
+    matching=0
     for code, name in tms_carriers.channel_catalogue(profile).items():
         if invoice["address"]["country"] == "US" and not re.search(r"美国|美西|美东|美森|\bUSA?\b", name, re.I):
             continue
-        if re.search("危险|纯电|电池|敏感",name):
+        if re.search("危险|纯电|电池|敏感|电子烟|化妆|自提|自打单|商业地址|带电|食品|纺织",name):
             continue
+        west={"CA","OR","WA","NV","AZ","UT","ID","MT","WY","CO","NM"}
+        if invoice["address"].get("region") not in west and re.search("美西|西岸",name) and not re.search("全美|外州|美东",name):
+            continue
+        matching+=1
         rules = tms_carriers.channel_rules(profile, code)
         if rules is None:
             continue
+        photos="photos" in nextsls.declaration_requirements(rules)
+        if photos:matching_photos+=1
         order = SimpleNamespace(invoice=invoice,agent_id=agent.id,agent_service=code,id=0)
         _, encoders = images.image_delivery(order,profile,rules)
         packing = images.media_store(order,profile) if rules["packing_list_required"] != 0 else None
@@ -61,18 +74,23 @@ def candidate(invoice, agent, profile, prefer_photos):
                 packing_host=packing.host if packing else "",include_packing=bool(packing),
                 use_invoice_po=tms_carriers.invoice_po_allowed(profile,code),preflight=True,
                 photos_protocol_confirmed=images.photos_encoder(profile,code) is not None)
-        except nextsls.ProtocolError:
+        except nextsls.ProtocolError as error:
+            blockers[str(error)]+=1
+            if photos:photo_blockers[str(error)]+=1
             continue
         photos = "photos" in nextsls.declaration_requirements(rules)
         options.append((0 if prefer_photos and photos else 1, len(rules.get("unknown_rules",[])),code,name,photos,rules))
     if not options:
-        return None
+        return {"code":None,"name":None,"blockers":dict(blockers),"matching_channels":matching,
+                "photos_total":photo_total,"photos_matching":matching_photos,"photos_blockers":dict(photo_blockers),
+                "business_suitability_confirmed":False}
     _,_,code,name,photos,rules = sorted(options,key=lambda value:value[:3])[0]
     return {"code":code,"name":name,"photos_required":photos,"unknown_rules":rules.get("unknown_rules",[]),
+            "photos_total":photo_total,"photos_matching":matching_photos,"photos_blockers":dict(photo_blockers),
             "business_suitability_confirmed":False}
 
 
-def prepare(source_id, agent_ids, batch, reason, photo_agents=()):
+def prepare(source_id, agent_ids, batch, reason, photo_agents=(), *, revise=False):
     if (not isinstance(batch,str) or not re.fullmatch(r"[a-f0-9]{32}",batch)
             or not isinstance(reason,str) or not 1 <= len(reason.strip()) <= 500):
         raise nextsls.ProtocolError("缺少本轮授权依据。")
@@ -93,6 +111,20 @@ def prepare(source_id, agent_ids, batch, reason, photo_agents=()):
             TmsOrder.invoice["acceptance_source"]["batch"].as_string()==batch))
         if existing:
             chosen=existing.invoice["acceptance_source"]["candidate"]
+            if revise and existing.status == "pending" and existing.revision == 1 and not existing.invoice.get(tms_carriers.CREATE_GRANT):
+                before=chosen
+                chosen=candidate(existing.invoice,agent,profile,aid in photo_agents)
+                invoice=deepcopy(existing.invoice)
+                invoice["acceptance_source"].update(candidate=chosen)
+                invoice["acceptance_source"].setdefault("candidate_history",[]).append(before)
+                if chosen.get("code"):
+                    invoice.update(supplier_channel={"code":chosen["code"],"name":chosen["name"]},supplier_tenant_origin=profile.base_url)
+                else:
+                    invoice.pop("supplier_channel",None)
+                existing.invoice=invoice
+                existing.agent_service=chosen.get("code")
+                existing.revision+=1
+                db.session.add(TmsAudit(order_id=existing.id,actor_type="operator",actor_id=0,action="acceptance_channel"))
             results.append({"agent_id":aid,"order_id":existing.id,"candidate":chosen})
             continue
         reference=f"XR-QA-{batch[:8]}-{aid}"
@@ -107,15 +139,15 @@ def prepare(source_id, agent_ids, batch, reason, photo_agents=()):
         product_photos(raw,invoice)
         chosen=candidate(invoice,agent,profile,aid in photo_agents)
         if invoice.get("nextsls_supplement"):
-            invoice["nextsls_supplement"].update(agent_id=aid,service=chosen["code"] if chosen else "")
+            invoice["nextsls_supplement"].update(agent_id=aid,service=chosen.get("code") or "")
         invoice["acceptance_source"]={"batch":batch,"order_id":source.id,"file_sha256":source.file_sha256,
             "original_customer_reference":source.invoice["customer_number"],"reason":reason,"candidate":chosen,
             "fulfillment_requested":False,"creation_granted":False}
-        if chosen:
+        if chosen.get("code"):
             invoice.update(supplier_tenant_origin=profile.base_url,
                 supplier_channel={"code":chosen["code"],"name":chosen["name"]})
         order=TmsOrder(customer_id=source.customer_id,number_key=reference,file_sha256=sha256(raw).hexdigest(),
-            status="pending",invoice=invoice,workbook=raw,agent_id=aid,agent_service=chosen["code"] if chosen else None)
+            status="pending",invoice=invoice,workbook=raw,agent_id=aid,agent_service=chosen.get("code"))
         db.session.add(order);db.session.flush()
         billing=db.session.get(TmsReceivable,source.id)
         if billing:

@@ -266,6 +266,9 @@ class UniversalV5Tests(unittest.TestCase):
             self.assertEqual(self.action(oid,"create",confirm="yes").status_code,302)
         db.session.expire_all()
         link=db.session.get(TmsSupplierOrder,oid)
+        order=db.session.get(TmsOrder,oid)
+        order.invoice={**order.invoice,"order_archive":{"reason":"Synthetic history archive"}}
+        db.session.commit()
         info={"shipment":{"shipment_id":link.supplier_number,"client_reference":link.client_reference,"service_code":"TMS_DEMO"}}
         listed={"shipment":[{"shipment_id":link.supplier_number,"client_reference":link.client_reference}]}
         secret="synthetic-read-only-proof"

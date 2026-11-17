@@ -154,7 +154,8 @@ def refresh_operation():
 @operations.post("/verify-existing")
 def verify_existing_operation():
     """Read a previously linked shipment with its saved account; never invoke creation."""
-    from tms_models import TmsOrder, TmsSupplierOrder
+    from tms_models import TmsOrder, TmsSupplierOrder, TmsReceivable
+    from models import Shipment
     body = request.get_json(silent=True) or {}
     if type(body.get("order_id")) is not int:
         abort(400)
@@ -164,9 +165,12 @@ def verify_existing_operation():
         abort(409)
     agent = db.session.get(CarrierAgent, order.agent_id)
     profile = db.session.get(TmsAgentApi, order.agent_id)
-    shipment, _ = tms_carriers.approved_shipment(order)
+    charge=db.session.get(TmsReceivable,order.id)
+    shipment=db.session.get(Shipment,charge.shipment_id) if charge and charge.shipment_id else None
     if (not agent or not profile or profile.provider != "nextsls" or profile.base_url != link.tenant_origin or link.agent_id != agent.id
-            or shipment.shipment_id != link.supplier_number):
+            or not shipment or shipment.customer_id != order.customer_id or shipment.agent_id != agent.id
+            or shipment.shipment_id != link.supplier_number or charge.agent_id != agent.id
+            or shipment.tracking_number != order.invoice["customer_number"]):
         abort(409)
     result={"order_id":order.id,"agent_id":agent.id,"supplier_number":link.supplier_number,
             "create_called":False,"errors":{},"http":{}}
@@ -211,7 +215,8 @@ def prepare_acceptance_operation():
     if not ids or len(ids)>12 or any(type(aid) is not int for aid in ids) or len(set(ids)) != len(ids):
         abort(400)
     try:
-        result=tms_acceptance.prepare(sid,ids,body.get("batch",""),body.get("reason",""),body.get("photo_agents",[]))
+        result=tms_acceptance.prepare(sid,ids,body.get("batch",""),body.get("reason",""),body.get("photo_agents",[]),
+                                      revise=body.get("revise_candidates") is True)
     except nextsls.ProtocolError as error:
         db.session.rollback()
         return jsonify(error=str(error)),400
