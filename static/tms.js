@@ -1,5 +1,58 @@
 "use strict";
 
+let attachmentFixture;
+document.addEventListener("change", async event => {
+  if (!event.target.matches("[data-preflight-fixture]")) return;
+  const status = document.querySelector("[data-preflight-status]");
+  try {
+    attachmentFixture = JSON.parse(await event.target.files[0].text());
+    if (attachmentFixture.invoice.customer_number !== "XR-PREFLIGHT-DO-NOT-SHIP") throw new Error();
+    document.querySelector("[data-sales-service]").textContent = attachmentFixture.invoice.service;
+    status.textContent = "模拟资料已载入，未创建业务订单。";
+  } catch { attachmentFixture = null; status.textContent = "模拟验收资料无效。"; }
+});
+document.addEventListener("click", async event => {
+  if (!event.target.matches("[data-preflight-run]")) return;
+  const status = document.querySelector("[data-preflight-status]");
+  const root = document.querySelector("[data-supplier-picker]");
+  const agent = root.querySelector('[name="agent_id"]').value;
+  const code = root.querySelector("[data-channel-picker] select").value;
+  if (!attachmentFixture || !agent || !code) { status.textContent = "请选择供应商、渠道并载入模拟资料。"; return; }
+  event.target.disabled = true;
+  status.dataset.state = "running";
+  status.textContent = "正在匿名回读图片和装箱单，并构造预检请求…";
+  try {
+    const files = attachmentFixture.manifests[agent];
+    for (const file of files) {
+      const url = new URL(file.url);
+      if (url.origin !== location.origin || !url.pathname.startsWith("/tms/supplier-files/")) throw new Error();
+      const options = {credentials:"omit",redirect:"error",cache:"no-store"};
+      const denied = await fetch(new URL(url.pathname, url.origin), options);
+      if (![403,404].includes(denied.status)) throw new Error();
+      const response = await fetch(url, options);
+      const bytes = await response.arrayBuffer();
+      const digest = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map(n=>n.toString(16).padStart(2,"0")).join("");
+      if (response.status !== 200 || bytes.byteLength !== file.bytes || digest !== file.sha256 ||
+          response.headers.get("Content-Type")?.split(";")[0] !== file.mime) throw new Error();
+    }
+    const response = await fetch("/tms/operations/agents/preflight", {method:"POST", credentials:"same-origin",
+      headers:{"Content-Type":"application/json"}, body:JSON.stringify({invoice:attachmentFixture.invoice,
+        deliveries:attachmentFixture.deliveries,agent_id:Number(agent),channel_code:code})});
+    if (!response.ok) throw new Error();
+    const row = (await response.json()).results[0];
+    const packing = files.find(file=>file.slot === "packing");
+    const verified = `匿名回读通过：${files.length-1} 张商品图及完整 packing.xlsx，文件字节一致，无签名访问被拒绝。附件链接 ${packing.url.length} 字符。`;
+    if (row.passed.includes(code)) {
+      status.dataset.state = "passed";
+      status.textContent = verified + " 当前渠道资料及完整请求预检通过，未发送供应商。";
+    } else {
+      status.dataset.state = "blocked";
+      status.textContent = verified + " 当前渠道仍阻断：" + (row.blocked[code] || "规则待核实");
+    }
+  } catch { status.dataset.state="error"; status.textContent="附件回读或请求预检未通过，请重新检查模拟资料与链接有效期。"; }
+  finally { event.target.disabled = false; }
+});
+
 const initialPassword = document.getElementById("initial-password");
 const passwordToggle = document.getElementById("toggle-password");
 const passwordGenerator = document.getElementById("generate-password");
@@ -184,7 +237,8 @@ function showSupplierRequirements(root) {
     is_magnetic:"真实带磁属性", is_battery:"真实带电属性", photos:"商品图片", photo_url:"图片链接",
     name_zh:"中文品名", name_en:"英文品名", material:"材质", usage:"用途", hscode:"HS 编码", qty:"数量", unit_value:"申报单价"};
   const required = rule.declarations.map(key=>labels[key] || key).join("、") || "未额外指定申报字段";
-  const missing = [...new Set(Object.values(rule.missing).flat())].map(key=>labels[key] || key);
+  const missing = [...new Set([...Object.values(rule.missing).flat(), ...(rule.missing_taxes || [])])]
+    .map(key=>({vat_number:"VAT 税号",eori:"EORI 税号",weight:"单件产品重量",size:"单件产品尺寸",asin:"ASIN",fnsku:"FNSKU"}[key] || labels[key] || key));
   output.textContent = `本渠道要求：${required}。${rule.packing ? "装箱单由系统自动生成。" : "无需单独装箱单。"}` +
     (missing.length ? `尚缺真实资料：${missing.join("、")}。` : "") +
     (rule.declarations.includes("photos") && !rule.photos_confirmed ? "photos 图片编码协议仍待该供应商确认。" : "") +
@@ -225,9 +279,13 @@ async function loadSupplierChannels(root, preserve = false) {
   status.textContent = "正在读取此供应商的渠道…";
   root.setAttribute("aria-busy", "true");
   try {
+    const requestFields = {agent_id:agent.value,csrf_token:form.elements.csrf_token.value};
+    if (root.dataset.channelUrl.startsWith("/tms/operations/") && attachmentFixture) {
+      requestFields.preflight_invoice = JSON.stringify(attachmentFixture.invoice);
+    }
     const response = await fetch(root.dataset.channelUrl, {
       method: "POST", credentials: "same-origin", signal: request.signal,
-      body: new URLSearchParams({agent_id: agent.value, csrf_token: form.elements.csrf_token.value}),
+      body: new URLSearchParams(requestFields),
     });
     if (response.redirected) throw new Error();
     const data = await response.json();

@@ -319,6 +319,8 @@ def supplier_preparation(order, profile, agent):
     supplement = order_supplement(order)
     use_invoice_po = invoice_po_allowed(profile, code)
     result["missing"] = nextsls.missing_supplements(order.invoice, supplement, rules, use_invoice_po=use_invoice_po)
+    result["missing_taxes"] = nextsls.missing_taxes(order.invoice, rules)
+    result["tax_fields"] = nextsls.TAX_FIELDS
     result["invoice_po_rows"] = invoice_po_rows(order.invoice, supplement, rules, use_invoice_po)
     result["invoice_header_po_used"] = bool(result["invoice_po_rows"] and not nextsls.has_line_amazon_po(order.invoice))
     result["amazon_po_candidate"] = (not nextsls.has_line_amazon_po(order.invoice)

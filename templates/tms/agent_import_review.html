@@ -5,4 +5,10 @@
 <form><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 {% with active_agent=none, agent_service='' %}{% include 'tms/supplier_picker.html' %}{% endwith %}
 </form>
+<section class="panel">
+  <h2>模拟资料与附件验收</h2>
+  <label>选择模拟验收资料<input type="file" accept=".json" data-preflight-fixture></label>
+  <button type="button" data-preflight-run>检查当前供应商渠道与附件</button>
+  <p role="status" data-preflight-status>请先选择供应商、渠道并载入模拟资料。</p>
+</section>
 {% endblock %}

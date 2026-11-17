@@ -37,7 +37,10 @@ DECLARATIONS = {"name_zh": "name_zh", "name_en": "name_en", "material": "materia
 SUPPLEMENTAL_DECLARATIONS = {
     "amazon_ref_id": "Amazon 参考号", "brand": "品牌", "model": "型号",
     "sku": "真实商品 SKU", "sale_url": "真实商品销售链接",
+    "weight": "单件产品重量（kg）", "size": "单件产品尺寸（长*宽*高）",
+    "asin": "真实 ASIN", "fnsku": "真实 FNSKU",
 }
+TAX_FIELDS = {"vat_number": "VAT 税号", "eori": "EORI 税号"}
 REQUIRED_FLAGS = ("tel_required", "email_required", "company_required", "city_required",
                   "vat_number_required", "eori_required", "packing_list_required")
 DESTINATION_PLACEHOLDER_BLOCKER = "收件地址含未经核对的历史模板占位值，请更正后再提交"
@@ -212,7 +215,19 @@ def preparation_rules(profile):
 
 
 def supplemental_value(invoice, field, value, *, confirmed_po=False):
+    if field == "weight":
+        amount = numeric(value)
+        if amount <= 0:
+            raise ProtocolError("请填写真实、且大于零的单件产品重量（kg）。")
+        return str(amount)
     value = supplied_text(value, 500 if field == "sale_url" else 120)
+    if field in {"asin", "fnsku", "sku", "size"} and value.casefold() in {"无", "未知", "none", "n/a", "null", "0", "-"}:
+        raise ProtocolError("请填写该商品真实的编号或尺寸，不能使用占位值。")
+    if field == "size":
+        parts = re.split(r"[xX×*]", value)
+        if len(parts) != 3 or any(numeric(part.strip()) <= 0 for part in parts):
+            raise ProtocolError("单件产品尺寸须填写真实的长*宽*高。")
+        value = "*".join(str(numeric(part.strip())) for part in parts)
     if field == "sale_url":
         try:
             parsed = urlsplit(value)
@@ -272,7 +287,8 @@ def declaration_supplements(invoice, supplement, index, fields, *, use_invoice_p
             if value is not None:
                 result[field] = value
             continue
-        for value in (declared.get(field), saved.get(field)):
+        source = {"weight": "unit_weight_kg", "size": "product_size"}.get(field, field)
+        for value in (declared.get(source), declared.get(field), saved.get(field)):
             try:
                 result[field] = supplemental_value(invoice, field, value)
                 break
@@ -293,6 +309,47 @@ def missing_supplements(invoice, supplement, rules, *, use_invoice_po=False):
         if len(values) < len(required):
             missing[index] = [field for field in required if field not in values]
     return missing
+
+
+def tax_value(value):
+    value = supplied_text(value, 120)
+    if value.casefold() in {"无", "未知", "none", "n/a", "null", "0", "-"}:
+        raise ProtocolError("请填写真实税号，不能使用占位值。")
+    return value
+
+
+def shipment_taxes(invoice):
+    meta = invoice["metadata"]
+    result = {}
+    explicit = {}
+    for field in TAX_FIELDS:
+        for value in (invoice.get("nextsls_tax", {}).get(field), meta.get(field)):
+            if value:
+                explicit[field] = tax_value(value)
+                break
+    legacy = meta.get("vat_eori", "").strip()
+    if legacy:
+        pattern = r"(VAT|EORI)\s*[:：]\s*([^\s;,，；]+)"
+        matches = list(re.finditer(pattern, legacy, re.I))
+        if not matches or re.sub(pattern, "", legacy, flags=re.I).strip(" ;,，；\r\n"):
+            if explicit:
+                return explicit
+            raise ProtocolError("税号须用 VAT: 或 EORI: 标记")
+        for match in matches:
+            field = "vat_number" if match[1].upper() == "VAT" else "eori"
+            if field in result and result[field] != match[2]:
+                raise ProtocolError("原发票包含不同的同类税号，请核对。")
+            result[field] = tax_value(match[2])
+    return result | explicit
+
+
+def missing_taxes(invoice, rules):
+    try:
+        supplied = shipment_taxes(invoice)
+    except ProtocolError:
+        supplied = {}
+    return [field for flag, field in (("vat_number_required", "vat_number"), ("eori_required", "eori"))
+            if required_flag(rules, flag) and field not in supplied]
 
 
 def address_values(values):
@@ -362,13 +419,10 @@ def create_payload(invoice, code, reference, profile, sender, *, supplement=None
                 blockers.append("报关、清关或交税方式尚无已确认的 NextSLS 映射")
             else:
                 shipment[target] = codes[meta[source]]
-    tax_id = meta.get("vat_eori", "")
-    if tax_id:
-        match = re.fullmatch(r"(VAT|EORI)\s*[:：]\s*(\S+)", tax_id, re.I)
-        if not match:
-            blockers.append("税号须用 VAT: 或 EORI: 标记")
-        else:
-            shipment["vat_number" if match[1].upper() == "VAT" else "eori"] = match[2]
+    try:
+        shipment.update(shipment_taxes(invoice))
+    except ProtocolError as error:
+        blockers.append(str(error))
     for setting, field, label in (("tel_required", "tel", "电话"), ("email_required", "email", "邮箱"),
                                   ("company_required", "company", "公司"), ("city_required", "city", "城市")):
         if required_flag(profile, setting) and not to_address.get(field):
@@ -439,6 +493,8 @@ def create_payload(invoice, code, reference, profile, sender, *, supplement=None
         declaration = {target: supplied_text(item.get(source)) for target, source in DECLARATIONS.items()}
         declaration.update(declaration_supplements(invoice, supplement, index, fields,
                                                     use_invoice_po=use_invoice_po))
+        if "weight" in declaration:
+            declaration["weight"] = float(numeric(declaration["weight"]))
         qty = item["quantity"]
         if type(qty) is not int or qty <= 0:
             raise ProtocolError("产品申报数量无效。")

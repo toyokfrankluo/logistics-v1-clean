@@ -156,6 +156,19 @@ class TmsSupplierEvent(db.Model, TimestampMixin):
     details = db.Column(db.JSON, nullable=False)
 
 
+class TmsSupplierPreviewFile(db.Model):
+    """Synthetic preflight files have no customer order or shipment association."""
+    __tablename__ = "tms_supplier_preview_file"
+    id = db.Column(db.String(32), primary_key=True)
+    batch_id = db.Column(db.String(32), nullable=False, index=True)
+    agent_id = db.Column(db.Integer, db.ForeignKey("carrier_agent.id", ondelete="RESTRICT"), nullable=False)
+    source_digest = db.Column(db.String(64), nullable=False)
+    slot = db.Column(db.String(20), nullable=False)
+    mime = db.Column(db.String(100), nullable=False)
+    expires_at = db.Column(db.BigInteger, nullable=False, index=True)
+    content = db.Column(db.LargeBinary, nullable=False)
+
+
 class TmsSupplierFile(db.Model):
     """An expiring snapshot of a single file, issued to the approved carrier."""
     __tablename__ = "tms_supplier_file"

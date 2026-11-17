@@ -94,11 +94,16 @@
   </details>
   {% endif %}
   {% endif %}
-  {% if preparation.missing %}
+  {% if preparation.missing or preparation.missing_taxes %}
   <details open><summary>{{ "保存已核实的产品品牌" if preparation.packing_required is none else "补齐本渠道缺少的申报资料" }}</summary>
     <form method="post" action="{{ url_for('tms_staff.supplier_action', order_id=order.id) }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <input type="hidden" name="revision" value="{{ order.revision }}">
+      {% if preparation.missing_taxes %}
+      <fieldset><legend>本渠道要求的真实税号</legend>
+      {% for field in preparation.missing_taxes %}<label>{{ preparation.tax_fields[field] }}<input name="tax_{{ field }}" maxlength="120" autocomplete="off"></label>{% endfor %}
+      </fieldset>
+      {% endif %}
       {% if preparation.amazon_po_candidate %}
       <p>请通过货主的货件资料或承运商核对 PO {{ invoice.metadata.po_number }} 是否是该渠道接受的参考号。</p>
       <label class="check-label"><input type="checkbox" name="confirm_amazon_po" value="yes">已核对此 PO 可用于本票 Amazon Reference ID</label>

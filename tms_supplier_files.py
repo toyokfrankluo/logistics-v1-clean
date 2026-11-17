@@ -1,10 +1,11 @@
 """Time-limited HTTPS access to individual, immutable supplier file snapshots."""
 from dataclasses import dataclass
 from hashlib import sha256
+import json
 import os
 import re
 from time import time
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, parse_qs
 from uuid import uuid4
 
 from flask import Blueprint, Response, abort, current_app, g, request
@@ -13,7 +14,7 @@ from sqlalchemy import delete, inspect, select, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from models import db
-from tms_models import TmsOrder, TmsSupplierFile
+from tms_models import TmsOrder, TmsSupplierFile, TmsSupplierPreviewFile
 
 
 PACKING_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -63,7 +64,9 @@ def init_app(app):
                             connection.execute(text("SELECT pg_advisory_xact_lock(651360348)"))
                         if inspect(connection).has_table(TmsOrder.__tablename__):
                             TmsSupplierFile.__table__.create(connection, checkfirst=True)
+                            TmsSupplierPreviewFile.__table__.create(connection, checkfirst=True)
                             connection.execute(delete(TmsSupplierFile).where(TmsSupplierFile.expires_at <= int(time())))
+                            connection.execute(delete(TmsSupplierPreviewFile).where(TmsSupplierPreviewFile.expires_at <= int(time())))
                 except SQLAlchemyError:
                     app.logger.warning("TMS supplier file storage initialization failed")
                 finally:
@@ -104,6 +107,42 @@ def stage_files(store, order, uploads, *, preview=False):
     return urls
 
 
+def preview_digest(invoice):
+    return sha256(json.dumps(invoice, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def stage_preview_files(store, batch_id, agent_id, invoice, uploads):
+    expiry = int(time()) + 1800
+    manifest = []
+    for slot, mime, content in uploads:
+        handle = uuid4().hex
+        name = FILE_NAMES[mime]
+        signature = signer().dumps(["preview", handle, expiry, name, agent_id])
+        db.session.add(TmsSupplierPreviewFile(id=handle, batch_id=batch_id, agent_id=agent_id,
+            source_digest=preview_digest(invoice), slot=slot, mime=mime, expires_at=expiry, content=content))
+        manifest.append({"slot": slot, "mime": mime, "bytes": len(content), "sha256": sha256(content).hexdigest(),
+                         "url": f"{store.origin}{FILE_PATH}/{name}?s={signature}"})
+    return manifest
+
+
+def preview_reference(url, agent_id, invoice, slot):
+    store = configured_store()
+    parsed = urlsplit(url)
+    if not store or parsed.scheme + "://" + parsed.netloc != store.origin:
+        raise ValueError()
+    payload = signer().loads(parse_qs(parsed.query).get("s", [""])[0])
+    if not isinstance(payload, list) or len(payload) != 5 or payload[0] != "preview":
+        raise ValueError()
+    _, handle, expiry, name, owner = payload
+    if owner != agent_id or expiry <= int(time()) or parsed.path != FILE_PATH + "/" + name:
+        raise ValueError()
+    record = db.session.get(TmsSupplierPreviewFile, handle)
+    if (not record or record.agent_id != agent_id or record.slot != slot or record.expires_at != expiry
+            or record.source_digest != preview_digest(invoice) or FILE_NAMES[record.mime] != name):
+        raise ValueError()
+    return url
+
+
 @files.get("/<filename>")
 def read_file(filename):
     if not current_app.config["TMS_ENABLED"] or filename not in FILE_NAMES.values():
@@ -112,18 +151,30 @@ def read_file(filename):
     if len(tokens) != 1 or not re.fullmatch(r"[A-Za-z0-9_.-]{1,256}", tokens[0]):
         abort(404)
     try:
-        handle, expiry, signed_name = signer().loads(tokens[0])
+        payload = signer().loads(tokens[0])
+        preview_agent = None
+        if isinstance(payload, list) and len(payload) == 5 and payload[0] == "preview":
+            _, handle, expiry, signed_name, preview_agent = payload
+            if type(preview_agent) is not int:
+                abort(404)
+        else:
+            handle, expiry, signed_name = payload
         if (not isinstance(handle, str) or not re.fullmatch(r"[0-9a-f]{32}", handle)
                 or type(expiry) is not int or expiry <= int(time()) or signed_name != filename):
             abort(404)
     except (BadData, ValueError, TypeError):
         abort(404)
     try:
-        record = db.session.scalar(
-            select(TmsSupplierFile).join(TmsOrder, TmsOrder.id == TmsSupplierFile.order_id)
-            .where(TmsSupplierFile.id == handle, TmsSupplierFile.expires_at == expiry,
-                   TmsSupplierFile.customer_id == TmsOrder.customer_id,
-                   TmsSupplierFile.agent_id == TmsOrder.agent_id))
+        if preview_agent is not None:
+            record = db.session.scalar(select(TmsSupplierPreviewFile).where(
+                TmsSupplierPreviewFile.id == handle, TmsSupplierPreviewFile.expires_at == expiry,
+                TmsSupplierPreviewFile.agent_id == preview_agent))
+        else:
+            record = db.session.scalar(
+                select(TmsSupplierFile).join(TmsOrder, TmsOrder.id == TmsSupplierFile.order_id)
+                .where(TmsSupplierFile.id == handle, TmsSupplierFile.expires_at == expiry,
+                       TmsSupplierFile.customer_id == TmsOrder.customer_id,
+                       TmsSupplierFile.agent_id == TmsOrder.agent_id))
     except SQLAlchemyError:
         db.session.rollback()
         abort(404)

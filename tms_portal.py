@@ -170,6 +170,7 @@ def create_tms_schema():
                       TmsAgentApi, TmsSupplierOrder, TmsSupplierEvent, TmsSupplierFile):
             model.__table__.create(connection, checkfirst=True)
         tms_agent_import.TmsAgentImport.__table__.create(connection, checkfirst=True)
+        tms_supplier_files.TmsSupplierPreviewFile.__table__.create(connection, checkfirst=True)
 
 
 @client.before_request
@@ -822,7 +823,8 @@ def assignment_channel_state(order, agent, profile):
                               "photos_confirmed": bool(tms_carriers.images.photos_encoder(profile, code)),
                               "missing": nextsls.missing_supplements(order.invoice,
                                   tms_carriers.order_supplement(order), rules,
-                                  use_invoice_po=tms_carriers.invoice_po_allowed(profile, code))}
+                                  use_invoice_po=tms_carriers.invoice_po_allowed(profile, code)),
+                              "missing_taxes": nextsls.missing_taxes(order.invoice, rules)}
                              if rules is not None else None)
     return {"managed": managed, "catalogue": catalogue, "recommended": recommended, "binding": binding,
             "error": error, "requirements": requirements}
@@ -1168,6 +1170,15 @@ def save_supplier_supplement(order, form):
     missing = nextsls.missing_supplements(order.invoice, prior, rules,
                                          use_invoice_po=tms_carriers.invoice_po_allowed(profile, order.agent_service))
     allowed = {f"supplement_{index}_{field}" for index, fields in missing.items() for field in fields}
+    taxes = dict(order.invoice.get("nextsls_tax", {}))
+    missing_tax = nextsls.missing_taxes(order.invoice, rules) if "vat_number_required" in rules else []
+    allowed_tax = {"tax_" + field for field in missing_tax}
+    if any(key.startswith("tax_") and (key not in allowed_tax or len(form.getlist(key)) != 1) for key in form):
+        raise nextsls.ProtocolError("渠道税号要求已变化，请刷新页面后补充。")
+    for field in missing_tax:
+        raw = form.get("tax_" + field, "").strip()
+        if raw:
+            taxes[field] = nextsls.tax_value(raw)
     if profile.base_url == tms_carriers.BC_ORIGIN:
         allowed.update(f"supplement_{index}_no_model" for index, fields in missing.items() if "model" in fields)
     if any(key.startswith("supplement_") and (key not in allowed or len(form.getlist(key)) != 1) for key in form):
@@ -1221,10 +1232,11 @@ def save_supplier_supplement(order, form):
         if values:
             rows[str(index)] = values
     confirmed_lines_changed = line_confirmations != order.invoice.get("amazon_po_line_confirmations", {})
-    if rows == prior.get("declarations", {}) and not confirmation and not confirmed_lines_changed:
+    if (rows == prior.get("declarations", {}) and not confirmation and not confirmed_lines_changed
+            and taxes == order.invoice.get("nextsls_tax", {})):
         raise nextsls.ProtocolError("请填写至少一项当前缺少的申报资料。")
     supplement = {**prior, "agent_id": order.agent_id, "service": order.agent_service, "declarations": rows}
-    invoice = dict(order.invoice, nextsls_supplement=supplement)
+    invoice = dict(order.invoice, nextsls_supplement=supplement, nextsls_tax=taxes)
     if confirmation:
         invoice["amazon_po_confirmation"] = confirmation
     if confirmed_lines_changed:
