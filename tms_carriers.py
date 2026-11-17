@@ -4,16 +4,18 @@ from decimal import Decimal, ROUND_HALF_UP
 from hashlib import sha256
 from io import BytesIO
 from uuid import uuid4
+from types import SimpleNamespace
 
 from flask import current_app, g
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
-from sqlalchemy import func, inspect, select, update
+from sqlalchemy import func, inspect, select, update, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from models import CarrierAgent, Shipment, db
 import nextsls
+import carrier_http
 import tms_create_control
 import tms_measurements as measurements
 import tms_supplier_images as images
@@ -107,7 +109,8 @@ def store_channel_catalogue(profile, catalogue, rules=None):
 
 def channel_rules(profile, code):
     if code in channel_catalogue(profile):
-        return profile.verified[CHANNEL_CATALOGUE].get("rules", {}).get(code)
+        saved = profile.verified[CHANNEL_CATALOGUE].get("rules", {}).get(code)
+        return nextsls.preparation_rules(saved or {})
     return None
 
 
@@ -157,6 +160,51 @@ def read_channel_catalogue(profile, agent):
             # A selectable service may return no rules. Keep it visible, but require verification.
             continue
     return catalogue, rules
+
+
+def quick_connect(name, origin, token):
+    """Verify a new account before persisting anything. Never updates an existing account."""
+    name = nextsls.supplied_text(name, 200)
+    origin = nextsls.base_url(origin.strip(), "nextsls")
+    if (not origin or not isinstance(token, str) or not 20 <= len(token.strip()) <= 255
+            or any(ord(c) <= 32 for c in token.strip())):
+        raise nextsls.ProtocolError("请填写有效的 HTTPS 基础域名和 App Token。")
+    token = token.strip()
+    if db.session.scalar(select(CarrierAgent.id).where(CarrierAgent.name == name)):
+        raise nextsls.ProtocolError("代理名称已存在，请编辑现有账号；快速接入不会覆盖它。")
+    if db.session.scalar(select(CarrierAgent.id).join(TmsAgentApi).where(
+            TmsAgentApi.provider == "nextsls", TmsAgentApi.base_url == origin, CarrierAgent.app_token == token)):
+        raise nextsls.ProtocolError("此租户和 Token 已有账号，未重复创建或覆盖。")
+    candidate = SimpleNamespace(is_active=True, supports_api=True, api_url="", app_token=token)
+    temporary = SimpleNamespace(provider="nextsls", base_url=origin, enabled=sorted(nextsls.WIRED))
+    docs = {}
+    for path in ("/api/v5/docs", "/api/v5/docs/markdown"):
+        try:
+            document = carrier_http.get_document(SimpleNamespace(is_active=True, supports_api=True, api_url=origin+path))
+            valid = bool(document.strip()) and (path.endswith("/docs") or all(
+                value in document for value in ("/shipment/create", "/shipment/get_services")))
+            docs[path.rsplit("/", 1)[-1]] = {"available":valid,"sha256":sha256(document.encode()).hexdigest()}
+        except carrier_http.CarrierRequestError:
+            docs[path.rsplit("/", 1)[-1]] = {"available":False}
+    catalogue, rules = read_channel_catalogue(temporary, candidate)
+    if not catalogue:
+        raise nextsls.ProtocolError("认证响应未返回可用渠道，未创建代理。")
+    if db.engine.dialect.name == "postgresql":
+        lock_key = int(sha256((origin + "|" + token).encode()).hexdigest()[:15], 16)
+        db.session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key":lock_key})
+    if db.session.scalar(select(CarrierAgent.id).join(TmsAgentApi).where(
+            TmsAgentApi.provider == "nextsls", TmsAgentApi.base_url == origin, CarrierAgent.app_token == token)):
+        raise nextsls.ProtocolError("此账号刚刚已完成接入，未重复创建。")
+    agent = CarrierAgent(name=name, is_active=True, supports_api=True, app_token=token)
+    db.session.add(agent)
+    db.session.flush()
+    profile = TmsAgentApi(agent_id=agent.id, provider="nextsls", base_url=origin,
+        enabled=sorted(nextsls.WIRED), service_codes=[], sender={}, verified={"onboarding":{
+            "docs":docs,"at":datetime.now(timezone.utc).isoformat(),"authentication":"bearer",
+            "create_acceptance_verified":False}})
+    store_channel_catalogue(profile, catalogue, rules)
+    db.session.add(profile)
+    return agent, profile
 
 
 def refresh_channel_catalogue(profile, agent):
@@ -310,17 +358,19 @@ def supplier_preparation(order, profile, agent):
         blockers.append("此渠道的完整必填规则尚未读取或已过期，请到代理设置刷新 NextSLS 渠道清单")
         result["missing"] = nextsls.missing_supplements(order.invoice, order_supplement(order), BRAND_ONLY_RULES)
         return result
+    result["unknown_rules"] = rules.get("unknown_rules", [])
     result["packing_required"] = nextsls.required_flag(rules, "packing_list_required")
-    result["required_photo_fields"] = [field for field in ("photos", "photo_url")
-                                       if field in rules["require_declaration_list"]]
+    result["required_photo_fields"] = (None if rules["require_declaration_list"] is None else
+        [field for field in ("photos", "photo_url") if field in nextsls.declaration_requirements(rules)])
     store, encoders = images.image_delivery(order, profile, rules)
-    result["photo_delivery_ready"] = bool(store and set(result["required_photo_fields"]) <= encoders.keys())
-    packing_store = images.media_store(order, profile) if result["packing_required"] else None
+    result["photo_delivery_ready"] = bool(store and (bool(encoders) if result["required_photo_fields"] is None
+        else set(result["required_photo_fields"]) <= encoders.keys()))
+    packing_store = images.media_store(order, profile) if result["packing_required"] is not False else None
     result["packing_delivery_ready"] = bool(packing_store)
     supplement = order_supplement(order)
     use_invoice_po = invoice_po_allowed(profile, code)
-    result["missing"] = nextsls.missing_supplements(order.invoice, supplement, rules, use_invoice_po=use_invoice_po)
-    result["missing_taxes"] = nextsls.missing_taxes(order.invoice, rules)
+    result["missing"] = nextsls.supplement_inputs(order.invoice, supplement, rules, use_invoice_po=use_invoice_po)
+    result["missing_taxes"] = nextsls.tax_inputs(order.invoice, rules)
     result["tax_fields"] = nextsls.TAX_FIELDS
     result["invoice_po_rows"] = invoice_po_rows(order.invoice, supplement, rules, use_invoice_po)
     result["invoice_header_po_used"] = bool(result["invoice_po_rows"] and not nextsls.has_line_amazon_po(order.invoice))
@@ -331,6 +381,7 @@ def supplier_preparation(order, profile, agent):
                                image_fields=encoders, packing_host=packing_store.host if packing_store else "",
                                photos_protocol_confirmed=result["photos_protocol_confirmed"],
                                use_invoice_po=use_invoice_po,
+                               include_packing=bool(packing_store),
                                preflight=True)
     except nextsls.PreparationError as exc:
         blockers.extend(exc.blockers)
@@ -346,7 +397,7 @@ def invoice_po_allowed(profile, code):
 
 
 def invoice_po_rows(invoice, supplement, rules, use_invoice_po):
-    if not use_invoice_po or "amazon_ref_id" not in rules["require_declaration_list"]:
+    if not use_invoice_po or "amazon_ref_id" not in nextsls.declaration_requirements(rules):
         return []
     return [{"row": i + 1, "source": source} for i in range(len(invoice["declarations"]))
             if (source := nextsls.amazon_reference(invoice, supplement, i, use_invoice_po=True)[1])
@@ -468,8 +519,13 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
     link = link or ensure_link(order)
 
     rules = nextsls.preparation_rules(service)
+    if rules.get("unknown_rules"):
+        grant = current_create_grant(order, profile)
+        if (not grant or not grant.get("unknown_rules_confirmed") or not grant.get("review_basis")
+                or grant.get("rules_digest") != nextsls.rules_digest(rules)):
+            raise nextsls.ProtocolError("渠道规则未知或已变化，请管理员核对真实资料并明确授权本票首次提交。")
     store, encoders = images.image_delivery(order, profile, rules)
-    packing_store = images.media_store(order, profile) if nextsls.required_flag(rules, "packing_list_required") else None
+    packing_store = images.media_store(order, profile) if rules["packing_list_required"] != 0 else None
     packing_host = current_app.config.get("TMS_NEXTSLS_PACKING_ATTACHMENT_HOST", "")
     if packing_store:
         packing_host = packing_store.host
@@ -488,6 +544,7 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
         image_fields=encoders,
         photos_protocol_confirmed=images.photos_encoder(profile, code) is not None,
         use_invoice_po=use_invoice_po,
+        include_packing=bool(packing_store),
         publish_image_fields=(lambda: images.publish_images(store, order, profile, original_photos(order), encoders))
         if encoders else None,
         publish_packing=(lambda: packing_publisher(packing_draft(order).getvalue()))
@@ -508,6 +565,11 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
         delivery_audit["amazon_ref_sources"] = po_rows
     if grant:
         delivery_audit["authorized_by"] = grant["actor_id"]
+    if rules.get("unknown_rules"):
+        delivery_audit["unknown_rule_attempt"] = {"fields":rules["unknown_rules"],
+            "review_basis":grant["review_basis"], "rules_digest":grant["rules_digest"],
+            "compatibility_verified":False}
+    delivery_audit["photos_encoding"] = "v5_https_url" if "photos" in encoders else None
     audit(link, "attempt", actor_id, {"state": "sending", **delivery_audit})
     db.session.commit()  # Commit the one-order reservation before contacting the supplier.
 
@@ -532,6 +594,14 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
         details = {"state": "uncertain", "reason": reason}
         if isinstance(error, nextsls.CreateRejected):
             details["supplier_rejected"] = True
+            details["missing_fields"] = list(error.fields)
+            if error.photos_url_rejected and transport is None and not current_app.config.get("ISOLATED_MODE"):
+                saved = db.session.get(TmsAgentApi, order.agent_id, with_for_update=True, populate_existing=True)
+                if saved and saved.base_url == origin:
+                    saved.verified = {**saved.verified, "photos_protocols":{
+                        **saved.verified.get("photos_protocols", {}), code:{"encoding":"unsupported",
+                            "evidence":"V5 create status=0 explicitly rejected photos URL",
+                            "at":datetime.now(timezone.utc).isoformat()}}}
         audit(link, "attempt", actor_id, details)
         db.session.commit()
         return "uncertain"
@@ -559,9 +629,9 @@ def preview_supplier_files(order, profile):
     store = files.direct_store(order, profile)
     if not store:
         raise nextsls.ProtocolError("星睿 HTTPS 文件服务暂未就绪。")
-    photos = original_photos(order)
-    references = images.publish_images(store, order, profile, photos, {"photo_url": nextsls.product_photo_url},
-                                       preview=True)
+    photos = original_photos(order) if all(item.get("image_part") for item in order.invoice["declarations"]) else []
+    references = (images.publish_images(store, order, profile, photos, {"photo_url": nextsls.product_photo_url},
+                                       preview=True) if photos else [])
     packing = packing_draft(order).getvalue()
     attachment = images.publish_packing(store, order, profile, packing, preview=True)
     if nextsls.packing_url_host(attachment) != store.host:
@@ -585,11 +655,14 @@ def preview_supplier_files(order, profile):
             publish_image_fields=lambda: [{field: encode(ref["photo_url"]) for field, encode in encoders.items()}
                                           for ref in references],
             use_invoice_po=use_invoice_po,
+            include_packing=rules["packing_list_required"] is None,
         )["shipment"]
     except nextsls.ProtocolError as error:
         return manifest, {"error": str(error)}
     rows = [row for parcel in payload["parcels"] for row in parcel["declarations"]]
     return manifest, {
+        "status": "规则未知，首次真实提交待验证" if rules.get("unknown_rules") else "通用请求预检通过",
+        "unknown_rules":rules.get("unknown_rules", []), "payload":{"shipment":payload},
         "combined": bool(payload.get("attachments") and any(nextsls.IMAGE_FIELDS & row.keys() for row in rows)),
         "po_rows": len(invoice_po_rows(invoice, supplement, rules, use_invoice_po)),
     }

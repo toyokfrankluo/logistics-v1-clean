@@ -455,6 +455,23 @@ def _save_agent_settings(agent, form, ready):
 def agents():
     ready = tms_carriers.carrier_schema()
     if request.method == "POST":
+        if request.form.get("onboarding") == "v5":
+            if not ready:
+                return "请先完成 TMS 数据库迁移。", 409
+            try:
+                agent, profile = tms_carriers.quick_connect(request.form.get("name"),
+                    request.form.get("base_url", ""), request.form.get("app_token", ""))
+                db.session.commit()
+                unknown = sum(bool(rule.get("unknown_rules")) for rule in profile.verified[tms_carriers.CHANNEL_CATALOGUE]["rules"].values())
+                flash(f"NextSLS V5 已接入：{len(tms_carriers.channel_catalogue(profile))} 个渠道，其中 {unknown} 个存在未知规则。尚未发送真实运单。", "success")
+                return redirect(url_for("views.edit_agent", agent_id=agent.id))
+            except nextsls.ProtocolError as error:
+                db.session.rollback()
+                flash(str(error), "danger")
+                return redirect(url_for("views.agents"))
+            except SQLAlchemyError:
+                db.session.rollback()
+                return "账号接入未保存，请刷新后重试。", 409
         name = request.form.get("name", "").strip()
         if not name or len(name) > 200:
             flash("代理名称不能为空或超过 200 个字符", "danger")
@@ -555,6 +572,8 @@ def edit_agent(agent_id):
                            integration_ready=ready, profile=profile, providers=tms_carriers.PROVIDERS,
                            capabilities=nextsls.CAPABILITIES, endpoints=endpoints, blocked=blocked,
                            catalogue=tms_carriers.channel_catalogue(profile), sales_services=tms_carriers.SERVICES,
+                           unknown_rule_count=sum(bool((tms_carriers.channel_rules(profile, code) or {}).get("unknown_rules"))
+                               for code in tms_carriers.channel_catalogue(profile)),
                            channel_mappings=tms_carriers.channel_mappings(profile))
 
 

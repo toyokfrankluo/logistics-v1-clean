@@ -522,8 +522,8 @@ class NextSLSTests(unittest.TestCase):
         tms_carriers.store_channel_catalogue(profile, {"TMS_DEMO": SERVICE["name"]}, {})
         db.session.commit()
         stale = self.get(self.staff, f"/tms/admin/orders/{order_id}").get_data(as_text=True)
-        self.assertIn("完整必填规则尚未读取", stale)
-        self.assertNotIn('name="supplement_0_model"', stale)
+        self.assertIn("规则未知，首次真实提交待验证", stale)
+        self.assertIn('name="supplement_0_model"', stale)
         self.carrier_post.assert_not_called()
 
     def test_po_requires_audited_confirmation_and_is_only_sent_if_required(self):
@@ -629,7 +629,7 @@ class NextSLSTests(unittest.TestCase):
             agent_service=code)).status_code, 302)
         path = f"/tms/admin/orders/{order_id}"
         html = self.get(self.staff, path).get_data(as_text=True)
-        for label in ("A. 管理员可修正的资料和代理配置", "B. 待供应商确认的协议", "C. 站点创建开关",
+        for label in ("A. 管理员可修正的资料和代理配置", "C. 站点创建开关",
                       "识别 3 / 3 张", "photos 为本渠道必填，真实传输未配置", "供应商读取图片", "供应商实际读取以创建结果为准",
                       "待提交代理", "本渠道无需单独装箱单", 'name="supplement_0_amazon_ref_id"'):
             self.assertIn(label, html)
@@ -641,7 +641,7 @@ class NextSLSTests(unittest.TestCase):
         ) as transport:
             result = self.action(order_id, "create", confirm="yes")
         self.assertEqual(result.status_code, 400)
-        self.assertIn(nextsls.PHOTOS_PROTOCOL_BLOCKER, result.get_data(as_text=True))
+        self.assertIn(nextsls.PHOTOS_STORAGE_BLOCKER, result.get_data(as_text=True))
         self.assertTrue(transport.call_args.args[0].api_url.endswith("/shipment/get_services"))
         self.assertEqual(transport.call_count, 1)
         self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
@@ -685,7 +685,9 @@ class NextSLSTests(unittest.TestCase):
             self.assertEqual(result.status_code, 200)
             self.assertEqual(result.headers["Referrer-Policy"], "no-referrer")
             manifest = result.json
-            self.assertEqual(manifest["draft"], {"combined": True, "po_rows": 3})
+            self.assertTrue(manifest["draft"]["combined"])
+            self.assertEqual(manifest["draft"]["po_rows"], 3)
+            self.assertIn("payload", manifest["draft"])
             self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
             self.carrier_post.assert_not_called()
             for resource in manifest["files"]:

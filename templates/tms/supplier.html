@@ -5,6 +5,7 @@
 {% if supplier_error %}<p class="error" role="alert">{{ supplier_error }}</p>{% endif %}
 <section class="panel" id="supplier-order">
   <h2>供应商下单</h2>
+  {% if link and link.state == 'linked' and supplier.supplier_number %}<p>已有真实创建成功记录：{{ supplier.supplier_number }}</p>{% endif %}
   <p>供应商：{{ '已启用' if supplier.agent_active else '未启用' }} ·
     渠道：{{ order.agent_service or '待选择' }} ·
     真实创建：{{ '站点已开放' if supplier.site_create_enabled else '等待管理员启用' }} ·
@@ -14,6 +15,9 @@
     {% if supplier.supplier_number %} · {{ supplier.supplier_number }}{% endif %}
     {% if link %} · 对账参考号 <code>{{ link.client_reference }}</code>{% endif %}</p>
   {% if preparation %}
+  {% if preparation.unknown_rules %}
+  <p class="notice">规则未知，首次真实提交待验证。已知基础字段仍校验；未知项：{{ preparation.unknown_rules|join('、') }}。通用预览可生成，不能视为供应商已接受。</p>
+  {% else %}<p>按当前渠道规则进行通用请求预检；供应商实际接单以返回真实运单号为准。</p>{% endif %}
   <dl class="fields">
     <div><dt>客户 / FBA 单号</dt><dd>{{ invoice.customer_number }}</dd></div>
     {% if invoice.metadata.po_number %}
@@ -31,17 +35,17 @@
     <div><dt>图片传输配置</dt><dd>{% if preparation.photo_delivery_ready %}提交时自动生成 HTTPS 图片链接
       {% elif preparation.required_photo_fields %}
       {{ preparation.required_photo_fields|join('、') }} 为本渠道必填，真实传输未配置
-      {% elif preparation.required_photo_fields is none %}等待当前渠道规则
+      {% elif preparation.required_photo_fields is none %}图片要求未知；已有完整商品图时自动附上，不视为已确认必填
       {% else %}当前渠道规则未要求图片字段{% endif %}</dd></div>
     {% if preparation.photos_protocol_confirmed and (preparation.required_photo_fields is none or 'photos' in preparation.required_photo_fields) %}
-    <div><dt>图片协议</dt><dd>已确认：photos 接受签名 HTTPS 图片链接</dd></div>
+    <div><dt>图片编码</dt><dd>通用 V5 默认：photos 使用完整签名 HTTPS URL 字符串；实际兼容以供应商响应为准</dd></div>
     {% endif %}
     <div><dt>供应商读取图片</dt><dd>提交前可验收星睿链接；供应商实际读取以创建结果为准</dd></div>
     <div><dt>装箱单</dt><dd>{% if preparation.packing_required is true %}
       {% if preparation.packing_delivery_ready %}提交时自动生成装箱单的 HTTPS 链接。{% else %}HTTPS 文件服务暂未就绪。{% endif %}
       <a href="{{ url_for('tms_staff.supplier_packing_draft', order_id=order.id) }}">下载草稿</a>
       {% elif preparation.packing_required is false %}本渠道无需单独装箱单
-      {% else %}等待渠道规则确认{% endif %}</dd></div>
+      {% else %}供应商要求未知；文件服务可用时自动附上通用装箱单，不代表已验证供应商要求{% endif %}</dd></div>
     <div><dt>目的地</dt><dd>{{ invoice.address.recipient }} · {{ [invoice.address.street, invoice.address.street2, invoice.address.street3, invoice.address.city, invoice.address.region, invoice.address.postal_code, invoice.address.country]|select|join(' · ') }}</dd></div>
   </dl>
   {% if preparation.invoice_po_rows and not preparation.invoice_header_po_used %}
@@ -54,6 +58,10 @@
     <button type="submit" class="secondary">验收图片与装箱单链接</button>
     <p role="status"></p>
   </form>
+  <form method="post" action="{{ url_for('tms_staff.supplier_files_check', order_id=order.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="revision" value="{{ order.revision }}">
+    <button type="submit" class="secondary" name="download" value="yes">下载通用创建请求预览（不发送）</button>
+  </form>
   {% endif %}
   {% if preparation.omitted_address_fields %}<p class="notice">原始发票可核实的可选地址占位值将在请求中省略（{{ preparation.omitted_address_fields|length }} 项），原资料保留。</p>{% endif %}
   <ul>{% for item in invoice.declarations %}<li>{{ item.box_number }} · {{ item.name_zh }} / {{ item.name_en }} · {{ item.quantity }} 件 · {{ item.total_usd }} USD</li>{% endfor %}</ul>
@@ -64,13 +72,17 @@
     <h3>{{ label }}</h3>
     <ul>{% for blocker in messages %}<li>{{ blocker }}</li>{% endfor %}</ul>
     {% endfor %}
-    {% if preparation.packing_required is none and supplier.agent_id %}
+    {% if preparation.packing_required is none and supplier.agent_id and not preparation.unknown_rules %}
     <p><a href="{{ url_for('views.edit_agent', agent_id=supplier.agent_id, _anchor='channel-mapping') }}">前往代理设置核对渠道规则</a></p>
     {% endif %}
   {% elif supplier.create_grant_required and not supplier.create_grant %}
   <form method="post" action="{{ url_for('tms_staff.supplier_action', order_id=order.id) }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input type="hidden" name="revision" value="{{ order.revision }}">
+    {% if preparation.unknown_rules %}
+    <label class="check-label"><input type="checkbox" name="unknown_rules_confirmed" value="yes" required>已完整核对实际货物、地址及申报资料，知悉渠道有未知要求，授权本票尝试一次真实提交</label>
+    <label>本票资料核对依据<textarea name="unknown_rules_basis" maxlength="500" required></textarea></label>
+    {% endif %}
     <label class="check-label"><input type="checkbox" name="confirm" value="yes" required>确认仅授权本票按当前资料向选定代理真实下单一次</label>
     <button class="secondary" name="action" value="grant_create">授权本单真实下单</button>
   </form>
@@ -99,12 +111,12 @@
   {% endif %}
   {% endif %}
   {% if preparation.missing or preparation.missing_taxes %}
-  <details open><summary>{{ "保存已核实的产品品牌" if preparation.packing_required is none else "补齐本渠道缺少的申报资料" }}</summary>
+  <details open><summary>{{ "可补充真实资料（规则未知，不代表以下全部必填）" if preparation.unknown_rules else "补齐本渠道缺少的申报资料" }}</summary>
     <form method="post" action="{{ url_for('tms_staff.supplier_action', order_id=order.id) }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <input type="hidden" name="revision" value="{{ order.revision }}">
       {% if preparation.missing_taxes %}
-      <fieldset><legend>本渠道要求的真实税号</legend>
+      <fieldset><legend>{{ '可补充的真实税号；未知要求不视为必填' if preparation.unknown_rules else '本渠道要求的真实税号' }}</legend>
       {% for field in preparation.missing_taxes %}<label>{{ preparation.tax_fields[field] }}<input name="tax_{{ field }}" maxlength="120" autocomplete="off"></label>{% endfor %}
       </fieldset>
       {% endif %}

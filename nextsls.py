@@ -1,5 +1,7 @@
 """NextSLS V5 protocol. Outbound paths are defined here, never supplied by request data."""
 from decimal import Decimal, InvalidOperation
+from hashlib import sha256
+import json
 import re
 from types import SimpleNamespace
 from urllib.parse import urlsplit
@@ -57,7 +59,10 @@ class ProtocolError(ValueError):
 
 
 class CreateRejected(ProtocolError):
-    pass
+    def __init__(self, message, *, fields=(), photos_url_rejected=False):
+        super().__init__(message)
+        self.fields = tuple(fields)
+        self.photos_url_rejected = photos_url_rejected
 
 
 class PreparationError(ProtocolError):
@@ -129,21 +134,31 @@ def request_data(agent, origin, path, payload, *, transport=None):
     if response.status_code != 200 or not isinstance(data, dict) or type(data.get("status")) is not int:
         raise ProtocolError("NextSLS 返回了无效响应。")
     if path == "/shipment/create" and data["status"] == 0:
-        raise CreateRejected(create_rejection_message(data.get("info")))
+        info = data.get("info")
+        raise CreateRejected(create_rejection_message(info), fields=create_rejection_fields(info),
+                             photos_url_rejected=photos_url_rejected(info))
     if data["status"] != 1:
         raise ProtocolError("NextSLS 拒绝请求，请核对账号权限及渠道必填项。")
     return object_value(data.get("data"))
 
 
-def create_rejection_message(info):
-    message = "供应商返回创建失败（status=0）"
-    if not isinstance(info, str):
-        return message + "，响应未明确指出缺少哪个字段。"
-    # Report only known field identifiers with explicit missing-field wording, never echo provider text.
-    labels = {"photos": "商品图片（photos）", "photo_url": "商品图片链接（photo_url）",
+CREATE_FIELD_LABELS = {"photos": "商品图片（photos）", "photo_url": "商品图片链接（photo_url）",
               "attachments": "附件（attachments）", "packing_list": "装箱单（packing_list）",
               "to_address": "收件地址（to_address）", "mobile": "收件手机（mobile）",
-              **SUPPLEMENTAL_DECLARATIONS}
+              **SUPPLEMENTAL_DECLARATIONS, **TAX_FIELDS,
+              "name_en":"英文品名", "name_zh":"中文品名", "qty":"数量", "unit_value":"申报单价",
+              "hscode":"HS编码", "material":"材质", "usage":"用途", "from_address":"发件地址"}
+
+
+def photos_url_rejected(info):
+    return isinstance(info, str) and bool(re.search(
+        r"(?im)^\s*photos\s*[:：]\s*(?:不支持|unsupported|does not support)\s*(?:https?|url|链接)\b", info[:1000]))
+
+
+def create_rejection_fields(info):
+    if not isinstance(info, str):
+        return []
+    labels = CREATE_FIELD_LABELS
     fields = "|".join(labels)
     mentioned = set()
     for line in re.split(r"[;；\r\n]", info[:1000]):
@@ -155,6 +170,15 @@ def create_rejection_message(info):
         )
         if missing:
             mentioned.add((missing[1] or missing[2]).lower())
+    return sorted(mentioned)
+
+
+def create_rejection_message(info):
+    message = "供应商返回创建失败（status=0）"
+    if photos_url_rejected(info):
+        return message + "，响应明确拒绝 photos URL 格式。"
+    labels = CREATE_FIELD_LABELS
+    mentioned = create_rejection_fields(info)
     if mentioned:
         return message + "，响应指出缺少：" + "、".join(label for key, label in labels.items() if key in mentioned) + "。"
     return message + "，响应未明确指出缺少哪个字段。"
@@ -204,14 +228,28 @@ def service_profile(data, code):
 
 def preparation_rules(profile):
     fields = profile.get("require_declaration_list")
-    if (not isinstance(fields, list) or len(fields) > 100
+    if fields is not None and (not isinstance(fields, list) or len(fields) > 100
             or any(not isinstance(key, str) or not re.fullmatch(r"[a-zA-Z0-9_]{1,64}", key) for key in fields)):
         raise ProtocolError("渠道的产品申报必填项待核实")
     sender = profile.get("from_address")
-    if sender not in ("no", "optional", "required", "yes"):
+    if sender not in (None, "no", "optional", "required", "yes"):
         raise ProtocolError("渠道的发件地址规则待核实")
-    return {**{key: int(required_flag(profile, key)) for key in REQUIRED_FLAGS},
-            "from_address": sender, "require_declaration_list": sorted(set(fields))}
+    result = {key: (None if profile.get(key) is None else int(required_flag(profile, key)))
+              for key in REQUIRED_FLAGS}
+    result.update(from_address=sender, require_declaration_list=sorted(set(fields)) if fields is not None else None)
+    unknown = sorted(key for key, value in result.items() if value is None)
+    if unknown:
+        result.update(unknown_rules=unknown, rule_version="legacy" if len(unknown) == 9 else "partial")
+    return result
+
+
+def rules_digest(rules):
+    return sha256(json.dumps(preparation_rules(rules), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def declaration_requirements(rules):
+    # None remains unknown in the stored contract; only iterate known requirements here.
+    return rules.get("require_declaration_list") or []
 
 
 def supplemental_value(invoice, field, value, *, confirmed_po=False):
@@ -302,13 +340,31 @@ def has_line_amazon_po(invoice):
 
 
 def missing_supplements(invoice, supplement, rules, *, use_invoice_po=False):
-    required = [field for field in SUPPLEMENTAL_DECLARATIONS if field in rules["require_declaration_list"]]
+    required = [field for field in SUPPLEMENTAL_DECLARATIONS if field in declaration_requirements(rules)]
     missing = {}
     for index, _ in enumerate(invoice["declarations"]):
         values = declaration_supplements(invoice, supplement, index, required, use_invoice_po=use_invoice_po)
         if len(values) < len(required):
             missing[index] = [field for field in required if field not in values]
     return missing
+
+
+def supplement_inputs(invoice, supplement, rules, *, use_invoice_po=False):
+    editable = dict(rules)
+    if rules.get("require_declaration_list") is None:
+        editable["require_declaration_list"] = list(SUPPLEMENTAL_DECLARATIONS)
+    return missing_supplements(invoice, supplement, editable, use_invoice_po=use_invoice_po)
+
+
+def tax_inputs(invoice, rules):
+    required = missing_taxes(invoice, rules)
+    try:
+        supplied = shipment_taxes(invoice)
+    except ProtocolError:
+        supplied = {}
+    return list(dict.fromkeys([*required, *(field for flag, field in (
+        ("vat_number_required", "vat_number"), ("eori_required", "eori"))
+        if rules.get(flag) is None and field not in supplied)]))
 
 
 def tax_value(value):
@@ -385,7 +441,7 @@ def unverified_destination_fields(invoice):
 
 def create_payload(invoice, code, reference, profile, sender, *, supplement=None, packing_host="",
                    publish_photos=None, publish_packing=None, image_fields=(), publish_image_fields=None,
-                   photos_protocol_confirmed=False, use_invoice_po=False, preflight=False):
+                   photos_protocol_confirmed=False, use_invoice_po=False, preflight=False, include_packing=False):
     """Translate a reviewed invoice; do not manufacture fields missing for the selected service."""
     if not CODE.fullmatch(code) or not CODE.fullmatch(reference):
         raise ProtocolError("渠道代码或系统对账参考号无效。")
@@ -431,13 +487,13 @@ def create_payload(invoice, code, reference, profile, sender, *, supplement=None
         if required_flag(profile, setting) and not shipment.get(field):
             blockers.append(f"渠道要求 {field}")
     sender_requirement = profile.get("from_address")
-    if sender_requirement in ("required", "yes") or (sender_requirement == "optional" and sender):
+    if sender_requirement in ("required", "yes") or (sender_requirement in (None, "optional") and sender):
         try:
             shipment["from_address"] = address_values(
                 {**sender, "company": sender.get("company") or meta.get("sender", "")})
         except ProtocolError:
             blockers.append("请在代理配置中补齐有效发件地址")
-    requirements = profile.get("require_declaration_list")
+    requirements = declaration_requirements(profile)
     supplement = supplement or {}
     image_fields = frozenset(image_fields)
     if publish_photos is not None:
@@ -453,7 +509,8 @@ def create_payload(invoice, code, reference, profile, sender, *, supplement=None
         "unit_value", "qty", "is_battery", "is_magnetic",
     } | IMAGE_FIELDS
     unsupported = sorted(set(requirements) - supported)
-    packing_required = required_flag(profile, "packing_list_required")
+    packing_required = required_flag(profile, "packing_list_required") is True or (
+        profile["packing_list_required"] is None and include_packing)
     if packing_required and (not packing_host or (publish_packing is None and not preflight)):
         blockers.append(PACKING_TRANSMISSION_BLOCKER)
     if "photos" in requirements and "photos" not in image_fields:
@@ -488,7 +545,8 @@ def create_payload(invoice, code, reference, profile, sender, *, supplement=None
     if not parcels:
         raise ProtocolError("没有可提交的箱货数据。")
     declarations = []
-    fields = [key for key in SUPPLEMENTAL_DECLARATIONS if key in requirements]
+    fields = [key for key in SUPPLEMENTAL_DECLARATIONS
+              if key in requirements or profile["require_declaration_list"] is None]
     for index, item in enumerate(invoice["declarations"]):
         declaration = {target: supplied_text(item.get(source)) for target, source in DECLARATIONS.items()}
         declaration.update(declaration_supplements(invoice, supplement, index, fields,
@@ -524,8 +582,7 @@ def create_payload(invoice, code, reference, profile, sender, *, supplement=None
             if not isinstance(values, dict) or values.keys() != image_fields:
                 raise ProtocolError("商品图片发布结果与已确认的接口字段不符。")
             for key, value in values.items():
-                declaration[key] = (product_photo_url(value) if key == "photo_url"
-                                    else supplied_text(value, 3 * 1024 * 1024))
+                declaration[key] = product_photo_url(value)
     if any(key not in row for row in declarations for key in requirements):
         raise ProtocolError("商品图片未满足所选渠道的必填申报要求。")
     if packing_required:
@@ -552,6 +609,8 @@ def product_photo_url(value):
 
 def required_flag(profile, name):
     value = profile.get(name)
+    if value is None and name in profile.get("unknown_rules", []):
+        return None
     if type(value) not in (int, str) or value not in (0, 1, "0", "1"):
         raise ProtocolError("渠道必填规则待核实。")
     return value in (1, "1")

@@ -3,6 +3,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from hashlib import sha256
 from io import BytesIO
+import json
 import os
 from pathlib import Path
 import re
@@ -821,8 +822,9 @@ def assignment_channel_state(order, agent, profile):
     requirements = {}
     for code in catalogue:
         rules = tms_carriers.channel_rules(profile, code)
-        requirements[code] = ({"declarations": rules["require_declaration_list"],
-                              "packing": bool(rules["packing_list_required"]),
+        requirements[code] = ({"declarations": nextsls.declaration_requirements(rules),
+                              "unknown_rules":rules.get("unknown_rules", []),
+                              "packing": nextsls.required_flag(rules, "packing_list_required"),
                               "sender": rules["from_address"],
                               "photos_confirmed": bool(tms_carriers.images.photos_encoder(profile, code)),
                               "missing": nextsls.missing_supplements(order.invoice,
@@ -1041,11 +1043,24 @@ def change_create_grant(order, *, revoke):
         blockers = tms_carriers.supplier_preparation(order, profile, agent)["blockers"]
         if blockers:
             raise nextsls.ProtocolError("；".join(blockers) + "。")
-        invoice[tms_carriers.CREATE_GRANT] = {
+        rules = tms_carriers.channel_rules(profile, order.agent_service)
+        unknown = rules.get("unknown_rules", []) if rules else []
+        basis = ""
+        if unknown:
+            if request.form.get("unknown_rules_confirmed") != "yes":
+                raise nextsls.ProtocolError("请明确确认渠道存在未知规则，且本票真实资料已完整核对。")
+            basis = nextsls.supplied_text(request.form.get("unknown_rules_basis"), 500)
+        grant = {
             "revision": order.revision + 1, "agent_id": order.agent_id, "service": order.agent_service,
             "origin": profile.base_url, "actor_id": current_user.id,
             "expires_at": int((datetime.now(timezone.utc) + timedelta(minutes=30)).timestamp()),
         }
+        if unknown:
+            grant.update(unknown_rules_confirmed=True, review_basis=basis,
+                         unknown_rules=unknown, rules_digest=nextsls.rules_digest(rules))
+        invoice[tms_carriers.CREATE_GRANT] = grant
+        invoice["supplier_authorization_history"] = [*invoice.get("supplier_authorization_history", []),
+            {**grant, "at":datetime.now(timezone.utc).isoformat(), "compatibility_verified":False if unknown else None}]
     update_order(order, {"invoice": invoice})
     history(order, "supplier_revoke" if revoke else "supplier_grant")
     db.session.commit()
@@ -1172,11 +1187,11 @@ def save_supplier_supplement(order, form):
     if rules is None:
         rules = tms_carriers.BRAND_ONLY_RULES
     prior = tms_carriers.order_supplement(order)
-    missing = nextsls.missing_supplements(order.invoice, prior, rules,
+    missing = nextsls.supplement_inputs(order.invoice, prior, rules,
                                          use_invoice_po=tms_carriers.invoice_po_allowed(profile, order.agent_service))
     allowed = {f"supplement_{index}_{field}" for index, fields in missing.items() for field in fields}
     taxes = dict(order.invoice.get("nextsls_tax", {}))
-    missing_tax = nextsls.missing_taxes(order.invoice, rules) if "vat_number_required" in rules else []
+    missing_tax = nextsls.tax_inputs(order.invoice, rules) if "vat_number_required" in rules else []
     allowed_tax = {"tax_" + field for field in missing_tax}
     if any(key.startswith("tax_") and (key not in allowed_tax or len(form.getlist(key)) != 1) for key in form):
         raise nextsls.ProtocolError("渠道税号要求已变化，请刷新页面后补充。")
@@ -1294,7 +1309,12 @@ def supplier_files_check(order_id):
     except SQLAlchemyError:
         db.session.rollback()
         return jsonify(error="文件服务暂时无法保存验收文件，请稍后重试。"), 503
-    response = jsonify(files=manifest, draft=draft)
+    if request.form.get("download") == "yes":
+        response = send_file(BytesIO(json.dumps(draft, ensure_ascii=False, indent=2).encode()),
+            download_name=f"nextsls-order-{order.id}-preview.json", as_attachment=True, mimetype="application/json")
+    else:
+        response = jsonify(files=manifest, draft=draft)
+    response.headers["Cache-Control"] = "private, no-store"
     response.headers["Referrer-Policy"] = "no-referrer"
     return response
 

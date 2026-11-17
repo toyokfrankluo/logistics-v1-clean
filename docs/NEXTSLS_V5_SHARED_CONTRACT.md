@@ -1,5 +1,7 @@
 # NextSLS V5 共用创建规范与证据（2026-11-18）
 
+> 历史证据记录。后续用户明确授权采用通用HTTPS photos默认编码及旧版未知规则单票尝试；当前运行策略见 [NEXTSLS_V5_COMPATIBILITY.md](NEXTSLS_V5_COMPATIBILITY.md)。以下“待确认阻断”和渠道数量描述属于该次验收，不能作为新版运行策略。
+
 范围：Render 测试站，12 家已有代理；本轮不发送任何 shipment/create。逐家读取实际 `/api/v5/docs/markdown`，比较创建字段表、渠道字段表、图片定义、附件结构及查询返回。下表为当前文档正文 SHA-256，便于复核版本；凭据不在本文或源码中。
 
 | Render 代理 ID | 供应商 | 官方文档 | 正文 SHA-256 |

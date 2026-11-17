@@ -2,6 +2,18 @@
 {% block content %}
 <div class="container mt-4">
     <h2>代理管理</h2>
+    {% if integration_ready %}
+    <section class="panel"><h3>NextSLS V5 快速接入</h3>
+      <p>自动识别渠道版本、保存本账号规则并接入统一下单。App Key、客户代码及旧轨迹地址无需填写。</p>
+      <form method="post" action="{{ url_for('views.agents') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="onboarding" value="v5">
+        <label>供应商名称<input name="name" maxlength="200" required></label>
+        <label>HTTPS API 基础域名<input name="base_url" type="url" maxlength="255" placeholder="https://租户.nextsls.com" required></label>
+        <label>App Token<input name="app_token" type="password" maxlength="255" autocomplete="new-password" required></label>
+        <button type="submit">验证并接入 V5</button>
+      </form>
+    </section>
+    {% endif %}
     <p><a class="button secondary" href="{{ url_for('tms_staff.import_agents') }}">批量接入 NextSLS V5 供应商</a></p>
 
     <!-- 添加代理表单 -->

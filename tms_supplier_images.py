@@ -13,8 +13,7 @@ import tms_supplier_files as direct
 from tms_xlsx_images import MAX_PHOTO_BYTES, MAX_PHOTO_TOTAL_BYTES
 
 
-# Use (tenant, None) for a verified tenant-wide contract or (tenant, channel) for a verified exception.
-CONFIRMED_PHOTOS_ENCODERS = {("https://bckjkj.nextsls.com", None): nextsls.product_photo_url}
+# Shared V5 default selected by the operator. This is not evidence of vendor acceptance.
 IMAGE_TYPES = {"image/png": "png", "image/jpeg": "jpg"}
 MEDIA_ERROR = "未能生成可读取的 HTTPS 商品图片链接，未提交代理下单。"
 
@@ -35,7 +34,10 @@ class ImageStore:
 
 def image_delivery(order, profile, rules):
     """Resolve only the configured account/channel and the fields it actually requires."""
-    required = nextsls.IMAGE_FIELDS.intersection(rules["require_declaration_list"])
+    required = nextsls.IMAGE_FIELDS.intersection(nextsls.declaration_requirements(rules))
+    if rules.get("require_declaration_list") is None and all(
+            item.get("image_part") for item in order.invoice["declarations"]):
+        required = {"photos"}
     store = media_store(order, profile) if required else None
     if not store:
         return None, {}
@@ -47,9 +49,14 @@ def image_delivery(order, profile, rules):
 
 
 def photos_encoder(profile, channel):
-    return CONFIRMED_PHOTOS_ENCODERS.get(
-        (profile.base_url, channel), CONFIRMED_PHOTOS_ENCODERS.get((profile.base_url, None)),
-    )
+    if not profile or profile.provider != "nextsls":
+        return None
+    # Explicit, evidence-backed exceptions are configuration, never supplier-name branches.
+    verified = getattr(profile, "verified", None) or {}
+    override = verified.get("photos_protocols", {}).get(channel, verified.get("photos_protocol", {}))
+    if override.get("encoding") == "unsupported" and override.get("evidence"):
+        return None
+    return nextsls.product_photo_url
 
 
 def media_store(order, profile):

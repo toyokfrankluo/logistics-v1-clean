@@ -131,6 +131,26 @@ def verify_tracking_operation():
     return jsonify(agent_id=agent_id, supplier_number=number, events=len(tracks or []), error=error), 400 if error else 200
 
 
+@operations.post("/refresh")
+def refresh_operation():
+    body = request.get_json(silent=True) or {}
+    aid = body.get("agent_id")
+    if type(aid) is not int:
+        abort(400)
+    agent = db.session.get(CarrierAgent, aid)
+    profile = db.session.get(TmsAgentApi, aid)
+    if not agent or not profile or profile.provider != "nextsls" or not agent.is_active:
+        abort(400)
+    try:
+        tms_carriers.refresh_channel_catalogue(profile, agent)
+        db.session.commit()
+    except nextsls.ProtocolError as error:
+        db.session.rollback()
+        return jsonify(error=str(error)), 400
+    return jsonify(agent_id=aid, channels=len(tms_carriers.channel_catalogue(profile)),
+        unknown=sum(bool(rule.get("unknown_rules")) for rule in profile.verified[tms_carriers.CHANNEL_CATALOGUE]["rules"].values()))
+
+
 @operations.get("/create-control")
 def verify_create_control_operation():
     # Read-only receipt. The deployment credential can never change the site permission.
@@ -188,11 +208,14 @@ def preflight_operation():
     store = tms_supplier_files.configured_store()
     results = []
     for profile in db.session.scalars(select(TmsAgentApi).where(TmsAgentApi.provider == "nextsls")):
+        if body.get("agent_ids") and profile.agent_id not in body["agent_ids"]:
+            continue
         if body.get("agent_id") and body["agent_id"] != profile.agent_id:
             continue
         agent = db.session.get(CarrierAgent, profile.agent_id)
         catalogue = tms_carriers.channel_catalogue(profile)
-        passed, failures, blocked = [], Counter(), {}
+        passed, failures, blocked, unknown = [], Counter(), {}, {}
+        common_photos = []
         sample = None
         actual_delivery, delivery_error = None, None
         if deliveries is not None and agent.is_active:
@@ -216,13 +239,18 @@ def preflight_operation():
                 failures["供应商未提供完整渠道规则"] += 1
                 blocked[code] = "供应商未提供完整渠道规则"
                 continue
+            if body.get("rule_filter") == "photos_or_unknown" and not (
+                    rules.get("unknown_rules") or "photos" in nextsls.declaration_requirements(rules)):
+                continue
             encoder = tms_supplier_images.photos_encoder(profile, code)
-            image_fields = {"photo_url"} if "photo_url" in rules["require_declaration_list"] else set()
-            if encoder and "photos" in rules["require_declaration_list"]:
+            known_fields = nextsls.declaration_requirements(rules)
+            image_fields = {"photo_url"} if "photo_url" in known_fields else set()
+            if encoder and ("photos" in known_fields or rules.get("require_declaration_list") is None):
                 image_fields.add("photos")
             try:
                 nextsls.create_payload(deepcopy(invoice), code, "XR-PREFLIGHT-NOT-SENT", rules,
                     profile.sender, preflight=True, image_fields=image_fields,
+                    include_packing=bool(store) and rules["packing_list_required"] is None,
                     packing_host=store.host if store else "", photos_protocol_confirmed=bool(encoder))
                 # Explicitly synthetic links exercise construction only. They are never published or sent.
                 fixture_host = store.host if store else "preflight.example.com"
@@ -231,6 +259,7 @@ def preflight_operation():
                 actual = actual_delivery
                 payload = nextsls.create_payload(deepcopy(invoice), code, "XR-PREFLIGHT-NOT-SENT", rules,
                     profile.sender, image_fields=image_fields, packing_host=fixture_host,
+                    include_packing=bool(store) and rules["packing_list_required"] is None,
                     photos_protocol_confirmed=bool(encoder),
                     publish_image_fields=(lambda: [{key: actual[str(i)] if actual else f"https://{fixture_host}/preflight-not-published/photo-{i}.png"
                                                    for key in image_fields} for i in range(len(invoice["declarations"]))])
@@ -241,11 +270,25 @@ def preflight_operation():
                 blocked[code] = str(error)
                 continue
             passed.append(code)
+            if image_fields:
+                image_rows = [row for parcel in payload["shipment"]["parcels"] for row in parcel["declarations"]]
+                indices = [i for parcel in payload["shipment"]["parcels"]
+                           for i, item in enumerate(invoice["declarations"]) if item["box_number"] == parcel["reference"]]
+                expected = [actual[str(i)] if actual else f"https://{fixture_host}/preflight-not-published/photo-{i}.png"
+                            for i in indices]
+                if any(row.get(field) != expected[i] for i, row in enumerate(image_rows) for field in image_fields):
+                    raise nextsls.ProtocolError("预检图片与逐行文件来源不符。")
+            if rules.get("unknown_rules"):
+                unknown[code] = rules["unknown_rules"]
+            if "photos" in known_fields:
+                common_photos.append(code)
             if sample is None:
                 sample = payload
         results.append({"agent_id": profile.agent_id, "name": agent.name, "active": agent.is_active,
                         "channels": len(catalogue), "passed": passed, "failures": dict(failures),
                         "sample": sample, "blocked": blocked, "transport_calls": 0,
+                        "unknown_rules": unknown, "photos_url_passed":common_photos,
+                        "supplier_acceptance_verified":False,
                         "files_published": deliveries is not None and bool(sample)})
     return jsonify(results=results)
 
@@ -291,6 +334,10 @@ def preflight_files_operation():
     results = []
     for agent in db.session.scalars(select(CarrierAgent).join(TmsAgentApi).where(
             CarrierAgent.is_active.is_(True), TmsAgentApi.provider == "nextsls")):
+        if body.get("agent_id") and agent.id != body["agent_id"]:
+            continue
+        if body.get("agent_ids") and agent.id not in body["agent_ids"]:
+            continue
         manifest = files.stage_preview_files(store, batch_id, agent.id, invoice, uploads)
         results.append({"agent_id": agent.id, "name": agent.name, "files": manifest})
     db.session.commit()

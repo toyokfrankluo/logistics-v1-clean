@@ -40,6 +40,23 @@ class TransportTests(unittest.TestCase):
     def send(self):
         return transport.post(self.agent, data={'appKey':self.agent.app_key, 'appToken':self.agent.app_token})
 
+    def test_document_get_is_pinned_https_without_bearer_or_legacy_credentials(self):
+        self.agent.api_url='https://carrier.example/api/v5/docs/markdown'
+        self.response.read.return_value=b'public V5 docs'
+        self.assertEqual(transport.get_document(self.agent),'public V5 docs')
+        args,kwargs=self.pool.urlopen.call_args
+        self.assertEqual(args,('GET','/api/v5/docs/markdown'))
+        self.assertNotIn('Authorization',kwargs['headers'])
+        self.assertIsNone(kwargs['body'])
+        self.assertFalse(kwargs['redirect'])
+
+    def test_document_get_rejects_http_and_arbitrary_paths_before_network(self):
+        for url in ('http://carrier.example/api/v5/docs','https://carrier.example/admin',
+                    'https://carrier.example/api/v5/docs?token=do-not-send'):
+            self.agent.api_url=url
+            with self.assertRaises(transport.CarrierRequestError):transport.get_document(self.agent)
+        self.dns.assert_not_called()
+
     def test_pins_validated_ip_preserves_tls_name_and_disables_redirect_retry(self):
         self.assertEqual(self.send().json(), {'tracks': []})
         self.dns.assert_called_once_with('carrier.example',443,type=socket.SOCK_STREAM)

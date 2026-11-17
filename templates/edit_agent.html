@@ -51,6 +51,8 @@
 <section class="panel" id="channel-mapping">
   <h2>NextSLS 渠道清单与推荐</h2>
   <p><strong>当前配置供应商：{{ agent.name }}</strong> · API 租户：{{ profile.base_url or '未配置' }}</p>
+  <p>统一 V5 引擎 · 其中 {{ unknown_rule_count }} 个渠道含未知规则，可生成通用预览；首次真实尝试须管理员逐票明确确认。photos 默认使用星睿签名 HTTPS URL，预检不代表供应商已真实接受。</p>
+  {% if profile.verified.get('onboarding') %}<p>快速接入已保存。官方文档：{{ '已读取' if profile.verified.onboarding.docs.markdown.available else '读取未完成；渠道已按真实接口识别' }} · 认证：Bearer App Token · 接入时未提交真实运单。</p>{% endif %}
   <p>{% if catalogue %}该供应商返回 {{ catalogue|length }} 个渠道。{% else %}该供应商暂无有效渠道清单。{% endif %}</p>
   <p>清单有效期 24 小时。审核时先选供应商，再查看该账号的推荐。推荐仅作选码提示，不会锁定承运商或渠道。</p>
   <form method="post" action="{{ url_for('views.edit_agent', agent_id=agent.id, _anchor='channel-mapping') }}">

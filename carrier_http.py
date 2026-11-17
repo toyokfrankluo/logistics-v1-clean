@@ -84,6 +84,17 @@ def _redact(value, secrets):
 
 
 def post(agent, *, data=None, json=None, headers=None, timeout=15):
+    return _request(agent, data=data, json=json, headers=headers, timeout=timeout)
+
+
+def get_document(agent, *, timeout=15):
+    parsed = urlsplit(agent.api_url)
+    if parsed.scheme != 'https' or parsed.path not in ('/api/v5/docs', '/api/v5/docs/markdown') or parsed.query:
+        raise CarrierRequestError('仅允许读取 HTTPS V5 文档')
+    return _request(agent, method='GET', document=True, headers={'Accept':'text/plain,text/html'}, timeout=timeout)
+
+
+def _request(agent, *, data=None, json=None, headers=None, timeout=15, method='POST', document=False):
     # No saved requests method is restored; isolated runs remain fully offline.
     if (os.getenv('LOGISTICS_ISOLATED') == '1' or not has_app_context()
             or current_app.config.get('ISOLATED_MODE')):
@@ -96,7 +107,7 @@ def post(agent, *, data=None, json=None, headers=None, timeout=15):
     pool = response = None
     try:
         # Preparing a request performs encoding only, without Session/netrc/env access.
-        prepared = requests.Request('POST', agent.api_url, data=data, json=json, headers=headers).prepare()
+        prepared = requests.Request(method, agent.api_url, data=data, json=json, headers=headers).prepare()
         request_headers = dict(prepared.headers)
         request_headers['Host'] = '[' + host + ']' if ':' in host else host
         if port != (80 if scheme == 'http' else 443):
@@ -109,7 +120,7 @@ def post(agent, *, data=None, json=None, headers=None, timeout=15):
                                              assert_hostname=host, cert_reqs='CERT_REQUIRED',
                                              ca_certs=certifi.where(), retries=False)
             pool.ConnectionCls = PinnedHTTPSConnection
-        response = pool.urlopen('POST', prepared.path_url, body=prepared.body,
+        response = pool.urlopen(method, prepared.path_url, body=prepared.body,
                                 headers=request_headers, redirect=False, retries=False,
                                 timeout=urllib3.Timeout(connect=min(timeout, 15), read=min(timeout, 15)),
                                 preload_content=False)
@@ -120,6 +131,8 @@ def post(agent, *, data=None, json=None, headers=None, timeout=15):
         raw = response.read(2 * 1024 * 1024 + 1)
         if len(raw) > 2 * 1024 * 1024:
             raise CarrierRequestError('代理 API 响应过大')
+        if document:
+            return raw.decode('utf-8')
         payload = _redact(jsonlib.loads(raw), secrets)
         result = requests.Response()
         result.status_code = response.status

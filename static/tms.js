@@ -44,7 +44,9 @@ document.addEventListener("click", async event => {
     const verified = `匿名回读通过：${files.length-1} 张商品图及完整 packing.xlsx，文件字节一致，无签名访问被拒绝。附件链接 ${packing.url.length} 字符。`;
     if (row.passed.includes(code)) {
       status.dataset.state = "passed";
-      status.textContent = verified + " 当前渠道资料及完整请求预检通过，未发送供应商。";
+      status.textContent = verified + (row.unknown_rules?.[code]?.length
+        ? " 通用请求预检通过；规则未知，首次真实提交待验证。未发送供应商。"
+        : " 通用请求预检通过，未发送供应商；不代表供应商已真实接受。");
     } else {
       status.dataset.state = "blocked";
       status.textContent = verified + " 当前渠道仍阻断：" + (row.blocked[code] || "规则待核实");
@@ -119,12 +121,12 @@ document.addEventListener("submit", async (event) => {
       else if (url.pathname.endsWith("/packing.xlsx") && file.url.length <= 500) attachments.push(file.url.length);
       else throw new Error();
     }
-    if (!images || attachments.length !== 1) throw new Error();
+    if (attachments.length !== 1) throw new Error();
     const draft = manifest.draft;
     const draftStatus = draft.error ? `下单预览：${draft.error}`
       : draft.combined ? `下单预览同时包含图片和装箱单，${draft.po_rows} 行使用客户原始发票 PO。`
       : "下单预览已通过当前渠道规则。";
-    status.textContent = `外部 HTTPS 验收通过：${images} 张商品图及 packing.xlsx 均无 Cookie 读取成功，字节一致；无签名请求被拒绝。装箱单链接 ${attachments[0]} 字符。${draftStatus}`;
+    status.textContent = `外部 HTTPS 验收通过：${images} 张商品图及 packing.xlsx 均无 Cookie 读取成功，字节一致；无签名请求被拒绝。装箱单链接 ${attachments[0]} 字符。${draft.status || draftStatus}`;
   } catch {
     status.textContent = "外部 HTTPS 验收未通过。请刷新订单页后重试。";
   } finally {
@@ -236,10 +238,12 @@ function showSupplierRequirements(root) {
   const labels = {brand:"品牌", model:"型号", sku:"商品 SKU", sale_url:"销售链接", amazon_ref_id:"Amazon 参考号",
     is_magnetic:"真实带磁属性", is_battery:"真实带电属性", photos:"商品图片", photo_url:"图片链接",
     name_zh:"中文品名", name_en:"英文品名", material:"材质", usage:"用途", hscode:"HS 编码", qty:"数量", unit_value:"申报单价"};
-  const required = rule.declarations.map(key=>labels[key] || key).join("、") || "未额外指定申报字段";
+  const required = rule.unknown_rules?.includes("require_declaration_list") ? "申报必填列表未知" :
+    rule.declarations.map(key=>labels[key] || key).join("、") || "未额外指定申报字段";
   const missing = [...new Set([...Object.values(rule.missing).flat(), ...(rule.missing_taxes || [])])]
     .map(key=>({vat_number:"VAT 税号",eori:"EORI 税号",weight:"单件产品重量",size:"单件产品尺寸",asin:"ASIN",fnsku:"FNSKU"}[key] || labels[key] || key));
-  output.textContent = `本渠道要求：${required}。${rule.packing ? "装箱单由系统自动生成。" : "无需单独装箱单。"}` +
+  output.textContent = (rule.unknown_rules?.length ? "规则未知，首次真实提交待验证。已知要求：" : "本渠道要求：") +
+    `${required}。${rule.packing === null ? "装箱单要求未知，可自动准备通用附件。" : rule.packing ? "装箱单由系统自动生成。" : "无需单独装箱单。"}` +
     (missing.length ? `尚缺真实资料：${missing.join("、")}。` : "") +
     (rule.declarations.includes("photos") && !rule.photos_confirmed ? "photos 图片编码协议仍待该供应商确认。" : "") +
     (["yes","required"].includes(rule.sender) ? "还需核对供应商配置中的发件地址。" : "");
