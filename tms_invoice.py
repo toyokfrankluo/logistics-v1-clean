@@ -50,6 +50,7 @@ ADDRESS_LOOKUPS = {
 }
 PLACEHOLDER_FIELDS = ("warehouse_code", "company", "phone", "mobile", "street2", "street3", "region")
 LEGACY_OMITTABLE_ADDRESS_FIELDS = ("mobile", "street2", "street3")
+LEGACY_OPTIONAL_COLUMNS = tuple(ADDRESS_COLUMNS[key] - 1 for key in LEGACY_OMITTABLE_ADDRESS_FIELDS)
 REQUIRED_ADDRESS = {
     "recipient": "L5（收件人姓名）", "street": "L7（收件地址一）", "city": "L10（城市）",
     "region": "L11（省份 / 州）", "postal_code": "L12（邮编）", "country": "L13（国家二字代码）",
@@ -282,7 +283,7 @@ def workbook_address(book, code):
         raise InvoiceError("L4 地址编码在此工作簿的「地址库」中不存在。")
     # The old template filled C and all three originally blank optional cells with literal 73.
     # Require the entire signature, including the historical string representation.
-    cells = [match[2], *(match[ADDRESS_COLUMNS[key] - 1] for key in LEGACY_OMITTABLE_ADDRESS_FIELDS)]
+    cells = [match[index] for index in (2, *LEGACY_OPTIONAL_COLUMNS)]
     placeholders = (list(LEGACY_OMITTABLE_ADDRESS_FIELDS)
                     if all(cell.data_type in {"s", "n"} and cell.value in ("73", 73) for cell in cells) else [])
     return address_values(validate_address_row(match)), placeholders
@@ -596,7 +597,12 @@ def blank_invoice(catalogue=None, *, layout=None, extended=False, product_detail
         if not catalogue:
             raise InvoiceError("尚无可下载的地址，请联系星睿开通本客户的地址库。")
         for index, row in enumerate(catalogue, start=2):
-            addresses.append(row)
+            values = list(row)
+            # C/H/J/K = 73 identifies the old export's three empty optional cells.
+            if all(values[column] in ("73", 73) for column in (2, *LEGACY_OPTIONAL_COLUMNS)):
+                for column in LEGACY_OPTIONAL_COLUMNS:
+                    values[column] = None
+            addresses.append(values)
             for cell in addresses[index]:
                 if isinstance(cell.value, str):
                     cell.data_type = "s"

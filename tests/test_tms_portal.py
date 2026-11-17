@@ -775,6 +775,31 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(order.invoice["destination_review"]["verified_optional"], {"street2": "73"})
         self.assertEqual(TmsAudit.query.filter_by(order_id=order_id, action="approve").count(), 1)
 
+    def test_download_removes_only_recognized_legacy_address_placeholders(self):
+        self.sign_in(self.alice, "customer-a")
+        fixture_path = Path(app.config["TMS_ADDRESS_BOOK_DIR"], f"{self.customer_a.id}.xlsx")
+
+        def legacy_rows(book):
+            sheet = book["地址库"]
+            for column in "CHJK":
+                sheet[f"{column}2"] = "73"
+            sheet["I2"] = "73 Fictional Road"
+            sheet.append(("实际地址", "DEMO-B", "73", None, "真实收件人", None, "5551234567",
+                          "5550000000", "75 Fictional Road", "73", None, "Test City", "CA", "US", "00002"))
+
+        fixture_path.write_bytes(workbook_bytes(change=legacy_rows))
+        result = self.get(self.alice, "/tms/customer/template?extended=1")
+        self.assertEqual(result.status_code, 200)
+        with io.BytesIO(result.data) as data:
+            book = load_workbook(data)
+            addresses = book["地址库"]
+            self.assertEqual([addresses[cell].value for cell in ("H2", "J2", "K2")], [None, None, None])
+            self.assertEqual(addresses["I2"].value, "73 Fictional Road")
+            self.assertEqual(addresses["J3"].value, "73")
+            for cell, column in (("L8", "J"), ("L9", "K"), ("L15", "H")):
+                self.assertIn(f"地址库!${column}$2:${column}$5000", book["星睿发票"][cell].value)
+            book.close()
+
     def test_download_preserves_layout_and_includes_only_assigned_catalogue(self):
         self.sign_in(self.alice, "customer-a")
         directory = app.config["TMS_ADDRESS_BOOK_DIR"]
