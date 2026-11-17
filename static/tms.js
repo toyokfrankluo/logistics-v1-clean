@@ -120,6 +120,7 @@ if (drawerBody && typeof drawer?.showModal === "function") {
         if (request.signal.aborted) return;
         drawerBody.replaceChildren(detail);
         detail.querySelectorAll("[data-pricing]").forEach(pricingPreview);
+        initSupplierPickers(detail);
         drawerBody.scrollTop = 0;
       } catch {
         if (!request.signal.aborted) window.location.assign(link.href);
@@ -170,25 +171,79 @@ document.addEventListener("input", event => {
     pricingPreview(form);
   }
 });
-document.addEventListener("change", event => {
-  const agent = event.target;
-  if (agent.name !== "agent_id" || !agent.form?.matches("[data-pricing]")) return;
+const supplierLoads = new WeakMap();
+async function loadSupplierChannels(root, preserve = false) {
+  supplierLoads.get(root)?.abort();
+  root.removeAttribute("aria-busy");
+  const request = new AbortController();
+  supplierLoads.set(root, request);
+  const agent = root.querySelector('[name="agent_id"]');
   const form = agent.form;
-  const list = agent.selectedOptions[0]?.dataset.channelList;
-  const picker = form.querySelector("[data-channel-picker]");
+  const scope = root.querySelector('[name="supplier_binding"]');
+  const picker = root.querySelector("[data-channel-picker]");
   const select = picker.querySelector("select");
-  const manual = form.querySelector("[data-manual-channel]");
+  const manual = root.querySelector("[data-manual-channel]");
   const input = manual.querySelector("input");
-  const options = list && form.querySelector(`template[data-agent-options="${list}"]`);
-  select.replaceChildren(new Option("请选择实际渠道", ""));
-  if (options) select.append(options.content.cloneNode(true));
-  select.value = "";
-  input.value = "";
+  const status = picker.querySelector("[data-channel-empty]");
+  const settings = picker.querySelector("[data-channel-settings]");
+  const search = picker.querySelector("[data-search-label]");
+  const previous = preserve ? (select.value || root.dataset.currentChannel) : "";
+  const previousBinding = scope.value;
+  select.replaceChildren(new Option(agent.value ? "请选择实际渠道" : "请先选择实际物流供应商", ""));
+  if (!preserve) input.value = "";
   picker.querySelector("[data-channel-search]").value = "";
-  picker.querySelector("[data-channel-empty]").hidden = select.options.length > 1;
-  picker.hidden = select.disabled = !options;
-  manual.hidden = input.disabled = Boolean(options) || !agent.value;
-  form.elements.namedItem("confirmed").checked = false;
+  scope.value = "";
+  picker.hidden = false;
+  select.disabled = manual.hidden = input.disabled = settings.hidden = search.hidden = status.hidden = true;
+  if (!agent.value) return;
+  if (!agent.selectedOptions[0]?.dataset.channelList) {
+    picker.hidden = true;
+    manual.hidden = input.disabled = false;
+    return;
+  }
+  status.hidden = false;
+  status.textContent = "正在读取此供应商的渠道…";
+  root.setAttribute("aria-busy", "true");
+  try {
+    const response = await fetch(root.dataset.channelUrl, {
+      method: "POST", credentials: "same-origin", signal: request.signal,
+      body: new URLSearchParams({agent_id: agent.value, csrf_token: form.elements.csrf_token.value}),
+    });
+    if (response.redirected) throw new Error();
+    const data = await response.json();
+    if (request.signal.aborted || !root.isConnected) return;
+    if (!response.ok || data.error || !data.managed) {
+      status.textContent = data.error || "供应商配置已变化，请刷新页面重新选择。";
+      if (data.settings) { settings.href = data.settings; settings.hidden = false; }
+      return;
+    }
+    for (const [code, name] of Object.entries(data.catalogue).sort(([a], [b]) => a.localeCompare(b))) {
+      select.add(new Option(`${name} · ${code}${code === data.recommended ? "（推荐）" : ""}`, code));
+    }
+    if (previous && previousBinding === data.binding && Object.hasOwn(data.catalogue, previous)) {
+      select.value = previous;
+    }
+    scope.value = data.binding;
+    select.disabled = search.hidden = false;
+    status.hidden = true;
+  } catch {
+    if (!request.signal.aborted) status.textContent = "渠道暂时无法读取。请刷新页面或重新选择供应商。";
+  } finally {
+    if (!request.signal.aborted) root.removeAttribute("aria-busy");
+  }
+}
+function initSupplierPickers(root) {
+  root.querySelectorAll("[data-supplier-picker]").forEach(picker => {
+    if (picker.querySelector('[name="agent_id"]').selectedOptions[0]?.dataset.channelList &&
+        picker.querySelector("[data-channel-picker] select").disabled) loadSupplierChannels(picker, true);
+  });
+}
+document.addEventListener("change", event => {
+  const picker = event.target.closest("[data-supplier-picker]");
+  if (!picker) return;
+  const confirmed = event.target.form.elements.namedItem("assignment_confirmed");
+  if (confirmed && ["agent_id", "agent_service"].includes(event.target.name)) confirmed.checked = false;
+  if (event.target.name === "agent_id") loadSupplierChannels(picker);
 });
 document.addEventListener("click", event => {
   const button = event.target.closest("[data-add-fee], [data-remove-fee]");
@@ -209,6 +264,7 @@ document.addEventListener("click", event => {
   pricingPreview(form);
 });
 document.querySelectorAll("[data-pricing]").forEach(pricingPreview);
+initSupplierPickers(document);
 
 document.addEventListener("click", (event) => {
   const trigger = event.target.closest("[data-open-order-delete]");

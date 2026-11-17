@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 from secrets import token_hex
 from unicodedata import normalize
+from uuid import uuid4
 from zipfile import BadZipFile, ZipFile
 
 import click
@@ -54,7 +55,7 @@ AUDIT_LABELS = {
     "upload": "上传发票", "replace": "更正发票", "confirm": "提交审核",
     "approve": "审核通过", "reject": "审核驳回", "pricing_draft": "保存收费草稿", "adjust": "调整销售条款",
     "settle": "确认最终应收",
-    "supplier_channel": "更正未提交的代理渠道",
+    "supplier_channel": "调整未提交的供应商或渠道",
     "supplier_prep": "保存下单补充资料",
     "supplier_address": "更正下单收件地址",
     "supplier_grant": "授权本票真实下单",
@@ -795,25 +796,78 @@ def destination_reference(order):
     ]}
 
 
+def assignment_channel_state(order, agent, profile):
+    managed = tms_carriers.uses_nextsls(profile, agent)
+    catalogue, recommended, binding = {}, None, ""
+    error = tms_carriers.channel_setup_error(profile, agent) if managed else None
+    if managed and not error:
+        catalogue = tms_carriers.channel_catalogue(profile)
+        mapping = tms_carriers.channel_mappings(profile).get(order.invoice["service"])
+        recommended = mapping["code"] if mapping else None
+        binding = f"{agent.id}:{profile.base_url}"
+        if not catalogue:
+            error = ("渠道清单已过期或该账号没有返回渠道，请在代理设置刷新。"
+                     if tms_carriers.CHANNEL_CATALOGUE in profile.verified
+                     else "此供应商尚未读取渠道，请在代理设置刷新。")
+    return {"managed": managed, "catalogue": catalogue, "recommended": recommended, "binding": binding,
+            "error": error}
+
+
+@staff.post("/orders/<int:order_id>/supplier-channels")
+def supplier_channels(order_id):
+    order = reviewable_order(order_id)
+    agent_id = request.form.get("agent_id", type=int)
+    agent = db.session.get(CarrierAgent, agent_id) if agent_id and 0 < agent_id < 2**31 else None
+    if not agent or not agent.is_active or order.status not in {"pending", "approved"}:
+        return jsonify(error="请选择启用的实际物流供应商。"), 400
+    profile = tms_carriers.agent_profile(agent.id)
+    error = tms_carriers.refresh_expired_channel_catalogue(profile, agent)
+    state = assignment_channel_state(order, agent, profile)
+    if error:
+        state["error"] = f"渠道自动刷新失败：{error}"
+    if state["managed"]:
+        state["settings"] = url_for("views.edit_agent", agent_id=agent.id, _anchor="channel-mapping")
+    return jsonify(state)
+
+
+def supplier_assignment_from_form(order, form, *, channel_field="agent_service"):
+    agent_id = form.get("agent_id", type=int)
+    code = form.get(channel_field, "").strip()
+    if not agent_id or not 0 < agent_id < 2**31 or len(code) > 100 or any(ord(c) < 32 for c in code):
+        raise ValueError("供应商或运输渠道格式不正确。")
+    agent = db.session.get(CarrierAgent, agent_id, with_for_update=True, populate_existing=True)
+    if not agent or not agent.is_active:
+        raise ValueError("请选择启用的实际物流代理。")
+    if not code:
+        raise ValueError("请选择或填写实际代理运输渠道。")
+    profile = (db.session.get(TmsAgentApi, agent_id, with_for_update=True, populate_existing=True)
+               if tms_carriers.carrier_schema() else None)
+    state = assignment_channel_state(order, agent, profile)
+    if state["managed"]:
+        if state["error"]:
+            raise ValueError(state["error"])
+        if code not in state["catalogue"] or form.get("supplier_binding") != state["binding"]:
+            raise ValueError("请选择此 NextSLS 代理当前已核验的渠道。供应商或租户已变化时，请重新选择。")
+        return agent, profile, code, state["catalogue"][code]
+    if form.get("supplier_binding"):
+        raise ValueError("供应商接口类型已变化，请重新选择。")
+    return agent, None, code, None
+
+
+def can_change_assignment(shipment, link):
+    if shipment.shipment_id or shipment.third_party_tracking_number or (link and (
+            link.state != "new" or link.attempt_at or link.supplier_number or link.tenant_origin
+            or link.synced_at or tms_carriers.latest_event(link.order_id, "attempt"))):
+        return False
+    return shipment.status == "待提交代理"
+
+
 def staff_detail(order, **context):
     agents = CarrierAgent.query.filter_by(is_active=True).order_by(CarrierAgent.name).all()
-    channels = {}
-    mapped_channels = {}
-    if order.status != "approved" and agents and tms_carriers.carrier_schema():
-        by_id = {agent.id: agent for agent in agents if agent.supports_api}
-        profiles = db.session.scalars(
-            select(TmsAgentApi).where(TmsAgentApi.provider == "nextsls",
-                                     TmsAgentApi.agent_id.in_(by_id))).all()
-        for profile in profiles:
-            if request.method == "GET":
-                agent = by_id[profile.agent_id]
-                error = tms_carriers.refresh_expired_channel_catalogue(profile, agent)
-                if error:
-                    flash(f"{agent.name} 渠道自动刷新失败：{error}", "danger")
-            channels[profile.agent_id] = tms_carriers.channel_catalogue(profile)
-            mapping = tms_carriers.channel_mappings(profile).get(order.invoice["service"])
-            if mapping:
-                mapped_channels[profile.agent_id] = mapping["code"]
+    profiles = ({p.agent_id: p for p in db.session.scalars(select(TmsAgentApi)
+                 .where(TmsAgentApi.agent_id.in_([a.id for a in agents])))}
+                if agents and tms_carriers.carrier_schema() else {})
+    assignment = {agent.id: assignment_channel_state(order, agent, profiles.get(agent.id)) for agent in agents}
     adjustments = (db.session.scalars(select(TmsChargeAdjustment).where(
         TmsChargeAdjustment.order_id == order.id).order_by(TmsChargeAdjustment.id.desc())).all()
         if order.status == "approved" and billing_available() else [])
@@ -853,10 +907,7 @@ def staff_detail(order, **context):
                 "address_corrections": supplier_address_corrections(order)
                 if unsubmitted and profile and profile.provider == "nextsls" else [],
                 "supplement_fields": nextsls.SUPPLEMENTAL_DECLARATIONS,
-                "channel_choices": ({code: name for code, name in tms_carriers.channel_catalogue(profile).items()
-                                     if code != order.agent_service}
-                                    if agent and agent.is_active and agent.supports_api and not shipment.shipment_id
-                                    and (not link or (link.state == "new" and not link.attempt_at)) else {}),
+                "can_change_assignment": can_change_assignment(shipment, link),
                 "can_reconcile": bool(agent and tms_carriers.available(profile, agent, "reconcile")),
                 "can_sync": bool(agent and any(tms_carriers.available(profile, agent, key)
                                  for key in tms_carriers.DETAILS)),
@@ -885,7 +936,8 @@ def staff_detail(order, **context):
                 })
             ],
         }
-    return order_detail(order, agents=agents, agent_channels=channels, mapped_channels=mapped_channels,
+    return order_detail(order, agents=agents, assignment=assignment,
+                        assigned_agent=db.session.get(CarrierAgent, order.agent_id) if order.agent_id else None,
                         customer=db.session.get(Customer, order.customer_id),
                         adjustments=adjustments, supplier=supplier, **destination, **context)
 
@@ -914,8 +966,8 @@ def supplier_action(order_id):
         elif action in {"grant_create", "revoke_create"}:
             message = change_create_grant(order, revoke=action == "revoke_create")
         elif action == "channel":
-            correct_supplier_channel(order)
-            message = "已更正未提交的代理渠道。"
+            change_supplier_assignment(order)
+            message = "已保存新供应商与渠道。旧授权已清除，请按新渠道核对下单资料。"
         elif action == "prepare":
             save_supplier_supplement(order, request.form)
             message = "已保存下单补充资料。"
@@ -1021,37 +1073,57 @@ def correct_supplier_address(order, form):
     db.session.commit()
 
 
-def correct_supplier_channel(order):
+def change_supplier_assignment(order):
     db.session.refresh(order, with_for_update=True)
     if request.form.get("revision", type=int) != order.revision:
-        raise nextsls.ProtocolError("订单已更新，请刷新后核对渠道。")
+        raise nextsls.ProtocolError("订单已更新，请刷新后核对供应商和渠道。")
     shipment, receivable = tms_carriers.approved_shipment(order)
-    link = db.session.get(TmsSupplierOrder, order.id)
-    if shipment.shipment_id or (link and (link.state != "new" or link.attempt_at)):
-        raise nextsls.ProtocolError("已提交或已关联代理的订单不能更改渠道。")
-    profile = tms_carriers.agent_profile(order.agent_id)
-    agent = db.session.get(CarrierAgent, order.agent_id)
-    code = request.form.get("channel_code", "").strip()
-    catalogue = tms_carriers.channel_catalogue(profile)
-    if not agent or not agent.is_active or not agent.supports_api or code == order.agent_service or code not in catalogue:
-        raise nextsls.ProtocolError("请选择此代理已配置且不同于当前值的渠道代码。")
-    if order.invoice.get("supplier_tenant_origin", profile.base_url) != profile.base_url:
-        raise nextsls.ProtocolError("代理租户已与审核记录不符，请核对原代理账号。")
-    review = {"from": order.agent_service, "to": code, "to_name": catalogue[code],
-              "from_name": order.invoice.get("supplier_channel", {}).get("name"),
+    db.session.refresh(shipment, with_for_update=True)
+    link = db.session.get(TmsSupplierOrder, order.id, with_for_update=True)
+    if not can_change_assignment(shipment, link):
+        raise nextsls.ProtocolError("已有供应商提交、轨迹或运单记录，不能直接调整供应商或渠道。")
+    reason = request.form.get("assignment_reason", "").strip()
+    if not 1 <= len(reason) <= 500 or request.form.get("assignment_confirmed") != "yes":
+        raise nextsls.ProtocolError("请核对收件地址、商品申报与费用，并填写调整原因。")
+    try:
+        agent, profile, code, channel_name = supplier_assignment_from_form(order, request.form)
+    except ValueError as error:
+        raise nextsls.ProtocolError(str(error)) from None
+    original_agent = db.session.get(CarrierAgent, order.agent_id)
+    old_origin = order.invoice.get("supplier_tenant_origin")
+    new_origin = profile.base_url if profile else None
+    if (agent.id, new_origin, code) == (order.agent_id, old_origin, order.agent_service):
+        raise nextsls.ProtocolError("请选择不同的供应商或渠道。")
+    invoice = dict(order.invoice)
+    review = {"from": order.agent_service, "to": code, "to_name": channel_name,
+              "from_name": order.invoice.get("supplier_channel", {}).get("name"), "reason": reason,
+              "from_agent_id": order.agent_id, "to_agent_id": agent.id,
+              "from_agent": original_agent.name if original_agent else "", "to_agent": agent.name,
+              "from_origin": old_origin, "to_origin": new_origin,
               "by": current_user.id, "at": datetime.now(timezone.utc).isoformat()}
-    invoice = dict(order.invoice, supplier_channel={"code": code, "name": catalogue[code]},
-                   supplier_tenant_origin=profile.base_url, supplier_channel_reviews=[
-                       *order.invoice.get("supplier_channel_reviews", []), review,
-                   ])
-    # Keep factual declarations, and recalculate which fields the new channel needs.
+    if (agent.id, new_origin) != (order.agent_id, old_origin):
+        for key in ("amazon_po_confirmation", "amazon_po_line_confirmations"):
+            if key in invoice:
+                review[key] = invoice.pop(key)
+    invoice["supplier_channel_reviews"] = [*invoice.get("supplier_channel_reviews", []), review]
+    invoice.pop(tms_carriers.CREATE_GRANT, None)
+    invoice.pop("supplier_tenant_origin", None)
+    invoice.pop("supplier_channel", None)
+    if profile:
+        invoice.update(supplier_tenant_origin=new_origin, supplier_channel={"code": code, "name": channel_name})
     declarations = tms_carriers.order_supplement(order).get("declarations")
     if declarations:
-        invoice["nextsls_supplement"] = {"agent_id": order.agent_id, "service": code, "declarations": declarations}
+        invoice["nextsls_supplement"] = {"agent_id": agent.id, "service": code, "declarations": declarations}
     else:
         invoice.pop("nextsls_supplement", None)
-    update_order(order, {"agent_service": code, "invoice": invoice})
-    receivable.agent_service = code
+    if link:
+        invoice["supplier_event_floor"] = db.session.scalar(select(func.max(TmsSupplierEvent.id)).where(
+            TmsSupplierEvent.order_id == order.id)) or 0
+        link.agent_id = agent.id
+        link.client_reference = "XR-" + uuid4().hex
+    update_order(order, {"agent_id": agent.id, "agent_service": code, "invoice": invoice})
+    shipment.agent_id = agent.id
+    receivable.agent_id, receivable.agent_service = agent.id, code
     if receivable.final_total is not None:
         receivable.details = dict(receivable.details, billing_state="review")
     history(order, "supplier_channel")
@@ -1312,16 +1384,8 @@ def save_pricing(order, decision):
     agent = db.session.get(CarrierAgent, agent_id, with_for_update=True) if agent_id else None
     if (agent_id or decision == "approve") and (not agent or not agent.is_active):
         raise ValueError("请选择启用的实际物流代理。")
-    channel_name = None
     if decision == "approve":
-        profile = tms_carriers.agent_profile(agent.id)
-        if not service:
-            raise ValueError("请选择或填写实际代理运输渠道。")
-        if profile and profile.provider == "nextsls":
-            catalogue = tms_carriers.channel_catalogue(profile)
-            if not agent.supports_api or service not in catalogue:
-                raise ValueError("请选择此 NextSLS 代理当前已核验的渠道。若没有选项，请先刷新代理渠道清单。")
-            channel_name = catalogue[service]
+        agent, profile, service, channel_name = supplier_assignment_from_form(order, form)
     details = confirm_sales_terms(values, form) if decision == "approve" else values
     if decision == "approve":
         invoice = order.invoice

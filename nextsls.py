@@ -116,7 +116,11 @@ def request_data(agent, origin, path, payload, *, transport=None):
             "Accept-Language": "zh-CN", "Content-Type": "application/json",
         })
         data = response.json()
-    except (ValueError, carrier_http.CarrierRequestError):
+    except carrier_http.CarrierRequestError as error:
+        if path == "/shipment/get_services" and error.status in (401, 403):
+            raise ProtocolError(f"NextSLS 拒绝渠道认证（HTTP {error.status}），请核对 App Token 或账号权限。") from None
+        raise ProtocolError("NextSLS 请求失败或响应不可解析。") from None
+    except ValueError:
         raise ProtocolError("NextSLS 请求失败或响应不可解析。") from None
     if response.status_code != 200 or not isinstance(data, dict) or type(data.get("status")) is not int:
         raise ProtocolError("NextSLS 返回了无效响应。")

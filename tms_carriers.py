@@ -18,7 +18,7 @@ import tms_measurements as measurements
 import tms_supplier_images as images
 import tms_supplier_files as files
 from tms_invoice import InvoiceError, SERVICES, parse_invoice, product_photos
-from tms_models import TmsAgentApi, TmsReceivable, TmsSupplierEvent, TmsSupplierOrder
+from tms_models import TmsAgentApi, TmsOrder, TmsReceivable, TmsSupplierEvent, TmsSupplierOrder
 
 
 PROVIDERS = {"nextsls": "NextSLS V5", "rtb56": "RTB56", "other": "其他"}
@@ -110,9 +110,32 @@ def channel_rules(profile, code):
     return None
 
 
+def uses_nextsls(profile, agent):
+    return (profile.provider == "nextsls" if profile else bool(nextsls.tenant_host(agent.api_url)))
+
+
+def channel_setup_error(profile, agent):
+    if not agent.is_active or not agent.supports_api:
+        return "代理已停用或未启用 API。"
+    if not profile or profile.provider != "nextsls" or not profile.base_url:
+        return "此供应商尚未配置 NextSLS V5 API 基础域名。"
+    try:
+        if nextsls.base_url(profile.base_url, "nextsls") != profile.base_url:
+            return "此供应商的 HTTPS 租户域名格式不正确。"
+    except nextsls.ProtocolError as error:
+        return str(error)
+    if not agent.app_token:
+        return "此供应商尚未配置 App Token。"
+    if not nextsls.legacy_tenant_matches(agent.api_url, profile.base_url):
+        return "API 租户与原有 NextSLS 轨迹地址不一致。"
+    if "create" not in profile.enabled:
+        return "请先在代理设置中启用创建运单能力并刷新渠道；站点下单总开关可以保持关闭。"
+    return None
+
+
 def read_channel_catalogue(profile, agent):
-    if not profile or profile.provider != "nextsls" or "create" not in profile.enabled:
-        raise nextsls.ProtocolError("请先保存 NextSLS 代理配置并勾选创建运单能力，再读取渠道。")
+    if error := channel_setup_error(profile, agent):
+        raise nextsls.ProtocolError(error)
     data = nextsls.request_data(agent, profile.base_url, "/shipment/get_services",
                                 {"services": {"type": "all"}})
     rows = data.get("services")
@@ -629,9 +652,14 @@ def record_tracking_verification(profile, agent):
 
 
 def latest_event(order_id, kind):
-    return db.session.scalar(select(TmsSupplierEvent).where(
+    event = db.session.scalar(select(TmsSupplierEvent).where(
         TmsSupplierEvent.order_id == order_id, TmsSupplierEvent.kind == kind,
     ).order_by(TmsSupplierEvent.id.desc()).limit(1))
+    if event and kind in {"cost", "snapshot"}:
+        order = db.session.get(TmsOrder, order_id)
+        if event.id <= order.invoice.get("supplier_event_floor", 0):
+            return None
+    return event
 
 
 def sync_snapshot(order, actor_id, *, transport=None):
@@ -761,6 +789,7 @@ def exchange_date(value, *, required):
 
 
 def record_cost(order, actor_id, form):
+    db.session.refresh(order, with_for_update=True)
     shipment, receivable = approved_shipment(order)
     currency = form.get("currency", "").strip().upper()
     if not nextsls.CURRENCY.fullmatch(currency):
@@ -831,17 +860,20 @@ def finance_costs(rows):
     order_ids = [item.order_id for _, item in pairs]
     if not order_ids or not carrier_schema():
         return {}
-    records, links = {}, {}
+    records, links, floors = {}, {}, {}
     for offset in range(0, len(order_ids), 500):
         batch = order_ids[offset:offset + 500]
         links.update((link.order_id, link) for link in db.session.scalars(
             select(TmsSupplierOrder).where(TmsSupplierOrder.order_id.in_(batch))))
+        floors.update(db.session.execute(select(TmsOrder.id, TmsOrder.invoice["supplier_event_floor"].as_integer())
+                       .where(TmsOrder.id.in_(batch))).all())
         latest = select(func.max(TmsSupplierEvent.id)).where(
             TmsSupplierEvent.order_id.in_(batch),
             TmsSupplierEvent.kind.in_(("cost", "snapshot")),
         ).group_by(TmsSupplierEvent.order_id, TmsSupplierEvent.kind)
         for event in db.session.scalars(select(TmsSupplierEvent).where(TmsSupplierEvent.id.in_(latest))):
-            records[event.order_id, event.kind] = event
+            if event.id > (floors.get(event.order_id) or 0):
+                records[event.order_id, event.kind] = event
     result = {}
     for shipment, item in pairs:
         cost, snapshot = (records.get((item.order_id, key)) for key in ("cost", "snapshot"))

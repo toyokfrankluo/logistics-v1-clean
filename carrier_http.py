@@ -16,7 +16,9 @@ from flask import current_app, has_app_context
 
 
 class CarrierRequestError(RuntimeError):
-    pass
+    def __init__(self, message="", *, status=None):
+        super().__init__(message)
+        self.status = status
 
 
 def _endpoint(url):
@@ -114,7 +116,7 @@ def post(agent, *, data=None, json=None, headers=None, timeout=15):
         if 300 <= response.status < 400:
             raise CarrierRequestError('代理 API 重定向已阻止')
         if response.status != 200:
-            raise CarrierRequestError('代理 API 返回非成功状态')
+            raise CarrierRequestError('代理 API 返回非成功状态', status=response.status)
         raw = response.read(2 * 1024 * 1024 + 1)
         if len(raw) > 2 * 1024 * 1024:
             raise CarrierRequestError('代理 API 响应过大')

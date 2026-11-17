@@ -1,0 +1,23 @@
+{% set state = assignment.get(active_agent, {}) %}
+{% set managed = state.managed %}
+<div data-supplier-picker data-current-channel="{{ agent_service or '' }}" data-channel-url="{{ url_for('tms_staff.supplier_channels', order_id=order.id) }}">
+  <p>星睿销售服务：<strong>{{ invoice.service }}</strong></p>
+  <label>实际物流供应商<select name="agent_id" required><option value="">请选择启用的供应商</option>
+    {% for agent in agents %}<option value="{{ agent.id }}"{% if assignment[agent.id].managed %} data-channel-list="{{ agent.id }}"{% endif %}{% if agent.id == active_agent %} selected{% endif %}>{{ agent.name }}</option>{% endfor %}
+  </select></label>
+  <input type="hidden" name="supplier_binding" value="{{ state.binding or '' }}">
+  <div data-manual-channel{% if managed or not active_agent %} hidden{% endif %}>
+    <label>实际供应商渠道（手工）<input name="agent_service" value="{{ agent_service or '' if not managed else '' }}" maxlength="100" required{% if managed or not active_agent %} disabled{% endif %}></label>
+  </div>
+  <div data-channel-picker{% if active_agent and not managed %} hidden{% endif %}>
+    <label data-search-label{% if not active_agent or not state.catalogue %} hidden{% endif %}>搜索渠道名称或代码<input type="search" data-channel-search placeholder="输入渠道名称或代码"></label>
+    <label>实际供应商渠道<select name="agent_service" required{% if not managed or not state.catalogue %} disabled{% endif %}>
+      <option value="">{{ '请选择实际渠道' if active_agent else '请先选择实际物流供应商' }}</option>
+      {% for code, name in (state.catalogue or {})|dictsort %}
+      <option value="{{ code }}"{% if code == agent_service %} selected{% endif %}>{{ name }} · {{ code }}{% if code == state.recommended %}（推荐）{% endif %}</option>
+      {% endfor %}
+    </select></label>
+    <p class="muted" data-channel-empty role="status"{% if not state.error %} hidden{% endif %}>{{ state.error or '' }}</p>
+    <a data-channel-settings{% if managed and state.error %} href="{{ url_for('views.edit_agent', agent_id=active_agent, _anchor='channel-mapping') }}"{% else %} hidden{% endif %}>前往该供应商设置刷新渠道</a>
+  </div>
+</div>

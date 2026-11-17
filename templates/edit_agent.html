@@ -50,7 +50,9 @@
 {% if profile and profile.provider == 'nextsls' %}
 <section class="panel" id="channel-mapping">
   <h2>NextSLS 渠道清单与推荐</h2>
-  <p>刷新后，审核页可按名称或代码搜索本账号的渠道。清单有效期 24 小时。推荐仅作选码提示，已审核订单可在订单页单独更正。</p>
+  <p><strong>当前配置供应商：{{ agent.name }}</strong> · API 租户：{{ profile.base_url or '未配置' }}</p>
+  <p>{% if catalogue %}该供应商返回 {{ catalogue|length }} 个渠道。{% else %}该供应商暂无有效渠道清单。{% endif %}</p>
+  <p>清单有效期 24 小时。审核时先选供应商，再查看该账号的推荐。推荐仅作选码提示，不会锁定承运商或渠道。</p>
   <form method="post" action="{{ url_for('views.edit_agent', agent_id=agent.id, _anchor='channel-mapping') }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <button type="submit" name="channel_action" value="load" class="secondary">刷新 NextSLS 渠道（只读）</button>
@@ -63,7 +65,7 @@
       <option value="">请选择销售服务</option>
       {% for sale in sales_services %}<option value="{{ sale }}"{% if request.form.get('sales_service') == sale %} selected{% endif %}>{{ sale }}</option>{% endfor %}
     </select></label>
-    <label>供应商渠道代码<select name="supplier_channel_code" required>
+    <label>该供应商的推荐渠道<select name="supplier_channel_code" required>
       <option value="">请选择供应商渠道</option>
       {% for code, label in catalogue|dictsort %}<option value="{{ code }}"{% if request.form.get('supplier_channel_code') == code %} selected{% endif %}>{{ code }} · {{ label }}</option>{% endfor %}
     </select></label>

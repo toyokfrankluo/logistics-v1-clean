@@ -4,7 +4,7 @@
 <h1>{{ invoice.customer_number }}</h1><p>{{ business_date(order.created_at) }}（北京时间）</p></div>
 <a class="button secondary" href="{{ url_for('tms_staff.staff_download' if staff else 'tms_client.download', order_id=order.id) }}">下载原始发票</a></div>
 <dl class="order-metrics">
-  <div><dt>运输服务</dt><dd>{{ invoice.service }}</dd></div>
+  <div><dt>星睿销售服务</dt><dd>{{ invoice.service }}</dd></div>
   <div><dt>目的国家或地区</dt><dd>{{ invoice.address.country }}</dd></div>
   <div><dt>箱数</dt><dd>{{ invoice.boxes|length }} 箱</dd></div>
   <div><dt>申报重量</dt><dd>{{ totals.weight }} kg</dd></div>
@@ -15,7 +15,7 @@
 {% include "tms/delete_order.html" %}
 {% if order.rejection_reason %}<p class="error">驳回原因：{{ order.rejection_reason }}</p>{% endif %}
 {% if staff %}
-<p class="notice">客户：{{ customer.name }}{% if order.agent_service %} · 代理服务：{{ invoice.supplier_channel.name ~ ' · ' if invoice.supplier_channel else '' }}{{ order.agent_service }}{% endif %}</p>
+<p class="notice">客户：{{ customer.name }}{% if assigned_agent %} · 实际物流供应商：{{ assigned_agent.name }} · 实际供应商渠道：{{ invoice.supplier_channel.name ~ ' · ' if invoice.supplier_channel else '' }}{{ order.agent_service }}{% endif %}</p>
 {% if supplier and not supplier.supplier_number and (not supplier.link or supplier.link.state == 'new') %}
 <a class="button secondary" href="#supplier-order">查看代理下单状态</a>
 {% endif %}

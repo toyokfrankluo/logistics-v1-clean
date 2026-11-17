@@ -125,24 +125,24 @@
     </form>
   </details>
   {% endif %}
-  {% if supplier.channel_choices %}
-  <details><summary>更正未提交的代理渠道</summary>
+  {% if supplier.can_change_assignment %}
+  <details><summary>调整未提交的供应商或渠道</summary>
     <form method="post" action="{{ url_for('tms_staff.supplier_action', order_id=order.id) }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <input type="hidden" name="revision" value="{{ order.revision }}">
-      <div data-channel-picker>
-        <label>搜索渠道名称或代码<input type="search" data-channel-search placeholder="输入渠道名称或代码"></label>
-        <label>实际代理运输渠道<select name="channel_code" required><option value="">请选择</option>
-          {% for code, name in supplier.channel_choices|dictsort %}<option value="{{ code }}">{{ name }} · {{ code }}</option>{% endfor %}
-        </select></label>
-      </div>
-      <button class="secondary" name="action" value="channel">保存渠道更正</button>
+      {% with active_agent=order.agent_id, agent_service=order.agent_service %}
+      {% include "tms/supplier_picker.html" %}
+      {% endwith %}
+      <label>调整原因<textarea name="assignment_reason" required maxlength="500"></textarea></label>
+      <label class="check-label"><input type="checkbox" name="assignment_confirmed" value="yes" required>已重新核对收件地址、商品申报及客户计费；按新渠道补齐下单资料</label>
+      <p class="muted">保存后清除旧的单票授权。已确认应收将转为待复核，原记录保留。</p>
+      <button class="secondary" name="action" value="channel">保存供应商与渠道</button>
     </form>
   </details>
   {% endif %}
   {% if invoice.supplier_channel_reviews %}
-  <details><summary>代理渠道更正记录</summary>
-    <ul>{% for item in invoice.supplier_channel_reviews %}<li>{{ item.from }} → {{ item.to }} · #{{ item.by }} · {{ item.at }}{% if item.reason %} · {{ item.reason }}{% endif %}</li>{% endfor %}</ul>
+  <details><summary>供应商与渠道调整记录</summary>
+    <ul>{% for item in invoice.supplier_channel_reviews %}<li>{{ item.from_agent or '' }} {{ item.from }} → {{ item.to_agent or '' }} {{ item.to }} · #{{ item.by }} · {{ item.at }}{% if item.reason %} · {{ item.reason }}{% endif %}</li>{% endfor %}</ul>
   </details>
   {% endif %}
   {% if link and link.state in ['sending','uncertain','not_found'] %}
