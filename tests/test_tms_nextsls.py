@@ -176,6 +176,10 @@ class NextSLSTests(unittest.TestCase):
             self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 302)
             self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 400)
         self.assertEqual([url.rsplit("/", 1)[-1] for url in calls], ["get_services", "create"])
+        audit_column_limit = TmsAudit.__table__.c.action.type.length
+        audit_actions = [event.action for event in TmsAudit.query.filter_by(order_id=order_id).order_by(TmsAudit.id)]
+        self.assertTrue(all(len(action) <= audit_column_limit for action in audit_actions))
+        self.assertEqual(audit_actions[-3:], ["supplier_grant", "supplier_revoke", "supplier_grant"])
         order = db.session.get(TmsOrder, order_id)
         self.assertNotIn(tms_carriers.CREATE_GRANT, order.invoice)
         self.assertIsNone(db.session.get(TmsSupplierOrder, other_id))

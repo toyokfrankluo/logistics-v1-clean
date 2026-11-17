@@ -57,8 +57,8 @@ AUDIT_LABELS = {
     "supplier_channel": "更正未提交的代理渠道",
     "supplier_prep": "保存下单补充资料",
     "supplier_address": "更正下单收件地址",
-    "supplier_create_granted": "授权本票真实下单",
-    "supplier_create_revoked": "撤销本票真实下单授权",
+    "supplier_grant": "授权本票真实下单",
+    "supplier_revoke": "撤销本票真实下单授权",
     "order_deleted": "删除订单",
     "order_restored": "恢复订单",
 }
@@ -973,7 +973,7 @@ def change_create_grant(order, *, revoke):
             "expires_at": int((datetime.now(timezone.utc) + timedelta(minutes=30)).timestamp()),
         }
     update_order(order, {"invoice": invoice})
-    history(order, "supplier_create_revoked" if revoke else "supplier_create_granted")
+    history(order, "supplier_revoke" if revoke else "supplier_grant")
     db.session.commit()
     return "已撤销本票下单授权。" if revoke else "已授权本票下单一次，30 分钟内有效。"
 
