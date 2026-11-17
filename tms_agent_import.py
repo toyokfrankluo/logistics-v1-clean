@@ -117,16 +117,17 @@ def preflight_operation():
     results = []
     for profile in db.session.scalars(select(TmsAgentApi).where(TmsAgentApi.provider == "nextsls")):
         catalogue = tms_carriers.channel_catalogue(profile)
-        passed, failures = [], Counter()
+        passed, failures, blocked = [], Counter(), {}
         sample = None
         for code in catalogue:
             rules = tms_carriers.channel_rules(profile, code)
             if rules is None:
                 failures["供应商未提供完整渠道规则"] += 1
+                blocked[code] = "供应商未提供完整渠道规则"
                 continue
             encoder = tms_supplier_images.photos_encoder(profile, code)
             image_fields = {"photo_url"} if "photo_url" in rules["require_declaration_list"] else set()
-            if encoder:
+            if encoder and "photos" in rules["require_declaration_list"]:
                 image_fields.add("photos")
             try:
                 nextsls.create_payload(deepcopy(invoice), code, "XR-PREFLIGHT-NOT-SENT", rules,
@@ -143,6 +144,7 @@ def preflight_operation():
                     publish_packing=lambda: f"https://{fixture_host}/preflight-not-published/packing.xlsx")
             except nextsls.ProtocolError as error:
                 failures[str(error)] += 1
+                blocked[code] = str(error)
                 continue
             passed.append(code)
             if sample is None:
@@ -150,7 +152,7 @@ def preflight_operation():
         agent = db.session.get(CarrierAgent, profile.agent_id)
         results.append({"agent_id": profile.agent_id, "name": agent.name, "active": agent.is_active,
                         "channels": len(catalogue), "passed": passed, "failures": dict(failures),
-                        "sample": sample, "transport_calls": 0, "files_published": False})
+                        "sample": sample, "blocked": blocked, "transport_calls": 0, "files_published": False})
     return jsonify(results=results)
 
 

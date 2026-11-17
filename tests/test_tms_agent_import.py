@@ -117,6 +117,14 @@ class AgentImportTests(unittest.TestCase):
         self.assertTrue(all(d["is_magnetic"] == 0 for d in declarations))
         self.assertEqual(declarations[0]["sku"], saved["0"]["sku"])
         self.assertEqual(declarations[0]["sale_url"], saved["0"]["sale_url"])
+        invoice["flags"]["magnet"] = True
+        magnetic = nextsls.create_payload(invoice, "TEST", "TEST-REF", rules, {},
+                                          supplement={"declarations": saved})
+        self.assertTrue(all(row["is_magnetic"] == 1 for parcel in magnetic["shipment"]["parcels"]
+                            for row in parcel["declarations"]))
+        basic = nextsls.create_payload(invoice, "TEST", "TEST-REF", fixture.SERVICE, {})
+        self.assertTrue(all("sku" not in row and "sale_url" not in row and "is_magnetic" not in row
+                            for parcel in basic["shipment"]["parcels"] for row in parcel["declarations"]))
         with self.assertRaises(nextsls.ProtocolError):
             nextsls.supplemental_value(invoice, "sale_url", "fake placeholder")
 
