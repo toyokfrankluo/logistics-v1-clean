@@ -630,8 +630,8 @@ class NextSLSTests(unittest.TestCase):
         path = f"/tms/admin/orders/{order_id}"
         html = self.get(self.staff, path).get_data(as_text=True)
         for label in ("A. 管理员可修正的资料和代理配置", "B. 待供应商确认的协议", "C. 站点创建开关",
-                      "识别 3 / 3 张", "photos 为本渠道必填，真实传输未配置", "供应商读取图片", "尚未验证",
-                      "本票创建验收", "未提交", "本渠道无需单独装箱单", 'name="supplement_0_amazon_ref_id"'):
+                      "识别 3 / 3 张", "photos 为本渠道必填，真实传输未配置", "供应商读取图片", "供应商实际读取以创建结果为准",
+                      "待提交代理", "本渠道无需单独装箱单", 'name="supplement_0_amazon_ref_id"'):
             self.assertIn(label, html)
         self.assertNotIn("渠道要求装箱单", html)
         self.carrier_post.assert_not_called()

@@ -113,6 +113,14 @@ class TmsAgentApi(db.Model, TimestampMixin):
     verified = db.Column(db.JSON, nullable=False)
 
 
+class TmsCreateControl(db.Model, TimestampMixin):
+    __tablename__ = "tms_create_control"
+    id = db.Column(db.Integer, primary_key=True)
+    enabled = db.Column(db.Boolean, nullable=False, default=False)
+    revision = db.Column(db.Integer, nullable=False, default=1)
+    history = db.Column(db.JSON, nullable=False, default=list)
+
+
 class TmsAgentImport(db.Model, TimestampMixin):
     """Protected configuration backup. Credentials never leave this table through the UI."""
     __tablename__ = "tms_agent_import"

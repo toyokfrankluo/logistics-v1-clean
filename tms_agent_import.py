@@ -21,6 +21,7 @@ from models import CarrierAgent, db
 from tms_models import TmsAgentApi, TmsAgentImport
 import nextsls
 import tms_carriers
+import tms_create_control
 
 MAX_BYTES = 2 * 1024 * 1024
 CAPABILITIES = {"create", "reconcile", "tracking", "measurement", "parcels", "charges"}
@@ -29,16 +30,16 @@ operations = Blueprint("tms_agent_operations", __name__, url_prefix="/tms/operat
 
 @operations.before_request
 def authorize_operation():
-    # A temporary deployment credential grants only account import and read-only verification.
+    # A temporary deployment credential grants scoped configuration and read-only verification.
     # Only its SHA-256 digest is stored in Render. It cannot create shipments or log in as a user.
     digest = current_app.config.get("TMS_AGENT_IMPORT_KEY_SHA256", "")
     expiry = current_app.config.get("TMS_AGENT_IMPORT_KEY_EXPIRES", 0)
     supplied = request.headers.get("Authorization", "").removeprefix("Bearer ")
-    if (os.getenv("RENDER") != "true" or current_app.config.get("TMS_NEXTSLS_CREATE_ENABLED")
+    if (os.getenv("RENDER") != "true" or tms_create_control.enabled()
             or not current_app.config.get("TMS_ENABLED") or not digest or time() >= expiry
             or not compare_digest(sha256(supplied.encode()).hexdigest(), digest)):
         abort(404)
-    if (current_app.config.get("TMS_AGENT_IMPORT_SCOPE") == "preflight"
+    if (current_app.config.get("TMS_AGENT_IMPORT_SCOPE") != "import"
             and request.endpoint == "tms_agent_operations.import_operation"):
         abort(404)
 
@@ -81,6 +82,62 @@ def verify_operation():
     return render_template("agent.html", agents=agents, profiles=profiles, shipment_counts=counts,
                            providers=tms_carriers.PROVIDERS, capabilities=nextsls.CAPABILITIES,
                            integration_ready=True)
+
+
+@operations.post("/activate")
+def activate_operation():
+    """A deployment grant can activate only its explicitly scoped existing account."""
+    body = request.get_json(silent=True) or {}
+    agent_id = body.get("agent_id")
+    if (type(agent_id) is not int or current_app.config.get("TMS_AGENT_IMPORT_SCOPE") != f"activate:{agent_id}"):
+        abort(404)
+    agent = db.session.get(CarrierAgent, agent_id, with_for_update=True, populate_existing=True)
+    profile = db.session.get(TmsAgentApi, agent_id, with_for_update=True, populate_existing=True)
+    if (not agent or not profile or profile.provider != "nextsls" or not agent.app_token
+            or not agent.supports_api or agent.name != body.get("expected_name")
+            or profile.base_url != body.get("expected_origin")
+            or not nextsls.legacy_tenant_matches(agent.api_url, profile.base_url)
+            or not isinstance(body.get("reason"), str) or not 1 <= len(body["reason"].strip()) <= 500):
+        abort(409, "代理身份或租户与授权不符，未修改。")
+    if not agent.is_active:
+        previous = capture(agent, profile)
+        agent.is_active = True
+        db.session.add(TmsAgentImport(id=uuid4().hex, actor_id=0,
+            source_digest="activation:" + current_app.config["TMS_AGENT_IMPORT_KEY_SHA256"],
+            previous=[{"id":agent.id, "created":False, "config":previous}],
+            result=[{"id":agent.id, "name":agent.name, "origin":profile.base_url,
+                     "active":True, "action":"activate", "reason":body["reason"].strip()}]))
+        db.session.commit()
+    return jsonify(agent_id=agent.id, active=agent.is_active,
+                   channels=len(tms_carriers.channel_catalogue(profile)))
+
+
+@operations.post("/tracking")
+def verify_tracking_operation():
+    from models import Shipment
+    from views import fetch_tracking_from_api
+    body = request.get_json(silent=True) or {}
+    agent_id, number = body.get("agent_id"), body.get("supplier_number")
+    if type(agent_id) is not int or not isinstance(number, str):
+        abort(400)
+    matches = list(db.session.scalars(select(Shipment).where(
+        Shipment.agent_id == agent_id, Shipment.shipment_id == number).limit(2)))
+    agent = db.session.get(CarrierAgent, agent_id)
+    if len(matches) != 1 or not agent:
+        abort(409)
+    shipment = matches[0]
+    tracks, error = fetch_tracking_from_api(agent, shipment.tracking_number,
+        selected_shipment=shipment, safe_errors=True, read_only_preview=True)
+    return jsonify(agent_id=agent_id, supplier_number=number, events=len(tracks or []), error=error), 400 if error else 200
+
+
+@operations.get("/create-control")
+def verify_create_control_operation():
+    # Read-only receipt. The deployment credential can never change the site permission.
+    from tms_models import TmsCreateControl
+    return render_template("tms/create_settings.html", control=db.session.get(TmsCreateControl, 1),
+        site_enabled=tms_create_control.enabled(), admin_mode=False,
+        emergency=current_app.config.get("TMS_NEXTSLS_CREATE_EMERGENCY_STOP"), staff=True, verification=True)
 
 
 @operations.route("/channels", methods=["GET", "POST"])
@@ -297,7 +354,7 @@ def capture(agent, profile):
 
 
 def apply_accounts(accounts, actor_id, source_digest):
-    if current_app.config.get("TMS_NEXTSLS_CREATE_ENABLED"):
+    if tms_create_control.enabled():
         raise nextsls.ProtocolError("请先关闭站点真实创建总开关，再导入代理配置。")
     # Resolve remote reads before taking configuration locks. No create endpoint is called here.
     app = current_app._get_current_object()

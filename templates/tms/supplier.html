@@ -5,6 +5,10 @@
 {% if supplier_error %}<p class="error" role="alert">{{ supplier_error }}</p>{% endif %}
 <section class="panel" id="supplier-order">
   <h2>供应商下单</h2>
+  <p>供应商：{{ '已启用' if supplier.agent_active else '未启用' }} ·
+    渠道：{{ order.agent_service or '待选择' }} ·
+    真实创建：{{ '站点已开放' if supplier.site_create_enabled else '等待管理员启用' }} ·
+    本票授权：{{ '有效' if supplier.create_grant else '未授权' }}</p>
   {% set states = {'new':'待提交代理', 'sending':'提交中 · 已预留', 'uncertain':'待对账 · 提交结果未确认', 'not_found':'列表无匹配，待人工核实', 'linked':'代理已接单 · 单号已关联'} %}
   <p><span class="badge">{% if supplier.last_attempt and supplier.last_attempt.details.supplier_rejected %}代理返回失败 · 待对账{% else %}{{ states[link.state] if link else ('已录入供应商单号' if supplier.supplier_number else '待提交代理') }}{% endif %}</span>
     {% if supplier.supplier_number %} · {{ supplier.supplier_number }}{% endif %}
@@ -32,8 +36,7 @@
     {% if preparation.photos_protocol_confirmed and (preparation.required_photo_fields is none or 'photos' in preparation.required_photo_fields) %}
     <div><dt>图片协议</dt><dd>已确认：photos 接受签名 HTTPS 图片链接</dd></div>
     {% endif %}
-    <div><dt>供应商读取图片</dt><dd>尚未验证</dd></div>
-    <div><dt>本票创建验收</dt><dd>未提交</dd></div>
+    <div><dt>供应商读取图片</dt><dd>提交前可验收星睿链接；供应商实际读取以创建结果为准</dd></div>
     <div><dt>装箱单</dt><dd>{% if preparation.packing_required is true %}
       {% if preparation.packing_delivery_ready %}提交时自动生成装箱单的 HTTPS 链接。{% else %}HTTPS 文件服务暂未就绪。{% endif %}
       <a href="{{ url_for('tms_staff.supplier_packing_draft', order_id=order.id) }}">下载草稿</a>
@@ -56,6 +59,7 @@
   <ul>{% for item in invoice.declarations %}<li>{{ item.box_number }} · {{ item.name_zh }} / {{ item.name_en }} · {{ item.quantity }} 件 · {{ item.total_usd }} USD</li>{% endfor %}</ul>
   {% if preparation.blockers %}
     <p class="notice">{{ '等待管理员授权启用真实下单' if not supplier.site_create_enabled else '暂不能提交' }}</p>
+    {% if not supplier.site_create_enabled %}<p><a href="{{ url_for('tms_staff.create_settings') }}">管理员管理真实下单开关</a></p>{% endif %}
     {% for label, messages in supplier.blocker_groups.items() %}
     <h3>{{ label }}</h3>
     <ul>{% for blocker in messages %}<li>{{ blocker }}</li>{% endfor %}</ul>

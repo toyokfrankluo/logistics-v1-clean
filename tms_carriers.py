@@ -14,6 +14,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from models import CarrierAgent, Shipment, db
 import nextsls
+import tms_create_control
 import tms_measurements as measurements
 import tms_supplier_images as images
 import tms_supplier_files as files
@@ -226,8 +227,8 @@ def capability_blockers(profile, agent, key):
         blockers.append("功能未勾选启用")
     elif key == "create" and not channel_catalogue(profile):
         blockers.append("请先到代理编辑页刷新 NextSLS 渠道清单")
-    switch = "TMS_NEXTSLS_CREATE_ENABLED" if key == "create" else "TMS_NEXTSLS_READ_ENABLED"
-    if not current_app.config.get(switch):
+    permitted = tms_create_control.enabled() if key == "create" else current_app.config.get("TMS_NEXTSLS_READ_ENABLED")
+    if not permitted:
         blockers.append(CREATE_DISABLED if key == "create" else READ_DISABLED)
     return blockers
 
@@ -247,7 +248,7 @@ def create_blockers(profile, agent, code):
     catalogue = channel_catalogue(profile)
     if catalogue and code not in catalogue:
         blockers.append("审核所选渠道未列入代理的已确认渠道代码")
-    if not current_app.config.get("TMS_NEXTSLS_CREATE_ENABLED") and CREATE_DISABLED not in blockers:
+    if not tms_create_control.enabled() and CREATE_DISABLED not in blockers:
         blockers.append(CREATE_DISABLED)
     return blockers
 

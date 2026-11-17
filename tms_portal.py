@@ -43,10 +43,12 @@ import tms_measurements as measurements
 from tms_models import TmsAgentApi, TmsSupplierEvent, TmsSupplierFile, TmsSupplierOrder
 import tms_supplier_files
 import tms_agent_import
+import tms_create_control
 
 client = Blueprint("tms_client", __name__, url_prefix="/tms/customer")
 staff = Blueprint("tms_staff", __name__, url_prefix="/tms/admin")
 tms_agent_import.register_routes(staff)
+tms_create_control.register_routes(staff)
 SESSION_KEY = "xingrui_customer"
 CUSTOMER_COOKIE = "xingrui_customer_session"
 CLIENT_POSTS = frozenset(f"tms_client.{name}" for name in ("sign_in", "sign_out", "upload", "confirm", "delete_order"))
@@ -109,6 +111,7 @@ def init_tms(app):
     app.register_blueprint(staff)
     tms_supplier_files.init_app(app)
     tms_agent_import.init_app(app)
+    tms_create_control.init_app(app)
 
     @app.before_request
     def check_tms_availability():
@@ -171,6 +174,7 @@ def create_tms_schema():
             model.__table__.create(connection, checkfirst=True)
         tms_agent_import.TmsAgentImport.__table__.create(connection, checkfirst=True)
         tms_supplier_files.TmsSupplierPreviewFile.__table__.create(connection, checkfirst=True)
+        tms_create_control.TmsCreateControl.__table__.create(connection, checkfirst=True)
 
 
 @client.before_request
@@ -916,10 +920,11 @@ def staff_detail(order, **context):
                 "last_attempt": (tms_carriers.latest_event(order.id, "attempt")
                                  if link and link.state == "uncertain" else None),
                 "agent_name": agent.name if agent else "—",
+                "agent_active": bool(agent and agent.is_active),
                 "preparation": preparation, "agent_id": agent.id if agent else None,
                 "create_grant_required": current_app.config["TMS_NEXTSLS_REQUIRE_ORDER_GRANT"],
                 "create_grant": tms_carriers.current_create_grant(order, profile),
-                "site_create_enabled": current_app.config["TMS_NEXTSLS_CREATE_ENABLED"],
+                "site_create_enabled": tms_create_control.enabled(),
                 "blocker_groups": tms_carriers.supplier_blocker_groups(preparation.get("blockers", [])),
                 "address_corrections": supplier_address_corrections(order)
                 if unsubmitted and profile and profile.provider == "nextsls" else [],
