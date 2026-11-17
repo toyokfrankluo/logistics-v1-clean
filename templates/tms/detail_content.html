@@ -12,11 +12,12 @@
   <div><dt>申报货值</dt><dd>{{ totals.value }} USD</dd></div>
   <div><dt>订单审核</dt><dd><span class="badge {{ order.status }}">{{ status_labels[order.status] }}</span></dd></div>
 </dl>
+{% include "tms/delete_order.html" %}
 {% if order.rejection_reason %}<p class="error">驳回原因：{{ order.rejection_reason }}</p>{% endif %}
 {% if staff %}
 <p class="notice">客户：{{ customer.name }}{% if order.agent_service %} · 代理服务：{{ invoice.supplier_channel.name ~ ' · ' if invoice.supplier_channel else '' }}{{ order.agent_service }}{% endif %}</p>
 {% if supplier and not supplier.supplier_number and (not supplier.link or supplier.link.state == 'new') %}
-<a class="button" href="#supplier-order">待提交代理 · 核对下单</a>
+<a class="button secondary" href="#supplier-order">查看代理下单状态</a>
 {% endif %}
 {% endif %}
 {% if staff and order.status == 'pending' %}

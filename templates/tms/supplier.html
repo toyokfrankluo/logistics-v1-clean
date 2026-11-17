@@ -55,7 +55,7 @@
   {% if preparation.omitted_address_fields %}<p class="notice">原始发票可核实的可选地址占位值将在请求中省略（{{ preparation.omitted_address_fields|length }} 项），原资料保留。</p>{% endif %}
   <ul>{% for item in invoice.declarations %}<li>{{ item.box_number }} · {{ item.name_zh }} / {{ item.name_en }} · {{ item.quantity }} 件 · {{ item.total_usd }} USD</li>{% endfor %}</ul>
   {% if preparation.blockers %}
-    <p class="notice">暂不能提交</p>
+    <p class="notice">{{ '等待管理员授权启用真实下单' if not supplier.site_create_enabled else '暂不能提交' }}</p>
     {% for label, messages in supplier.blocker_groups.items() %}
     <h3>{{ label }}</h3>
     <ul>{% for blocker in messages %}<li>{{ blocker }}</li>{% endfor %}</ul>
@@ -63,13 +63,20 @@
     {% if preparation.packing_required is none and supplier.agent_id %}
     <p><a href="{{ url_for('views.edit_agent', agent_id=supplier.agent_id, _anchor='channel-mapping') }}">前往代理设置核对渠道规则</a></p>
     {% endif %}
-    <button type="button" disabled>提交代理下单</button>
+  {% elif supplier.create_grant_required and not supplier.create_grant %}
+  <form method="post" action="{{ url_for('tms_staff.supplier_action', order_id=order.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="revision" value="{{ order.revision }}">
+    <label class="check-label"><input type="checkbox" name="confirm" value="yes" required>确认仅授权本票按当前资料向选定代理真实下单一次</label>
+    <button class="secondary" name="action" value="grant_create">授权本单真实下单</button>
+  </form>
   {% else %}
   <form method="post" action="{{ url_for('tms_staff.supplier_action', order_id=order.id) }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input type="hidden" name="revision" value="{{ order.revision }}">
     <label class="check-label"><input type="checkbox" name="confirm" value="yes" required>确认向审核选定的代理提交本票资料</label>
     <button name="action" value="create">提交代理下单</button>
+    {% if supplier.create_grant %}<button class="secondary" name="action" value="revoke_create">撤销本单授权</button>{% endif %}
   </form>
   {% endif %}
   {% if supplier.address_corrections %}

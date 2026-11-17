@@ -465,6 +465,85 @@ class PortalTests(unittest.TestCase):
         self.assertIn("attachment", own.headers["Content-Disposition"])
         self.assertIn("no-store", own.headers["Cache-Control"])
 
+    def test_approved_order_customer_delete_isolation_and_staff_restore(self):
+        order_id = self.pending_order()
+        self.assertEqual(self.decision(order_id, 2, decision="approve", **self.pricing()).status_code, 302)
+        order = db.session.get(TmsOrder, order_id)
+        workbook = order.workbook
+        receivable = db.session.get(TmsReceivable, order_id)
+        shipment_id = receivable.shipment_id
+        base = f"/tms/customer/orders/{order_id}"
+        staff_base = f"/tms/admin/orders/{order_id}"
+        filters = "?status=approved&q=0000123"
+        self.assertEqual(self.sign_in(self.bob, "customer-b").status_code, 302)
+        self.assertEqual(self.post(self.alice, staff_base + "/restore", {"revision": 3}).status_code, 302)
+        self.assertEqual(self.get(self.bob, base).status_code, 404)
+        self.assertEqual(self.post(self.bob, base + "/delete", {"revision": 3, "reason": "测试"}).status_code, 404)
+        for path in ("/tms/customer/" + filters, base):
+            self.assertIn("删除订单", self.get(self.alice, path).get_data(as_text=True))
+        self.assertIn("共 1 票", self.get(self.alice, "/tms/customer/" + filters).get_data(as_text=True))
+        self.assertEqual(self.post(self.alice, base + "/delete", {"revision": 2, "reason": "测试"}).status_code, 409)
+        self.assertEqual(self.post(self.alice, base + "/delete", {"revision": 3, "reason": ""}).status_code, 400)
+        form = {"revision": 3, "reason": "客户删除验收"}
+        self.assertEqual(self.post(self.alice, base + "/delete", form).status_code, 302)
+        self.assertEqual(self.post(self.alice, base + "/delete", form).status_code, 404)
+        for path in (base, base + "/invoice"):
+            self.assertEqual(self.get(self.alice, path).status_code, 404)
+        for client_role, path in ((self.alice, "/tms/customer/"), (self.staff, "/tms/admin/")):
+            body = self.get(client_role, path + filters).get_data(as_text=True)
+            self.assertIn("审核通过 <span>0</span>", body)
+            self.assertIn("共 0 票", body)
+        archived = self.get(self.staff, "/tms/admin/orders/deleted" + filters).get_data(as_text=True)
+        self.assertIn("客户删除验收", archived)
+        self.assertIn("共 1 票", archived)
+        self.assertEqual(self.upload(self.alice, workbook).status_code, 409)
+        self.assertEqual(self.post(self.staff, staff_base + "/restore", {"revision": 3}, "/login").status_code, 409)
+        self.assertEqual(self.post(self.staff, staff_base + "/restore", {"revision": 4}, "/login").status_code, 302)
+        self.assertEqual(self.post(self.staff, staff_base + "/restore", {"revision": 4}, "/login").status_code, 404)
+        self.assertEqual(self.get(self.alice, base + "/invoice").data, workbook)
+        self.assertIn("共 1 票", self.get(self.alice, "/tms/customer/" + filters).get_data(as_text=True))
+        db.session.refresh(order)
+        self.assertEqual((order.status, order.revision), ("approved", 5))
+        delete, restore = order.invoice["order_archive_history"]
+        self.assertEqual((delete["action"], delete["original_status"], delete["actor_type"]),
+                         ("delete", "approved", "customer"))
+        self.assertEqual(restore["actor_type"], "staff")
+        self.assertEqual(TmsAudit.query.filter(TmsAudit.action.in_(("order_deleted", "order_restored"))).count(), 2)
+        self.assertEqual(db.session.get(TmsReceivable, order_id).shipment_id, shipment_id)
+        self.assertIsNotNone(db.session.get(Shipment, shipment_id))
+
+    def test_admin_cannot_delete_uncertain_or_cancel_linked_supplier_shipment(self):
+        order_id = self.pending_order()
+        self.assertEqual(self.decision(order_id, 2, decision="approve", **self.pricing()).status_code, 302)
+        order = db.session.get(TmsOrder, order_id)
+        shipment = db.session.get(Shipment, db.session.get(TmsReceivable, order_id).shipment_id)
+        link = TmsSupplierOrder(order_id=order_id, agent_id=order.agent_id, client_reference="XR-test",
+                                state="uncertain", attempt_at=datetime.now())
+        db.session.add(link)
+        db.session.commit()
+        staff_path = f"/tms/admin/orders/{order_id}/delete"
+        client_path = f"/tms/customer/orders/{order_id}/delete"
+        form = {"revision": order.revision, "reason": "归档验收"}
+        self.assertEqual(self.post(self.staff, staff_path, form, "/login").status_code, 409)
+        self.assertEqual(self.post(self.alice, client_path, form).status_code, 409)
+        link.state = "linked"
+        shipment.shipment_id = link.supplier_number = "TEST-LINKED"
+        shipment.status = "已签收"
+        db.session.commit()
+        self.assertIn("申请取消", self.get(self.alice, f"/tms/customer/orders/{order_id}").get_data(as_text=True))
+        self.assertEqual(self.post(self.alice, client_path, form).status_code, 409)
+        self.assertIn("仅在星睿归档", self.get(self.staff, f"/tms/admin/orders/{order_id}").get_data(as_text=True))
+        self.assertEqual(self.staff_login("tms-test-reader").status_code, 302)
+        self.assertEqual(self.post(self.staff, staff_path, form, "/login").status_code, 403)
+        self.assertEqual(self.staff_login().status_code, 302)
+        self.assertEqual(self.post(self.staff, staff_path, form, "/login").status_code, 302)
+        self.assertEqual(self.get(self.staff, f"/tms/admin/orders/{order_id}").status_code, 404)
+        self.assertEqual(self.post(self.staff, f"/tms/admin/orders/{order_id}/restore",
+                                   {"revision": form["revision"] + 1}, "/login").status_code, 302)
+        db.session.refresh(shipment)
+        db.session.refresh(link)
+        self.assertEqual((shipment.status, shipment.shipment_id, link.state), ("已签收", "TEST-LINKED", "linked"))
+
     def test_auth_review_end_to_end(self):
         order_id = self.get_order()
         preview = self.get(self.alice, f"/tms/customer/orders/{order_id}")

@@ -46,7 +46,7 @@ client = Blueprint("tms_client", __name__, url_prefix="/tms/customer")
 staff = Blueprint("tms_staff", __name__, url_prefix="/tms/admin")
 SESSION_KEY = "xingrui_customer"
 CUSTOMER_COOKIE = "xingrui_customer_session"
-CLIENT_POSTS = frozenset(f"tms_client.{name}" for name in ("sign_in", "sign_out", "upload", "confirm"))
+CLIENT_POSTS = frozenset(f"tms_client.{name}" for name in ("sign_in", "sign_out", "upload", "confirm", "delete_order"))
 SESSION_TTL = timedelta(hours=8)
 DUMMY_HASH = generate_password_hash(token_hex(32))
 STATUS_LABELS = {"draft": "待确认", "pending": "待审核", "approved": "审核通过", "rejected": "审核驳回"}
@@ -57,6 +57,10 @@ AUDIT_LABELS = {
     "supplier_channel": "更正未提交的代理渠道",
     "supplier_prep": "保存下单补充资料",
     "supplier_address": "更正下单收件地址",
+    "supplier_create_granted": "授权本票真实下单",
+    "supplier_create_revoked": "撤销本票真实下单授权",
+    "order_deleted": "删除订单",
+    "order_restored": "恢复订单",
 }
 BUSINESS_TIME = timezone(timedelta(hours=8))
 ORDER_FILTERS = {
@@ -88,6 +92,7 @@ def init_tms(app):
         TMS_INVOICE_TEMPLATE_PATH=os.getenv("TMS_INVOICE_TEMPLATE_PATH"),
         TMS_NEXTSLS_READ_ENABLED=os.getenv("TMS_NEXTSLS_READ_ENABLED") == "1",
         TMS_NEXTSLS_CREATE_ENABLED=os.getenv("TMS_NEXTSLS_CREATE_ENABLED") == "1",
+        TMS_NEXTSLS_REQUIRE_ORDER_GRANT=not app.config.get("ISOLATED_MODE"),
         TMS_NEXTSLS_PACKING_ATTACHMENT_HOST=os.getenv("TMS_NEXTSLS_PACKING_ATTACHMENT_HOST", "").strip().lower(),
     )
     for suffix in ("SCOPE", "BUCKET", "REGION", "URL_TTL_SECONDS", "ACCESS_KEY_ID", "SECRET_ACCESS_KEY",
@@ -236,8 +241,16 @@ def sign_out():
     return response
 
 
+def archive_marker():
+    return TmsOrder.invoice["order_archive"]["at"].as_string()
+
+
+def active_orders():
+    return TmsOrder.query.filter(archive_marker().is_(None))
+
+
 def owned_orders():
-    return TmsOrder.query.filter_by(customer_id=g.tms_account.customer_id)
+    return active_orders().filter_by(customer_id=g.tms_account.customer_id)
 
 
 def customer_order(order_id):
@@ -257,6 +270,75 @@ def history(order, action):
     by_staff = request.blueprint == staff.name
     db.session.add(TmsAudit(order_id=order.id, actor_type="staff" if by_staff else "customer",
                             actor_id=current_user.id if by_staff else g.tms_account.id, action=action))
+
+
+def order_deletion_options(orders, *, by_staff):
+    approved = {order.id: order for order in orders if order.status == "approved"}
+    options = {order.id: {"allowed": True} for order in orders}
+    if not approved:
+        return options
+    shipments = {}
+    if billing_available():
+        shipments = {charge.order_id: (charge, shipment) for charge, shipment in db.session.execute(
+            select(TmsReceivable, Shipment).join(Shipment, Shipment.id == TmsReceivable.shipment_id)
+            .where(TmsReceivable.order_id.in_(approved))
+        )}
+    links = {}
+    if tms_carriers.carrier_schema():
+        links = {link.order_id: link for link in db.session.scalars(
+            select(TmsSupplierOrder).where(TmsSupplierOrder.order_id.in_(approved))
+        )}
+    for order_id, order in approved.items():
+        charge, shipment = shipments.get(order_id, (None, None))
+        link = links.get(order_id)
+        if (not shipment or shipment.customer_id != order.customer_id
+                or shipment.tracking_number != order.invoice["customer_number"]
+                or shipment.agent_id != order.agent_id or charge.agent_id != order.agent_id):
+            options[order_id] = {"reason": "订单与运单或账目关联需由星睿核对后才能删除。"}
+        elif link and link.state not in {"new", "linked"}:
+            options[order_id] = {"reason": ("请先在供应商下单中对账，确认结果后再删除。" if by_staff
+                                           else "代理提交结果尚待确认，请联系星睿核对后再处理。")}
+        elif (shipment.shipment_id or shipment.third_party_tracking_number
+              or shipment.status not in (None, "", "已创建", "待提交代理")
+              or (link and (link.state == "linked" or link.supplier_number))):
+            options[order_id] = ({"allowed": True, "linked": True} if by_staff else
+                                 {"reason": "已生成运单。请联系星睿管理员申请取消，并等待承运商确认。"})
+    return options
+
+
+def change_archive(order, *, by_staff, restore=False):
+    db.session.refresh(order, with_for_update=True)
+    if request.form.get("revision", type=int) != order.revision:
+        abort(409, "订单刚刚变更，请刷新后再试。")
+    invoice = dict(order.invoice)
+    archived = invoice.get("order_archive")
+    if bool(archived) != restore:
+        abort(409, "订单的删除状态已经变更，请刷新列表。")
+    record = {"actor_type": "staff" if by_staff else "customer",
+              "actor_id": current_user.id if by_staff else g.tms_account.id,
+              "at": datetime.now(timezone.utc).isoformat()}
+    if restore:
+        invoice.pop("order_archive")
+        record.update(action="restore", original_status=archived["original_status"])
+    else:
+        if order.status == "approved" and billing_available():
+            charge = db.session.get(TmsReceivable, order.id)
+            if charge and charge.shipment_id:
+                db.session.get(Shipment, charge.shipment_id, with_for_update=True)
+        option = order_deletion_options([order], by_staff=by_staff)[order.id]
+        if not option.get("allowed"):
+            abort(409, option["reason"])
+        reason = request.form.get("reason", "").strip()
+        if not reason or len(reason) > 500:
+            abort(400, "请填写 1–500 字的删除原因。")
+        record.update(action="delete", reason=reason, original_status=order.status)
+        invoice["order_archive"] = record
+    invoice.pop(tms_carriers.CREATE_GRANT, None)
+    invoice["order_archive_history"] = [*invoice.get("order_archive_history", []), record]
+    update_order(order, {"invoice": invoice})
+    history(order, "order_restored" if restore else "order_deleted")
+    db.session.commit()
+    flash("订单已恢复。" if restore else "订单已移至已删除订单。", "success")
 
 
 def legacy_duplicate(customer_id, key):
@@ -330,7 +412,7 @@ def order_list(query, endpoint, default_status):
     filters = {key: request.args.get(key, "").strip() for key in ORDER_FILTERS}
     status = request.args.get("status", default_status)
     statuses = {key: value for key, value in STATUS_LABELS.items()
-                if endpoint == "tms_client.orders" or key != "draft"}
+                if endpoint != "tms_staff.queue" or key != "draft"}
     if status not in statuses and status != "all":
         status = default_status
     error = None
@@ -347,7 +429,11 @@ def order_list(query, endpoint, default_status):
         query = query.filter_by(status=status)
     pagination = query.order_by(TmsOrder.id.desc()).paginate(per_page=25, error_out=False)
     args = {key: value for key, value in filters.items() if value}
+    archived = endpoint == "tms_staff.deleted_orders"
+    options = {} if archived else order_deletion_options(pagination.items, by_staff=request.blueprint == staff.name)
     return page("orders", pagination=pagination, filters=filters, filter_args=args, counts=counts,
+                archived=archived, deletion_options=options,
+                archive_date=lambda value: business_date(datetime.fromisoformat(value)),
                 statuses=statuses, status=status, services=SERVICES, endpoint=endpoint,
                 invoice_totals=invoice_totals, business_date=business_date, error=error), (400 if error else 200)
 
@@ -407,7 +493,7 @@ def upload():
         return page("upload", error=str(error), replacement=order), 400
     key = invoice["customer_number"].upper()
     digest = sha256(raw).hexdigest()
-    candidates = owned_orders().filter(
+    candidates = TmsOrder.query.filter_by(customer_id=customer_id).filter(
         (TmsOrder.number_key == key) | (TmsOrder.file_sha256 == digest)
     )
     if order:
@@ -494,7 +580,8 @@ def order_detail(order, **context):
             ).order_by(ManualTrack.happen_time.desc())).all()
             tracks = [{"happen_time": when, "description": "物流轨迹已更新"} for when in times]
             customer_view = customer_measurement_view(order, owned_shipment)
-    return page(template, order=order, totals=invoice_totals(order.invoice), shipment=shipment, tracks=tracks,
+    deletion = order_deletion_options([order], by_staff=request.blueprint == staff.name)[order.id]
+    return page(template, order=order, deletion=deletion, totals=invoice_totals(order.invoice), shipment=shipment, tracks=tracks,
                 business_date=business_date, events=events, receivable=receivable, customer_measurements=customer_view,
                 units=UNITS, settlement_sources=SETTLEMENT_SOURCES, currencies=CURRENCIES, fixed=FIXED, **context)
 
@@ -535,6 +622,12 @@ def confirm(order_id):
     history(order, "confirm")
     db.session.commit()
     return redirect(url_for("tms_client.detail", order_id=order.id))
+
+
+@client.post("/orders/<int:order_id>/delete")
+def delete_order(order_id):
+    change_archive(customer_order(order_id), by_staff=False)
+    return redirect(url_for("tms_client.orders"))
 
 
 def original_workbook(order):
@@ -658,11 +751,29 @@ def account_availability(account_id):
 
 @staff.get("/")
 def queue():
-    return order_list(TmsOrder.query.filter(TmsOrder.status != "draft"), "tms_staff.queue", "pending")
+    return order_list(active_orders().filter(TmsOrder.status != "draft"), "tms_staff.queue", "pending")
+
+
+@staff.get("/orders/deleted")
+def deleted_orders():
+    return order_list(TmsOrder.query.filter(archive_marker().is_not(None)), "tms_staff.deleted_orders", "all")
+
+
+@staff.post("/orders/<int:order_id>/delete")
+def staff_delete_order(order_id):
+    change_archive(reviewable_order(order_id), by_staff=True)
+    return redirect(url_for("tms_staff.queue", status="all"))
+
+
+@staff.post("/orders/<int:order_id>/restore")
+def restore_order(order_id):
+    order = TmsOrder.query.filter(TmsOrder.id == order_id, archive_marker().is_not(None)).first_or_404()
+    change_archive(order, by_staff=True, restore=True)
+    return redirect(url_for("tms_staff.deleted_orders"))
 
 
 def reviewable_order(order_id):
-    return TmsOrder.query.filter(TmsOrder.status != "draft", TmsOrder.id == order_id).first_or_404()
+    return active_orders().filter(TmsOrder.status != "draft", TmsOrder.id == order_id).first_or_404()
 
 
 def destination_reference(order):
@@ -720,12 +831,13 @@ def staff_detail(order, **context):
             if not tms_carriers.snapshot_matches(link, shipment, snapshot, order.agent_service):
                 snapshot = None
             cost = tms_carriers.latest_event(order.id, "cost")
-            unsubmitted = not shipment.shipment_id and (not link or (link.state == "new" and not link.attempt_at))
+            can_create = not shipment.shipment_id and (not link or link.state == "new")
+            unsubmitted = can_create and (not link or not link.attempt_at)
             refresh_error = None
             if (unsubmitted and request.method == "GET" and profile
                     and order.invoice.get("supplier_tenant_origin", profile.base_url) == profile.base_url):
                 refresh_error = tms_carriers.refresh_expired_channel_catalogue(profile, agent)
-            preparation = tms_carriers.supplier_preparation(order, profile, agent) if unsubmitted else {}
+            preparation = tms_carriers.supplier_preparation(order, profile, agent) if can_create else {}
             if refresh_error:
                 preparation["blockers"].append(f"渠道自动刷新失败：{refresh_error}")
             supplier = {
@@ -734,6 +846,9 @@ def staff_detail(order, **context):
                                  if link and link.state == "uncertain" else None),
                 "agent_name": agent.name if agent else "—",
                 "preparation": preparation, "agent_id": agent.id if agent else None,
+                "create_grant_required": current_app.config["TMS_NEXTSLS_REQUIRE_ORDER_GRANT"],
+                "create_grant": tms_carriers.current_create_grant(order, profile),
+                "site_create_enabled": current_app.config["TMS_NEXTSLS_CREATE_ENABLED"],
                 "blocker_groups": tms_carriers.supplier_blocker_groups(preparation.get("blockers", [])),
                 "address_corrections": supplier_address_corrections(order)
                 if unsubmitted and profile and profile.provider == "nextsls" else [],
@@ -785,7 +900,7 @@ def supplier_action(order_id):
     order = reviewable_order(order_id)
     action = request.form.get("action")
     if action not in {"create", "channel", "prepare", "address", "reconcile", "retry", "sync", "cost",
-                      "measurement_review"}:
+                      "measurement_review", "grant_create", "revoke_create"}:
         abort(400)
     try:
         if action == "create":
@@ -796,6 +911,8 @@ def supplier_action(order_id):
             state = tms_carriers.send_order(order, current_user.id)
             message = ("已保存供应商运单号。" if state == "linked"
                        else "未取得代理运单号。请先对账，系统不会自动重试。")
+        elif action in {"grant_create", "revoke_create"}:
+            message = change_create_grant(order, revoke=action == "revoke_create")
         elif action == "channel":
             correct_supplier_channel(order)
             message = "已更正未提交的代理渠道。"
@@ -831,6 +948,34 @@ def supplier_action(order_id):
         abort(409, "代理数据未能保存。若已提交下单，请先对账。")
     flash(message, "success")
     return redirect(url_for("tms_staff.review", order_id=order.id))
+
+
+def change_create_grant(order, *, revoke):
+    db.session.refresh(order, with_for_update=True)
+    if request.form.get("revision", type=int) != order.revision or request.form.get("confirm") != "yes":
+        raise nextsls.ProtocolError("请刷新页面并明确确认本票下单授权。")
+    shipment, _ = tms_carriers.approved_shipment(order)
+    link = db.session.get(TmsSupplierOrder, order.id)
+    if shipment.shipment_id or (link and link.state != "new"):
+        raise nextsls.ProtocolError("本票已有供应商单号或提交记录。")
+    invoice = dict(order.invoice)
+    if revoke:
+        invoice.pop(tms_carriers.CREATE_GRANT, None)
+    else:
+        agent = db.session.get(CarrierAgent, order.agent_id)
+        profile = db.session.get(TmsAgentApi, order.agent_id)
+        blockers = tms_carriers.supplier_preparation(order, profile, agent)["blockers"]
+        if blockers:
+            raise nextsls.ProtocolError("；".join(blockers) + "。")
+        invoice[tms_carriers.CREATE_GRANT] = {
+            "revision": order.revision + 1, "agent_id": order.agent_id, "service": order.agent_service,
+            "origin": profile.base_url, "actor_id": current_user.id,
+            "expires_at": int((datetime.now(timezone.utc) + timedelta(minutes=30)).timestamp()),
+        }
+    update_order(order, {"invoice": invoice})
+    history(order, "supplier_create_revoked" if revoke else "supplier_create_granted")
+    db.session.commit()
+    return "已撤销本票下单授权。" if revoke else "已授权本票下单一次，30 分钟内有效。"
 
 
 def supplier_address_corrections(order):

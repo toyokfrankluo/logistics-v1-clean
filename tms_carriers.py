@@ -1,5 +1,5 @@
 """Carrier configuration, audited supplier operations, and internal reports."""
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from hashlib import sha256
 from io import BytesIO
@@ -32,6 +32,8 @@ CHANNEL_CATALOGUE = "channel_catalogue"
 BRAND_ONLY_RULES = {"require_declaration_list": ["brand"]}
 CHANNEL_CATALOGUE_TTL = timedelta(hours=24)
 CREATE_DISABLED = "系统未开放真实下单"
+CREATE_GRANT = "nextsls_create_grant"
+CREATE_GRANT_REQUIRED = "请先授权本票真实下单"
 READ_DISABLED = "系统未开放 NextSLS 只读请求"
 BC_ORIGIN = "https://bckjkj.nextsls.com"
 
@@ -325,7 +327,19 @@ def invoice_po_rows(invoice, supplement, rules, use_invoice_po):
             == nextsls.INVOICE_PO_SOURCE]
 
 
+def current_create_grant(order, profile):
+    grant = order.invoice.get(CREATE_GRANT)
+    if not grant or not profile:
+        return None
+    if (grant["revision"], grant["agent_id"], grant["service"], grant["origin"]) != (
+            order.revision, order.agent_id, order.agent_service, profile.base_url):
+        return None
+    return grant if grant["expires_at"] > datetime.now(timezone.utc).timestamp() else None
+
+
 def approved_shipment(order):
+    if order.invoice.get("order_archive"):
+        raise nextsls.ProtocolError("订单已删除，请先恢复。")
     if not carrier_schema() or order.status != "approved":
         raise nextsls.ProtocolError("请先完成迁移与订单审核。")
     charge = db.session.get(TmsReceivable, order.id)
@@ -405,6 +419,9 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
     shipment, agent, profile, link = operation_context(order, "create")
     if shipment.shipment_id or (link and link.state != "new"):
         raise nextsls.ProtocolError("订单已有供应商单号或提交记录。请先对账，避免重复下单。")
+    grant_required = current_app.config.get("TMS_NEXTSLS_REQUIRE_ORDER_GRANT")
+    if grant_required and not current_create_grant(order, profile):
+        raise nextsls.ProtocolError(CREATE_GRANT_REQUIRED)
     code = order.agent_service or ""
     if code not in channel_catalogue(profile):
         raise nextsls.ProtocolError("审核选定的实际代理渠道尚未列入代理的已确认渠道代码。")
@@ -420,6 +437,8 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
             or order.agent_service != code or order.revision != revision
             or shipment.shipment_id or (link and link.state != "new")):
         raise nextsls.ProtocolError("订单或代理配置已变化，请刷新后重新核对。")
+    if grant_required and not current_create_grant(order, profile):
+        raise nextsls.ProtocolError(CREATE_GRANT_REQUIRED)
     link = link or ensure_link(order)
 
     rules = nextsls.preparation_rules(service)
@@ -448,6 +467,11 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
         publish_packing=(lambda: packing_publisher(packing_draft(order).getvalue()))
         if packing_publisher is not None else None,
     )
+    grant = current_create_grant(order, profile)
+    if grant_required and not grant:
+        raise nextsls.ProtocolError(CREATE_GRANT_REQUIRED)
+    if grant:
+        order.invoice = {key: value for key, value in order.invoice.items() if key != CREATE_GRANT}
     transition(link, "new", "sending", attempt_at=datetime.utcnow(), tenant_origin=origin)
     delivery_audit = {"image_rows_verified": len(order.invoice["declarations"])
                       if encoders and not isinstance(store, files.DirectStore) else 0,
@@ -456,6 +480,8 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
         delivery_audit["image_rows_published"] = len(order.invoice["declarations"])
     if po_rows := invoice_po_rows(invoice, supplement, rules, use_invoice_po):
         delivery_audit["amazon_ref_sources"] = po_rows
+    if grant:
+        delivery_audit["authorized_by"] = grant["actor_id"]
     audit(link, "attempt", actor_id, {"state": "sending", **delivery_audit})
     db.session.commit()  # Commit the one-order reservation before contacting the supplier.
 

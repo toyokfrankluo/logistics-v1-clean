@@ -1,0 +1,23 @@
+{% if deletion.allowed %}
+<div class="order-delete">
+  <button type="button" class="secondary" data-open-order-delete>删除订单</button>
+  <dialog class="work-dialog" aria-label="确认删除订单">
+    <header class="dialog-header">
+      <h2>确认删除订单</h2>
+      <form method="dialog"><button class="secondary">返回</button></form>
+    </header>
+    <div class="dialog-body">
+      <p>{{ order.invoice.customer_number }} · {{ status_labels[order.status] }}</p>
+      {% if deletion.linked %}<p class="notice">仅在星睿归档。搏诚运单与账目保留，取消请另行向承运商申请。</p>{% endif %}
+      <form method="post" action="{{ url_for('tms_staff.staff_delete_order' if staff else 'tms_client.delete_order', order_id=order.id) }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="revision" value="{{ order.revision }}">
+        <label>删除原因<textarea name="reason" maxlength="500" required></textarea></label>
+        <button>确认删除订单</button>
+      </form>
+    </div>
+  </dialog>
+</div>
+{% elif deletion.reason %}
+<small class="cell-note">{{ deletion.reason }}</small>
+{% endif %}

@@ -1,10 +1,17 @@
 {% extends "tms/layout.html" %}
-{% block title %}{{ '订单审核' if staff else '我的运单' }}{% endblock %}
+{% block title %}{{ '已删除订单' if archived else ('订单审核' if staff else '我的运单') }}{% endblock %}
 {% block content %}
 <div class="heading">
-  <div><p class="kicker">{{ '星睿管理端' if staff else '客户操作端' }}</p><h1>{{ '订单审核' if staff else '我的运单' }}</h1></div>
+  <div><p class="kicker">{{ '星睿管理端' if staff else '客户操作端' }}</p><h1>{{ '已删除订单' if archived else ('订单审核' if staff else '我的运单') }}</h1></div>
   {% if staff %}
-  <a class="button secondary" href="{{ url_for('tms_staff.accounts') }}">开通客户账号</a>
+  <div class="inline-actions">
+    {% if archived %}
+    <a class="button secondary" href="{{ url_for('tms_staff.queue') }}">返回订单审核</a>
+    {% else %}
+    <a class="button secondary" href="{{ url_for('tms_staff.deleted_orders') }}">已删除订单</a>
+    <a class="button secondary" href="{{ url_for('tms_staff.accounts') }}">开通客户账号</a>
+    {% endif %}
+  </div>
   {% else %}
   <a class="button" data-open-import href="{{ url_for('tms_client.upload') }}">＋ Excel 导入</a>
   {% endif %}
@@ -45,21 +52,32 @@
   <div class="table-wrap" tabindex="0" aria-label="运单表格，可横向滚动">
     <table class="shipment-table">
       <thead><tr><th scope="col">运单号</th><th scope="col">运输服务</th><th scope="col">收件人</th><th scope="col">目的地</th>
-        <th scope="col">箱数</th><th scope="col">申报货值</th><th scope="col">申报重量</th><th scope="col">审核状态</th><th scope="col">创建时间</th></tr></thead>
+        <th scope="col">箱数</th><th scope="col">申报货值</th><th scope="col">申报重量</th><th scope="col">审核状态</th><th scope="col">创建时间</th>{% if archived %}<th scope="col">删除记录</th>{% endif %}<th scope="col">操作</th></tr></thead>
       <tbody>
         {% for order in pagination.items %}
         {% set link = url_for('tms_staff.review' if staff else 'tms_client.detail', order_id=order.id) %}
         {% set totals = invoice_totals(order.invoice) %}
         <tr>
-          <td><a class="shipment-number" href="{{ link }}" data-order-drawer>{{ order.invoice.customer_number }}</a>{% if staff %}<small class="cell-note">XR-{{ order.id }}</small>{% endif %}</td>
+          <td>{% if archived %}{{ order.invoice.customer_number }}{% else %}<a class="shipment-number" href="{{ link }}" data-order-drawer>{{ order.invoice.customer_number }}</a>{% endif %}{% if staff %}<small class="cell-note">XR-{{ order.id }}</small>{% endif %}</td>
           <td>{{ order.invoice.service }}</td><td>{{ order.invoice.address.recipient }}</td>
           <td>{{ order.invoice.address.country }}<small class="cell-note">{{ order.invoice.address.postal_code }}{% if order.invoice.address.warehouse_code %} · 仓库 {{ order.invoice.address.warehouse_code }}{% endif %}</small></td>
           <td>{{ order.invoice.boxes|length }}</td><td>{{ totals.value }} <small>USD</small></td>
           <td>{{ totals.weight }} <small>kg</small></td><td><span class="badge {{ order.status }}">{{ status_labels[order.status] }}</span></td>
           <td>{{ business_date(order.created_at) }}</td>
+          {% if archived %}
+          {% set entry = order.invoice.order_archive %}
+          <td>{{ entry.reason }}<small class="cell-note">{{ archive_date(entry.at) }} · {{ '管理员' if entry.actor_type == 'staff' else '客户账号' }} #{{ entry.actor_id }}</small></td>
+          <td><form method="post" action="{{ url_for('tms_staff.restore_order', order_id=order.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="revision" value="{{ order.revision }}">
+            <button class="secondary">恢复订单</button>
+          </form></td>
+          {% else %}
+          <td>{% with deletion=deletion_options[order.id] %}{% include "tms/delete_order.html" %}{% endwith %}</td>
+          {% endif %}
         </tr>
         {% else %}
-        <tr><td colspan="9" class="empty">当前没有符合条件的订单。</td></tr>
+        <tr><td colspan="{{ 11 if archived else 10 }}" class="empty">当前没有符合条件的订单。</td></tr>
         {% endfor %}
       </tbody>
     </table>

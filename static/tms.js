@@ -209,3 +209,8 @@ document.addEventListener("click", event => {
   pricingPreview(form);
 });
 document.querySelectorAll("[data-pricing]").forEach(pricingPreview);
+
+document.addEventListener("click", (event) => {
+  const trigger = event.target.closest("[data-open-order-delete]");
+  if (trigger) trigger.closest(".order-delete").querySelector("dialog").showModal();
+});

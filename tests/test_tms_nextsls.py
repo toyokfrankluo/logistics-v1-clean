@@ -135,6 +135,54 @@ class NextSLSTests(unittest.TestCase):
         self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 403)
         self.assertEqual(self.get(self.alice, f"/tms/admin/orders/{order_id}/supplier/measurements.xlsx").status_code, 302)
 
+    def test_single_order_grant_is_revision_bound_consumed_and_still_requires_site_switch(self):
+        self.profile()
+        order_id = self.approve()
+        other = self.upload(self.alice, fixture.workbook_bytes(order_number="SECOND-GRANT-TEST"))
+        self.assertEqual(other.status_code, 302)
+        other_id = int(other.location.rsplit("/", 1)[1])
+        self.assertEqual(self.post(self.alice, f"/tms/customer/orders/{other_id}/confirm",
+                                   {"revision": 1}).status_code, 302)
+        self.assertEqual(self.decision(other_id, 2, decision="approve",
+                                      **self.pricing(agent_service="TMS_DEMO")).status_code, 302)
+        page = f"/tms/admin/orders/{order_id}"
+        with patch.dict(app.config, TMS_NEXTSLS_REQUIRE_ORDER_GRANT=True):
+            body = self.get(self.staff, page).get_data(as_text=True)
+            self.assertIn("等待管理员授权启用真实下单", body)
+            self.assertNotIn('name="action" value="create"', body)
+            self.assertEqual(self.action(order_id, "grant_create", confirm="yes", revision=3).status_code, 400)
+        calls = []
+
+        def fake(target, *, json, headers):
+            calls.append(target.api_url)
+            if target.api_url.endswith("/get_services"):
+                return success({"services": [SERVICE]})
+            self.assertEqual(target.api_url, ORIGIN + "/api/v5/shipment/create")
+            self.assertEqual(json["shipment"]["reference_1"], "0000123")
+            return success({"shipment": {"shipment_id": SUPPLIER_NUMBER}})
+
+        with patch.dict(app.config, TMS_NEXTSLS_REQUIRE_ORDER_GRANT=True, TMS_NEXTSLS_CREATE_ENABLED=True,
+                        TMS_NEXTSLS_READ_ENABLED=False), patch("carrier_http.post", side_effect=fake):
+            self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 400)
+            self.assertEqual(self.action(order_id, "grant_create", confirm="yes", revision=2).status_code, 400)
+            self.assertEqual(self.action(order_id, "grant_create", confirm="yes", revision=3).status_code, 302)
+            self.assertIn('name="action" value="create"', self.get(self.staff, page).get_data(as_text=True))
+            self.assertEqual(self.action(other_id, "create", confirm="yes").status_code, 400)
+            self.assertEqual(self.action(order_id, "create", confirm="yes", revision=3).status_code, 400)
+            self.assertEqual(self.action(order_id, "revoke_create", confirm="yes", revision=4).status_code, 302)
+            self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 400)
+            self.assertEqual(self.action(order_id, "grant_create", confirm="yes", revision=5).status_code, 302)
+            self.assertEqual(calls, [])
+            self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 302)
+            self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 400)
+        self.assertEqual([url.rsplit("/", 1)[-1] for url in calls], ["get_services", "create"])
+        order = db.session.get(TmsOrder, order_id)
+        self.assertNotIn(tms_carriers.CREATE_GRANT, order.invoice)
+        self.assertIsNone(db.session.get(TmsSupplierOrder, other_id))
+        body = self.get(self.staff, page).get_data(as_text=True)
+        self.assertIn(SUPPLIER_NUMBER, body)
+        self.assertIn("代理已接单", body)
+
     def test_approval_cannot_call_create_even_when_feature_is_enabled(self):
         self.profile()
         with patch.dict(app.config, TMS_NEXTSLS_CREATE_ENABLED=True), patch("carrier_http.post") as transport:
@@ -1015,7 +1063,8 @@ class NextSLSTests(unittest.TestCase):
         profile = self.profile(service_codes=[])
         path = f"/tms/admin/orders/{order_id}"
         body = self.get(self.staff, path).get_data(as_text=True)
-        for label in ("待提交代理", "提交代理下单", "TMS_DEMO", "1 Fictional Way", "Demo item", "刷新 NextSLS 渠道清单"):
+        for label in ("待提交代理", "等待管理员授权启用真实下单", "TMS_DEMO", "1 Fictional Way", "Demo item",
+                      "刷新 NextSLS 渠道清单"):
             self.assertIn(label, body)
         self.assertNotIn(TOKEN, body)
         with patch.dict(app.config, TMS_NEXTSLS_CREATE_ENABLED=True), patch(
