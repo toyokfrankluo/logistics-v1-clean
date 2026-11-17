@@ -83,8 +83,14 @@ def fetch_tracking_from_api(agent: CarrierAgent, tracking_number: str, *, select
         or not agent or selected_shipment.agent_id != agent.id
     ):
         return None, "运单身份与代理不一致"
-    if not agent or not agent.api_url or not agent.supports_api or not agent.is_active:
-        return None, "代理不支持 API 抓取"
+    if not agent:
+        return None, "未找到运单关联的代理"
+    if not agent.is_active:
+        return None, "代理已停用，请在代理管理核对状态后启用轨迹查询"
+    if not agent.supports_api:
+        return None, "代理未启用 API 查询，请在代理管理核对配置"
+    if not agent.api_url:
+        return None, "代理未配置轨迹 API 地址"
 
     try:
         host = (urlsplit(agent.api_url).hostname or "").rstrip(".").lower()

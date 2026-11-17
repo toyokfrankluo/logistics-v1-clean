@@ -274,6 +274,22 @@ class NextSLSTests(unittest.TestCase):
         self.assertEqual(Shipment.query.count(), 1)
         self.assertEqual(self.post(self.staff, f"/shipments/{shipment.id}/edit", {"shipment_id": "WRONG"}, "/login").status_code, 409)
 
+    def test_tracking_reports_inactive_agent_before_any_outbound_request(self):
+        self.staff_login()
+        self.agent.api_url = ORIGIN + "/api/v5/shipment/get_tracking"
+        self.agent.app_token = TOKEN
+        self.agent.is_active = False
+        db.session.add(Shipment(tracking_number="LOCAL-INACTIVE", shipment_id="PROVIDER-INACTIVE",
+                                agent_id=self.agent.id, customer_id=self.customer_a.id))
+        db.session.commit()
+        page = self.post(self.staff, "/track", {"numbers": "LOCAL-INACTIVE"}, "/login")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("代理已停用", page.get_data(as_text=True))
+        self.assertNotIn("代理不支持 API 抓取", page.get_data(as_text=True))
+        self.assertNotIn(TOKEN, page.get_data(as_text=True))
+        self.carrier_post.assert_not_called()
+        self.assertFalse(self.agent.is_active)
+
     def test_tracking_dispatches_per_agent_without_legacy_url(self):
         self.staff_login()
         for index in (1, 2):
