@@ -813,8 +813,19 @@ def assignment_channel_state(order, agent, profile):
             error = ("渠道清单已过期或该账号没有返回渠道，请在代理设置刷新。"
                      if tms_carriers.CHANNEL_CATALOGUE in profile.verified
                      else "此供应商尚未读取渠道，请在代理设置刷新。")
+    requirements = {}
+    for code in catalogue:
+        rules = tms_carriers.channel_rules(profile, code)
+        requirements[code] = ({"declarations": rules["require_declaration_list"],
+                              "packing": bool(rules["packing_list_required"]),
+                              "sender": rules["from_address"],
+                              "photos_confirmed": bool(tms_carriers.images.photos_encoder(profile, code)),
+                              "missing": nextsls.missing_supplements(order.invoice,
+                                  tms_carriers.order_supplement(order), rules,
+                                  use_invoice_po=tms_carriers.invoice_po_allowed(profile, code))}
+                             if rules is not None else None)
     return {"managed": managed, "catalogue": catalogue, "recommended": recommended, "binding": binding,
-            "error": error}
+            "error": error, "requirements": requirements}
 
 
 @staff.post("/orders/<int:order_id>/supplier-channels")

@@ -20,4 +20,5 @@
     <p class="muted" data-channel-empty role="status"{% if not state.error %} hidden{% endif %}>{{ state.error or '' }}</p>
     <a data-channel-settings{% if managed and state.error %} href="{{ url_for('views.edit_agent', agent_id=active_agent, _anchor='channel-mapping') }}"{% else %} hidden{% endif %}>前往该供应商设置刷新渠道</a>
   </div>
+  <p class="notice" data-channel-requirements role="status" hidden></p>
 </div>

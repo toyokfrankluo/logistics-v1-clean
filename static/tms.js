@@ -172,6 +172,24 @@ document.addEventListener("input", event => {
   }
 });
 const supplierLoads = new WeakMap();
+const supplierRequirements = new WeakMap();
+function showSupplierRequirements(root) {
+  const code = root.querySelector("[data-channel-picker] select").value;
+  const output = root.querySelector("[data-channel-requirements]");
+  output.hidden = !code;
+  if (!code) return;
+  const rule = supplierRequirements.get(root)?.[code];
+  if (!rule) { output.textContent = "供应商尚未提供此渠道的完整规则，创建前须核实。"; return; }
+  const labels = {brand:"品牌", model:"型号", sku:"商品 SKU", sale_url:"销售链接", amazon_ref_id:"Amazon 参考号",
+    is_magnetic:"真实带磁属性", is_battery:"真实带电属性", photos:"商品图片", photo_url:"图片链接",
+    name_zh:"中文品名", name_en:"英文品名", material:"材质", usage:"用途", hscode:"HS 编码", qty:"数量", unit_value:"申报单价"};
+  const required = rule.declarations.map(key=>labels[key] || key).join("、") || "未额外指定申报字段";
+  const missing = [...new Set(Object.values(rule.missing).flat())].map(key=>labels[key] || key);
+  output.textContent = `本渠道要求：${required}。${rule.packing ? "装箱单由系统自动生成。" : "无需单独装箱单。"}` +
+    (missing.length ? `尚缺真实资料：${missing.join("、")}。` : "") +
+    (rule.declarations.includes("photos") && !rule.photos_confirmed ? "photos 图片编码协议仍待该供应商确认。" : "") +
+    (["yes","required"].includes(rule.sender) ? "还需核对供应商配置中的发件地址。" : "");
+}
 async function loadSupplierChannels(root, preserve = false) {
   supplierLoads.get(root)?.abort();
   root.removeAttribute("aria-busy");
@@ -193,6 +211,8 @@ async function loadSupplierChannels(root, preserve = false) {
   if (!preserve) input.value = "";
   picker.querySelector("[data-channel-search]").value = "";
   scope.value = "";
+  supplierRequirements.delete(root);
+  root.querySelector("[data-channel-requirements]").hidden = true;
   picker.hidden = false;
   select.disabled = manual.hidden = input.disabled = settings.hidden = search.hidden = status.hidden = true;
   if (!agent.value) return;
@@ -224,6 +244,8 @@ async function loadSupplierChannels(root, preserve = false) {
       select.value = previous;
     }
     scope.value = data.binding;
+    supplierRequirements.set(root, data.requirements);
+    showSupplierRequirements(root);
     select.disabled = search.hidden = false;
     status.hidden = true;
   } catch {
@@ -244,6 +266,7 @@ document.addEventListener("change", event => {
   const confirmed = event.target.form.elements.namedItem("assignment_confirmed");
   if (confirmed && ["agent_id", "agent_service"].includes(event.target.name)) confirmed.checked = false;
   if (event.target.name === "agent_id") loadSupplierChannels(picker);
+  if (event.target.name === "agent_service") showSupplierRequirements(picker);
 });
 document.addEventListener("click", event => {
   const button = event.target.closest("[data-add-fee], [data-remove-fee]");
