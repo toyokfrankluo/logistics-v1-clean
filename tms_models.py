@@ -144,3 +144,16 @@ class TmsSupplierEvent(db.Model, TimestampMixin):
     kind = db.Column(db.String(16), nullable=False)
     actor_id = db.Column(db.Integer, nullable=False)
     details = db.Column(db.JSON, nullable=False)
+
+
+class TmsSupplierFile(db.Model):
+    """An expiring snapshot of a single file, issued to the approved carrier."""
+    __tablename__ = "tms_supplier_file"
+    id = db.Column(db.String(32), primary_key=True)
+    order_id = db.Column(db.Integer, db.ForeignKey("tms_order.id", ondelete="CASCADE"),
+                         nullable=False, index=True)
+    customer_id = db.Column(db.Integer, nullable=False)
+    agent_id = db.Column(db.Integer, nullable=False)
+    mime = db.Column(db.String(100), nullable=False)
+    expires_at = db.Column(db.BigInteger, nullable=False, index=True)
+    content = db.Column(db.LargeBinary, nullable=False)

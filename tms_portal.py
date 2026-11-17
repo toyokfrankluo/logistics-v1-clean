@@ -12,7 +12,7 @@ from zipfile import BadZipFile, ZipFile
 
 import click
 from flask import (
-    Blueprint, abort, current_app, flash, g, redirect, render_template, request,
+    Blueprint, abort, current_app, flash, g, jsonify, redirect, render_template, request,
     send_file, session, url_for,
 )
 from flask_login import current_user
@@ -39,7 +39,8 @@ from tms_xlsx_images import PhotoError, read_photo
 import nextsls
 import tms_carriers
 import tms_measurements as measurements
-from tms_models import TmsAgentApi, TmsSupplierEvent, TmsSupplierOrder
+from tms_models import TmsAgentApi, TmsSupplierEvent, TmsSupplierFile, TmsSupplierOrder
+import tms_supplier_files
 
 client = Blueprint("tms_client", __name__, url_prefix="/tms/customer")
 staff = Blueprint("tms_staff", __name__, url_prefix="/tms/admin")
@@ -98,6 +99,7 @@ def init_tms(app):
         app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
     app.register_blueprint(client)
     app.register_blueprint(staff)
+    tms_supplier_files.init_app(app)
 
     @app.before_request
     def check_tms_availability():
@@ -113,7 +115,7 @@ def init_tms(app):
     def protect_tms_responses(response):
         if request.blueprint in {client.name, staff.name}:
             response.headers["Cache-Control"] = "private, no-store"
-            response.headers["Referrer-Policy"] = "same-origin"
+            response.headers.setdefault("Referrer-Policy", "same-origin")
             response.headers["X-Robots-Tag"] = "noindex, nofollow"
             response.headers["X-Content-Type-Options"] = "nosniff"
         return response
@@ -156,7 +158,7 @@ def create_tms_schema():
         if connection.dialect.name == "postgresql":
             connection.execute(text("SELECT pg_advisory_xact_lock(651360348)"))
         for model in (TmsAccount, TmsAddressBook, TmsOrder, TmsAudit, TmsReceivable, TmsChargeAdjustment,
-                      TmsAgentApi, TmsSupplierOrder, TmsSupplierEvent):
+                      TmsAgentApi, TmsSupplierOrder, TmsSupplierEvent, TmsSupplierFile):
             model.__table__.create(connection, checkfirst=True)
 
 
@@ -931,7 +933,8 @@ def save_supplier_supplement(order, form):
     if rules is None:
         rules = tms_carriers.BRAND_ONLY_RULES
     prior = tms_carriers.order_supplement(order)
-    missing = nextsls.missing_supplements(order.invoice, prior, rules)
+    missing = nextsls.missing_supplements(order.invoice, prior, rules,
+                                         use_invoice_po=tms_carriers.invoice_po_allowed(profile, order.agent_service))
     allowed = {f"supplement_{index}_{field}" for index, fields in missing.items() for field in fields}
     if profile.base_url == tms_carriers.BC_ORIGIN:
         allowed.update(f"supplement_{index}_no_model" for index, fields in missing.items() if "model" in fields)
@@ -1021,6 +1024,30 @@ def supplier_packing_draft(order_id):
     except nextsls.ProtocolError:
         abort(404)
     return send_file(tms_carriers.packing_draft(order), download_name="packing-draft.xlsx", as_attachment=True)
+
+
+@staff.post("/orders/<int:order_id>/supplier/files-check")
+def supplier_files_check(order_id):
+    order = reviewable_order(order_id)
+    db.session.refresh(order, with_for_update=True)
+    if request.form.get("revision", type=int) != order.revision:
+        return jsonify(error="订单已更新，请刷新页面后重新验收。"), 409
+    try:
+        tms_carriers.approved_shipment(order)
+        profile = tms_carriers.agent_profile(order.agent_id)
+        if not profile or order.invoice.get("supplier_tenant_origin", profile.base_url) != profile.base_url:
+            raise nextsls.ProtocolError("订单与已审核的代理账号不一致。")
+        manifest, draft = tms_carriers.preview_supplier_files(order, profile)
+        db.session.commit()
+    except nextsls.ProtocolError as error:
+        db.session.rollback()
+        return jsonify(error=str(error)), 400
+    except SQLAlchemyError:
+        db.session.rollback()
+        return jsonify(error="文件服务暂时无法保存验收文件，请稍后重试。"), 503
+    response = jsonify(files=manifest, draft=draft)
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
 
 
 @staff.post("/orders/<int:order_id>/decision")

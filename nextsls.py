@@ -41,9 +41,9 @@ REQUIRED_FLAGS = ("tel_required", "email_required", "company_required", "city_re
                   "vat_number_required", "eori_required", "packing_list_required")
 DESTINATION_PLACEHOLDER_BLOCKER = "收件地址含未经核对的历史模板占位值，请更正后再提交"
 PHOTOS_PROTOCOL_BLOCKER = "渠道要求 photos，图片传输格式尚待供应商确认"
-PHOTOS_STORAGE_BLOCKER = "渠道要求 photos，请配置用于发布签名 HTTPS 图片链接的私有存储"
+PHOTOS_STORAGE_BLOCKER = "渠道要求 photos，签名 HTTPS 图片链接暂不可用"
 PHOTO_URL_PUBLICATION_BLOCKER = "商品图片链接传输尚未获准"
-PACKING_TRANSMISSION_BLOCKER = "渠道要求装箱单，自动发布所需的私有存储尚未配置"
+PACKING_TRANSMISSION_BLOCKER = "渠道要求装箱单，签名 HTTPS 文件链接暂不可用"
 UNSUPPORTED_DECLARATION_BLOCKER = "当前发票映射不支持该渠道的全部必填申报字段"
 IMAGE_FIELDS = frozenset({"photo_url", "photos"})
 
@@ -217,33 +217,54 @@ def supplemental_value(invoice, field, value, *, confirmed_po=False):
                            if row.get("amazon_po_candidate"))
         invalid.update(box["box_number"].casefold() for box in invoice["boxes"])
         if value.casefold() in invalid or re.fullmatch(r"FBA[A-Z0-9]{9}", value, re.I):
-            raise ProtocolError("Amazon 参考号须来自 Amazon 货件资料。PO 需单独核实，客户单号、FBA 单号、箱号和占位值不可使用。")
+            raise ProtocolError("请使用该渠道接受的真实参考号。客户单号、FBA 单号、箱号和占位值不可使用。")
     return value
 
 
-def declaration_supplements(invoice, supplement, index, fields):
+INVOICE_PO_SOURCE = "客户原始发票 PO"
+
+
+def amazon_reference(invoice, supplement, index, *, use_invoice_po=False):
+    row = invoice["declarations"][index]
+    saved = supplement.get("declarations", {}).get(str(index), {})
+    for value in (row.get("amazon_ref_id"), saved.get("amazon_ref_id")):
+        try:
+            return supplemental_value(invoice, "amazon_ref_id", value), "已录入参考号"
+        except ProtocolError:
+            continue
+    if has_line_amazon_po(invoice):
+        confirmation = invoice.get("amazon_po_line_confirmations", {}).get(str(index), {})
+        po = row.get("amazon_po_candidate")
+    else:
+        confirmation = invoice.get("amazon_po_confirmation", {})
+        po = invoice["metadata"]["po_number"]
+    confirmed = bool(po and confirmation.get("value") == po and confirmation.get("by")
+                     and confirmation.get("reason"))
+    if po and (confirmed or use_invoice_po):
+        try:
+            value = supplemental_value(invoice, "amazon_ref_id", po, confirmed_po=True)
+            return value, INVOICE_PO_SOURCE if use_invoice_po else "已核对发票 PO"
+        except ProtocolError:
+            pass
+    return None, None
+
+
+def declaration_supplements(invoice, supplement, index, fields, *, use_invoice_po=False):
     saved = supplement.get("declarations", {}).get(str(index), {})
     declared = invoice["declarations"][index]
     result = {}
     for field in fields:
+        if field == "amazon_ref_id":
+            value, _ = amazon_reference(invoice, supplement, index, use_invoice_po=use_invoice_po)
+            if value is not None:
+                result[field] = value
+            continue
         for value in (declared.get(field), saved.get(field)):
             try:
                 result[field] = supplemental_value(invoice, field, value)
                 break
             except ProtocolError:
                 continue
-    if "amazon_ref_id" in fields and "amazon_ref_id" not in result:
-        if has_line_amazon_po(invoice):
-            confirmation = invoice.get("amazon_po_line_confirmations", {}).get(str(index), {})
-            po = declared.get("amazon_po_candidate")
-        else:
-            confirmation = invoice.get("amazon_po_confirmation", {})
-            po = invoice["metadata"]["po_number"]
-        if po and confirmation.get("value") == po and confirmation.get("by") and confirmation.get("reason"):
-            try:
-                result["amazon_ref_id"] = supplemental_value(invoice, "amazon_ref_id", po, confirmed_po=True)
-            except ProtocolError:
-                pass
     return result
 
 
@@ -251,11 +272,11 @@ def has_line_amazon_po(invoice):
     return any(row.get("amazon_po_candidate") for row in invoice["declarations"])
 
 
-def missing_supplements(invoice, supplement, rules):
+def missing_supplements(invoice, supplement, rules, *, use_invoice_po=False):
     required = [field for field in SUPPLEMENTAL_DECLARATIONS if field in rules["require_declaration_list"]]
     missing = {}
     for index, _ in enumerate(invoice["declarations"]):
-        values = declaration_supplements(invoice, supplement, index, required)
+        values = declaration_supplements(invoice, supplement, index, required, use_invoice_po=use_invoice_po)
         if len(values) < len(required):
             missing[index] = [field for field in required if field not in values]
     return missing
@@ -294,7 +315,7 @@ def unverified_destination_fields(invoice):
 
 def create_payload(invoice, code, reference, profile, sender, *, supplement=None, packing_host="",
                    publish_photos=None, publish_packing=None, image_fields=(), publish_image_fields=None,
-                   photos_protocol_confirmed=False, preflight=False):
+                   photos_protocol_confirmed=False, use_invoice_po=False, preflight=False):
     """Translate a reviewed invoice; do not manufacture fields missing for the selected service."""
     if not CODE.fullmatch(code) or not CODE.fullmatch(reference):
         raise ProtocolError("渠道代码或系统对账参考号无效。")
@@ -373,7 +394,7 @@ def create_payload(invoice, code, reference, profile, sender, *, supplement=None
     if unsupported:
         known = sorted(set(unsupported) & {"amazon_ref_id", "brand", "model", "photos", "weight", "size"})
         blockers.append(UNSUPPORTED_DECLARATION_BLOCKER + (f"（{', '.join(known)}）" if known else ""))
-    missing = missing_supplements(invoice, supplement, profile)
+    missing = missing_supplements(invoice, supplement, profile, use_invoice_po=use_invoice_po)
     missing_fields = [label for field, label in SUPPLEMENTAL_DECLARATIONS.items()
                       if any(field in fields for fields in missing.values())]
     if missing_fields:
@@ -403,7 +424,8 @@ def create_payload(invoice, code, reference, profile, sender, *, supplement=None
     fields = [key for key in SUPPLEMENTAL_DECLARATIONS if key in requirements]
     for index, item in enumerate(invoice["declarations"]):
         declaration = {target: supplied_text(item.get(source)) for target, source in DECLARATIONS.items()}
-        declaration.update(declaration_supplements(invoice, supplement, index, fields))
+        declaration.update(declaration_supplements(invoice, supplement, index, fields,
+                                                    use_invoice_po=use_invoice_po))
         qty = item["quantity"]
         if type(qty) is not int or qty <= 0:
             raise ProtocolError("产品申报数量无效。")

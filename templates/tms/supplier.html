@@ -14,16 +14,17 @@
     <div><dt>客户 / FBA 单号</dt><dd>{{ invoice.customer_number }}</dd></div>
     {% if invoice.metadata.po_number %}
     <div><dt>原发票 D14 PO</dt><dd>{{ invoice.metadata.po_number }} ·
-      {% if invoice.amazon_po_confirmation and invoice.amazon_po_confirmation.value == invoice.metadata.po_number %}
-      已核实为 Amazon Reference ID
-      {% else %}尚未核实为 Amazon Reference ID{% endif %}</dd></div>
+      {% if preparation.invoice_header_po_used %}按搏诚渠道映射为 Amazon Reference ID（客户原始发票 PO）
+      {% elif invoice.amazon_po_confirmation and invoice.amazon_po_confirmation.value == invoice.metadata.po_number %}
+      已核对为 Amazon Reference ID
+      {% else %}原发票参考号{% endif %}</dd></div>
     {% endif %}
     <div><dt>代理</dt><dd>{{ supplier.agent_name }}</dd></div>
     <div><dt>实际代理渠道</dt><dd>{{ invoice.supplier_channel.name ~ ' · ' if invoice.supplier_channel else '' }}{{ order.agent_service }}</dd></div>
     <div><dt>箱数</dt><dd>{{ invoice.boxes|length }}</dd></div>
     <div><dt>申报信息</dt><dd>{{ invoice.declarations|length }} 项 · {{ totals.value }} USD · {{ invoice.metadata.declaration_mode }}</dd></div>
     <div><dt>商品图片</dt><dd>从星睿 Excel 识别 {{ preparation.image_count }} / {{ invoice.declarations|length }} 张</dd></div>
-    <div><dt>图片传输配置</dt><dd>{% if preparation.photo_delivery_ready %}已配置，提交时自动验证图片
+    <div><dt>图片传输配置</dt><dd>{% if preparation.photo_delivery_ready %}提交时自动生成 HTTPS 图片链接
       {% elif preparation.required_photo_fields %}
       {{ preparation.required_photo_fields|join('、') }} 为本渠道必填，真实传输未配置
       {% elif preparation.required_photo_fields is none %}等待当前渠道规则
@@ -34,12 +35,23 @@
     <div><dt>供应商读取图片</dt><dd>尚未验证</dd></div>
     <div><dt>本票创建验收</dt><dd>未提交</dd></div>
     <div><dt>装箱单</dt><dd>{% if preparation.packing_required is true %}
-      {% if preparation.packing_delivery_ready %}提交时自动生成并验证装箱单链接。{% else %}自动发布所需的私有存储尚未配置。{% endif %}
+      {% if preparation.packing_delivery_ready %}提交时自动生成装箱单的 HTTPS 链接。{% else %}HTTPS 文件服务暂未就绪。{% endif %}
       <a href="{{ url_for('tms_staff.supplier_packing_draft', order_id=order.id) }}">下载草稿</a>
       {% elif preparation.packing_required is false %}本渠道无需单独装箱单
       {% else %}等待渠道规则确认{% endif %}</dd></div>
     <div><dt>目的地</dt><dd>{{ invoice.address.recipient }} · {{ [invoice.address.street, invoice.address.street2, invoice.address.street3, invoice.address.city, invoice.address.region, invoice.address.postal_code, invoice.address.country]|select|join(' · ') }}</dd></div>
   </dl>
+  {% if preparation.invoice_po_rows and not preparation.invoice_header_po_used %}
+  <p>按搏诚渠道使用客户原始发票 PO：{{ preparation.invoice_po_rows|length }} 个申报行。</p>
+  {% endif %}
+  {% if preparation.direct_files_ready %}
+  <form method="post" action="{{ url_for('tms_staff.supplier_files_check', order_id=order.id) }}" data-supplier-files-check>
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="revision" value="{{ order.revision }}">
+    <button type="submit" class="secondary">验收图片与装箱单链接</button>
+    <p role="status"></p>
+  </form>
+  {% endif %}
   {% if preparation.omitted_address_fields %}<p class="notice">原始发票可核实的可选地址占位值将在请求中省略（{{ preparation.omitted_address_fields|length }} 项），原资料保留。</p>{% endif %}
   <ul>{% for item in invoice.declarations %}<li>{{ item.box_number }} · {{ item.name_zh }} / {{ item.name_en }} · {{ item.quantity }} 件 · {{ item.total_usd }} USD</li>{% endfor %}</ul>
   {% if preparation.blockers %}
@@ -81,8 +93,8 @@
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <input type="hidden" name="revision" value="{{ order.revision }}">
       {% if preparation.amazon_po_candidate %}
-      <p>FBA / 客户单号 {{ invoice.customer_number }} 独立保存。仅当 Amazon Seller Central 确认 PO {{ invoice.metadata.po_number }} 就是本票 Reference ID 时，才勾选下方确认。</p>
-      <label class="check-label"><input type="checkbox" name="confirm_amazon_po" value="yes">已在 Amazon Seller Central 核实此 PO 是本票 Amazon Reference ID</label>
+      <p>请通过货主的货件资料或承运商核对 PO {{ invoice.metadata.po_number }} 是否是该渠道接受的参考号。</p>
+      <label class="check-label"><input type="checkbox" name="confirm_amazon_po" value="yes">已核对此 PO 可用于本票 Amazon Reference ID</label>
       <label>核对依据<input name="amazon_po_reason" maxlength="200"></label>
       {% endif %}
       {% for row_index, fields in preparation.missing.items() %}
@@ -92,9 +104,9 @@
         <div class="pricing-grid">
         {% for key in fields %}
         <label>{{ supplier.supplement_fields[key] }}<input name="supplement_{{ row_index }}_{{ key }}" maxlength="120"
-          {% if key == 'amazon_ref_id' %}placeholder="从 Amazon 货件详情核对 Reference ID"{% endif %}></label>
+          {% if key == 'amazon_ref_id' %}placeholder="填入货主或承运商提供的真实参考号"{% endif %}></label>
         {% if key == 'amazon_ref_id' and row.amazon_po_candidate %}
-        <label class="check-label"><input type="checkbox" name="confirm_amazon_po_line_{{ row_index }}" value="yes">已在 Seller Central 核实本行 PO {{ row.amazon_po_candidate }} 为参考号</label>
+        <label class="check-label"><input type="checkbox" name="confirm_amazon_po_line_{{ row_index }}" value="yes">已核对本行 PO {{ row.amazon_po_candidate }} 可用于该渠道</label>
         <label>本行核对依据<input name="amazon_po_line_reason_{{ row_index }}" maxlength="200"></label>
         {% endif %}
         {% if key == 'model' and preparation.allow_no_model %}<label class="check-label"><input type="checkbox" name="supplement_{{ row_index }}_no_model" value="yes">无型号</label>{% endif %}

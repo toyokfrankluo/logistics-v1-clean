@@ -9,13 +9,14 @@ from urllib.parse import parse_qs, urlsplit
 from flask import current_app
 
 import nextsls
+import tms_supplier_files as direct
 from tms_xlsx_images import MAX_PHOTO_BYTES, MAX_PHOTO_TOTAL_BYTES
 
 
 # Use (tenant, None) for a verified tenant-wide contract or (tenant, channel) for a verified exception.
 CONFIRMED_PHOTOS_ENCODERS = {("https://bckjkj.nextsls.com", None): nextsls.product_photo_url}
 IMAGE_TYPES = {"image/png": "png", "image/jpeg": "jpg"}
-MEDIA_ERROR = "商品图片未能通过私有存储的 HTTPS 读取校验，未提交代理下单。"
+MEDIA_ERROR = "未能生成可读取的 HTTPS 商品图片链接，未提交代理下单。"
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,12 @@ def photos_encoder(profile, channel):
 
 
 def media_store(order, profile):
+    # The site's own signed file URLs are the default. Existing S3 settings
+    # can still be used by installations without a direct HTTPS origin.
+    return direct.direct_store(order, profile) or s3_media_store(order, profile)
+
+
+def s3_media_store(order, profile):
     config = current_app.config
     account_scope = f"{order.agent_id}|{profile.base_url}"
     legacy_scope = f"{account_scope}|{order.agent_service}"
@@ -97,35 +104,38 @@ def image_get(host, target, *, read_content, limit=MAX_PHOTO_BYTES):
         connection.close()
 
 
-def publish_images(store, order, profile, photos, encoders):
-    """Publish only the images in this order, then fetch each signed URL over HTTPS."""
-    if current_app.config.get("ISOLATED_MODE"):
-        raise nextsls.ProtocolError("隔离模式禁止真实图片上传。")
+def publish_images(store, order, profile, photos, encoders, *, preview=False):
+    """Publish only the original image associated with each declaration."""
     if (profile.agent_id != order.agent_id or not photos or len(photos) != len(order.invoice["declarations"])
             or not encoders or not encoders.keys() <= nextsls.IMAGE_FIELDS
             or any(mime not in IMAGE_TYPES or type(data) is not bytes or not 0 < len(data) <= MAX_PHOTO_BYTES
                    for mime, data in photos) or sum(len(data) for _, data in photos) > MAX_PHOTO_TOTAL_BYTES):
         raise nextsls.ProtocolError(MEDIA_ERROR)
     files = [(str(index), IMAGE_TYPES[mime], mime, data) for index, (mime, data) in enumerate(photos)]
-    urls = publish_files(store, order, profile, files, MEDIA_ERROR)
+    urls = publish_files(store, order, profile, files, MEDIA_ERROR, preview=preview)
     try:
         return [{name: encoder(url) for name, encoder in encoders.items()} for url in urls]
     except Exception:
         raise nextsls.ProtocolError(MEDIA_ERROR) from None
 
 
-PACKING_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-PACKING_ERROR = "装箱单未通过私有存储的 HTTPS 读取校验，未提交代理下单。"
+PACKING_MIME = direct.PACKING_MIME
+PACKING_ERROR = "未能生成可读取的 HTTPS 装箱单链接，未提交代理下单。"
 
 
-def publish_packing(store, order, profile, data):
+def publish_packing(store, order, profile, data, *, preview=False):
     if not data or len(data) > MAX_PHOTO_TOTAL_BYTES:
         raise nextsls.ProtocolError(PACKING_ERROR)
-    return publish_files(store, order, profile, [("packing", "xlsx", PACKING_MIME, data)], PACKING_ERROR)[0]
+    return publish_files(store, order, profile, [("packing", "xlsx", PACKING_MIME, data)], PACKING_ERROR,
+                         preview=preview)[0]
 
 
-def publish_files(store, order, profile, files, error):
-    if current_app.config.get("ISOLATED_MODE") or profile.agent_id != order.agent_id:
+def publish_files(store, order, profile, files, error, *, preview=False):
+    if profile.agent_id != order.agent_id:
+        raise nextsls.ProtocolError(error)
+    if isinstance(store, direct.DirectStore):
+        return direct.stage_files(store, order, files, preview=preview)
+    if current_app.config.get("ISOLATED_MODE") or preview:
         raise nextsls.ProtocolError(error)
     scope = f"{profile.base_url}|{order.agent_id}|{order.agent_service}|{order.id}|{order.revision}"
     prefix = sha256(scope.encode()).hexdigest()

@@ -26,6 +26,59 @@ function regularClick(event) {
     !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey;
 }
 
+// Test the same public HTTPS route that the carrier uses, without the admin session.
+document.addEventListener("submit", async (event) => {
+  const form = event.target;
+  if (!form.matches("form[data-supplier-files-check]")) return;
+  event.preventDefault();
+  const button = form.querySelector("button");
+  const status = form.querySelector("[role=status]");
+  if (button.disabled) return;
+  button.disabled = true;
+  status.textContent = "正在验收外部读取…";
+  const getOptions = {
+    credentials: "omit", cache: "no-store", redirect: "error", referrerPolicy: "no-referrer",
+  };
+  try {
+    const prepared = await fetch(form.action, {
+      method: "POST", body: new FormData(form), credentials: "same-origin",
+      cache: "no-store", redirect: "error",
+    });
+    const manifest = await prepared.json();
+    if (!prepared.ok) {
+      status.textContent = manifest.error || "无法准备验收文件。";
+      return;
+    }
+    let images = 0;
+    const attachments = [];
+    for (const file of manifest.files) {
+      const url = new URL(file.url);
+      if (url.origin !== window.location.origin || url.protocol !== "https:") throw new Error();
+      const unsigned = await fetch(new URL(url.pathname, url.origin), getOptions);
+      if (unsigned.status !== 404) throw new Error();
+      const download = await fetch(url, getOptions);
+      if (!download.ok || download.headers.get("content-type") !== file.mime) throw new Error();
+      const bytes = await download.arrayBuffer();
+      const hash = await crypto.subtle.digest("SHA-256", bytes);
+      const hex = Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, "0")).join("");
+      if (bytes.byteLength !== file.bytes || hex !== file.sha256) throw new Error();
+      if (file.mime.startsWith("image/")) images++;
+      else if (url.pathname.endsWith("/packing.xlsx") && file.url.length <= 500) attachments.push(file.url.length);
+      else throw new Error();
+    }
+    if (!images || attachments.length !== 1) throw new Error();
+    const draft = manifest.draft;
+    const draftStatus = draft.error ? `下单预览：${draft.error}`
+      : draft.combined ? `下单预览同时包含图片和装箱单，${draft.po_rows} 行使用客户原始发票 PO。`
+      : "下单预览已通过当前渠道规则。";
+    status.textContent = `外部 HTTPS 验收通过：${images} 张商品图及 packing.xlsx 均无 Cookie 读取成功，字节一致；无签名请求被拒绝。装箱单链接 ${attachments[0]} 字符。${draftStatus}`;
+  } catch {
+    status.textContent = "外部 HTTPS 验收未通过。请刷新订单页后重试。";
+  } finally {
+    button.disabled = false;
+  }
+});
+
 const importDialog = document.getElementById("import-dialog");
 if (typeof importDialog?.showModal === "function") {
   document.querySelectorAll("[data-open-import]").forEach(link => {

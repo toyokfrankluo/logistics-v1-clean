@@ -4,9 +4,11 @@ from functools import partial
 from hashlib import sha256
 from io import BytesIO
 import re
+from time import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
+from urllib.parse import urlsplit
 
 from openpyxl import load_workbook
 
@@ -14,10 +16,12 @@ import carrier_http
 import nextsls
 import test_tms_portal as fixture
 import tms_carriers
+import tms_supplier_files
 import tms_supplier_images
 from app import app
 from models import BankAccount, CarrierAgent, Customer, ManualTrack, Shipment, db
-from tms_models import TmsAccount, TmsAgentApi, TmsAudit, TmsOrder, TmsReceivable, TmsSupplierEvent, TmsSupplierOrder
+from tms_models import (TmsAccount, TmsAgentApi, TmsAudit, TmsOrder, TmsReceivable,
+                        TmsSupplierEvent, TmsSupplierFile, TmsSupplierOrder)
 
 
 ORIGIN = "https://demo.nextsls.com"
@@ -555,6 +559,108 @@ class NextSLSTests(unittest.TestCase):
         self.assertEqual(transport.call_count, 1)
         self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
 
+    def test_bc_creates_with_direct_media_and_reviewed_invoice_po_without_s3(self):
+        origin, code = tms_carriers.BC_ORIGIN, "B009-MD"
+        rule = SERVICE | {"code": code, "packing_list_required": 1,
+                          "require_declaration_list": ["photos", "amazon_ref_id", "brand", "model",
+                                                       "hscode", "material", "name_en", "name_zh", "qty",
+                                                       "unit_value", "usage"]}
+        profile = self.profile(base_url=origin, service_codes=[code], rules={code: nextsls.preparation_rules(rule)})
+        self.agent.api_url = ""
+        db.session.commit()
+        order_id = self.pending_order()
+        self.assertEqual(self.decision(order_id, 2, decision="approve", **self.pricing(agent_service=code)).status_code,
+                         302)
+        order = db.session.get(TmsOrder, order_id)
+        self.assertEqual(self.action(order_id, "prepare", revision=order.revision,
+                                     **{f"supplement_{i}_{field}": value
+                                        for i in range(len(order.invoice["declarations"]))
+                                        for field, value in (("brand", "无"), ("no_model", "yes"))}).status_code, 302)
+        db.session.refresh(order)
+        original = order.workbook
+        po = order.invoice["metadata"]["po_number"]
+        checked = f"/tms/admin/orders/{order_id}/supplier/files-check"
+        anonymous = app.test_client(use_cookies=False)
+        self.assertEqual(anonymous.post(checked, data={"revision": order.revision}).status_code, 302)
+
+        def unauthenticated_get(url):
+            target = urlsplit(url)
+            self.assertEqual(target.netloc, "files.example.com")
+            return anonymous.get(f"{target.path}?{target.query}")
+
+        with patch.dict(app.config, TMS_NEXTSLS_FILE_ORIGIN="https://files.example.com",
+                        TMS_NEXTSLS_CREATE_ENABLED=False):
+            page = self.get(self.staff, f"/tms/admin/orders/{order_id}").get_data(as_text=True)
+            self.assertIn("客户原始发票 PO", page)
+            self.assertIn("验收图片与装箱单链接", page)
+            self.assertNotIn("请逐条补充申报", page)
+            result = self.post(self.staff, checked, {"revision": order.revision}, "/login")
+            self.assertEqual(result.status_code, 200)
+            self.assertEqual(result.headers["Referrer-Policy"], "no-referrer")
+            manifest = result.json
+            self.assertEqual(manifest["draft"], {"combined": True, "po_rows": 3})
+            self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
+            self.carrier_post.assert_not_called()
+            for resource in manifest["files"]:
+                target = urlsplit(resource["url"])
+                self.assertEqual(anonymous.get(target.path).status_code, 404)
+                received = unauthenticated_get(resource["url"])
+                self.assertEqual((received.status_code, received.mimetype), (200, resource["mime"]))
+                self.assertEqual(received.headers["Cache-Control"], "private, no-store")
+                self.assertEqual(sha256(received.data).hexdigest(), resource["sha256"])
+                self.assertEqual(len(received.data), resource["bytes"])
+            photo_url, packing_url = manifest["files"][0]["url"], manifest["files"][-1]["url"]
+            self.assertEqual(unauthenticated_get(photo_url).data, fixture.PNG)
+            self.assertEqual(unauthenticated_get(photo_url.replace("/photo.png?", "/packing.xlsx?")).status_code, 404)
+            self.assertEqual(unauthenticated_get(photo_url + "x").status_code, 404)
+            self.assertLessEqual(len(packing_url), 500)
+            packing = load_workbook(BytesIO(unauthenticated_get(packing_url).data), read_only=True)
+            self.assertEqual(packing.sheetnames, ["货箱", "商品申报"])
+            packing.close()
+            with patch("tms_supplier_files.time", return_value=time() + 301):
+                self.assertEqual(unauthenticated_get(packing_url).status_code, 404)
+
+            submitted = []
+
+            def carrier(target, *, json, headers):
+                if target.api_url.endswith("/get_services"):
+                    return success({"services": [rule]})
+                self.assertTrue(target.api_url.endswith("/create"))
+                submitted.append(json["shipment"])
+                # The DB reservation and its media must already be accessible.
+                attachment = json["shipment"]["attachments"][0]
+                self.assertEqual(attachment["file_type"], "order")
+                self.assertEqual(unauthenticated_get(attachment["url"]).status_code, 200)
+                return success({"shipment": {"shipment_id": SUPPLIER_NUMBER}})
+
+            with patch.dict(app.config, TMS_NEXTSLS_CREATE_ENABLED=True), patch("carrier_http.post", side_effect=carrier):
+                self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 302)
+                self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 400)
+            shipment, = submitted
+            self.assertEqual(shipment["reference_1"], order.invoice["customer_number"])
+            self.assertEqual(shipment["reference_2"], po)
+            for box in shipment["parcels"]:
+                for row in box["declarations"]:
+                    self.assertEqual((row["amazon_ref_id"], row["brand"], row["model"]), (po, "无", "无"))
+                    self.assertEqual(unauthenticated_get(row["photos"]).data, fixture.PNG)
+            self.assertEqual(order.workbook, original)
+            link = db.session.get(TmsSupplierOrder, order_id)
+            self.assertEqual((link.state, link.supplier_number), ("linked", SUPPLIER_NUMBER))
+            event = TmsSupplierEvent.query.filter_by(order_id=order_id, kind="attempt").order_by(
+                TmsSupplierEvent.id.desc()).first()
+            self.assertEqual(event.details["amazon_ref_sources"][0], {"row": 1, "source": "客户原始发票 PO"})
+            self.assertNotIn(packing_url, str(event.details))
+            live_packing_url = shipment["attachments"][0]["url"]
+            db.session.refresh(order)
+            order.revision += 1
+            db.session.commit()
+            self.assertEqual(unauthenticated_get(live_packing_url).status_code, 200)
+            TmsSupplierFile.query.filter_by(order_id=order_id).update({"customer_id": self.customer_b.id})
+            db.session.commit()
+            self.assertEqual(unauthenticated_get(live_packing_url).status_code, 404)
+            self.assertFalse(tms_carriers.invoice_po_allowed(profile, "B009-4"))
+            self.assertFalse(tms_carriers.invoice_po_allowed(SimpleNamespace(provider="nextsls", base_url=ORIGIN), code))
+
     def test_verified_channel_encoder_uses_private_storage_before_real_transport(self):
         code = "B009-MD"
         rule = SERVICE | {"code": code, "name": "虚构搏诚渠道", "require_declaration_list": ["photos"], "packing_list_required": 1}
@@ -611,7 +717,7 @@ class NextSLSTests(unittest.TestCase):
         with patch.dict(app.config, config), patch(
             "tms_supplier_images.s3_client", return_value=s3,
         ), patch("tms_supplier_images.image_get", side_effect=image_get), patch("carrier_http.post", side_effect=api):
-            self.assertIn("已配置，提交时自动验证图片", self.get(
+            self.assertIn("提交时自动生成 HTTPS 图片链接", self.get(
                 self.staff, f"/tms/admin/orders/{order_id}").get_data(as_text=True))
             with patch.dict(app.config, TMS_NEXTSLS_IMAGE_SCOPE=f"{order.agent_id}|https://other.nextsls.com|{code}"):
                 blocked = self.action(order_id, "create", confirm="yes")

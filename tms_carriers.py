@@ -16,6 +16,7 @@ from models import CarrierAgent, Shipment, db
 import nextsls
 import tms_measurements as measurements
 import tms_supplier_images as images
+import tms_supplier_files as files
 from tms_invoice import InvoiceError, SERVICES, parse_invoice, product_photos
 from tms_models import TmsAgentApi, TmsReceivable, TmsSupplierEvent, TmsSupplierOrder
 
@@ -277,6 +278,7 @@ def supplier_preparation(order, profile, agent):
         blockers.append("代理租户已与审核记录不符")
         return result
     result["photos_protocol_confirmed"] = images.photos_encoder(profile, code) is not None
+    result["direct_files_ready"] = files.direct_store(order, profile) is not None
     rules = channel_rules(profile, code)
     if rules is None:
         blockers.append("此渠道的完整必填规则尚未读取或已过期，请到代理设置刷新 NextSLS 渠道清单")
@@ -290,19 +292,37 @@ def supplier_preparation(order, profile, agent):
     packing_store = images.media_store(order, profile) if result["packing_required"] else None
     result["packing_delivery_ready"] = bool(packing_store)
     supplement = order_supplement(order)
-    result["missing"] = nextsls.missing_supplements(order.invoice, supplement, rules)
+    use_invoice_po = invoice_po_allowed(profile, code)
+    result["missing"] = nextsls.missing_supplements(order.invoice, supplement, rules, use_invoice_po=use_invoice_po)
+    result["invoice_po_rows"] = invoice_po_rows(order.invoice, supplement, rules, use_invoice_po)
+    result["invoice_header_po_used"] = bool(result["invoice_po_rows"] and not nextsls.has_line_amazon_po(order.invoice))
     result["amazon_po_candidate"] = (not nextsls.has_line_amazon_po(order.invoice)
                                      and any("amazon_ref_id" in fields for fields in result["missing"].values()))
     try:
         nextsls.create_payload(invoice, code, "XR-PREFLIGHT", rules, profile.sender, supplement=supplement,
                                image_fields=encoders, packing_host=packing_store.host if packing_store else "",
                                photos_protocol_confirmed=result["photos_protocol_confirmed"],
+                               use_invoice_po=use_invoice_po,
                                preflight=True)
     except nextsls.PreparationError as exc:
         blockers.extend(exc.blockers)
     except nextsls.ProtocolError as exc:
         blockers.append(str(exc))
     return result
+
+
+def invoice_po_allowed(profile, code):
+    # In Boch'eng WOS the B009-MD declaration grid's PO Number column
+    # binds directly to amazon_ref_id, matching the V5 account rule.
+    return profile.provider == "nextsls" and profile.base_url == BC_ORIGIN and code == "B009-MD"
+
+
+def invoice_po_rows(invoice, supplement, rules, use_invoice_po):
+    if not use_invoice_po or "amazon_ref_id" not in rules["require_declaration_list"]:
+        return []
+    return [{"row": i + 1, "source": source} for i in range(len(invoice["declarations"]))
+            if (source := nextsls.amazon_reference(invoice, supplement, i, use_invoice_po=True)[1])
+            == nextsls.INVOICE_PO_SOURCE]
 
 
 def approved_shipment(order):
@@ -410,30 +430,32 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
         packing_host = packing_store.host
         packing_publisher = lambda data: images.publish_packing(packing_store, order, profile, data)
     invoice, omitted = destination_for_create(order)
-
-    def order_photos():
-        try:
-            return product_photos(order.workbook, order.invoice)
-        except InvoiceError as exc:
-            raise nextsls.ProtocolError(str(exc)) from None
+    supplement = order_supplement(order)
+    use_invoice_po = invoice_po_allowed(profile, code)
 
     def publish_photos():
-        return [photo_publisher(mime, data) for mime, data in order_photos()]
+        return [photo_publisher(mime, data) for mime, data in original_photos(order)]
 
     payload = nextsls.create_payload(
-        invoice, code, link.client_reference, rules, profile.sender, supplement=order_supplement(order),
+        invoice, code, link.client_reference, rules, profile.sender, supplement=supplement,
         packing_host=packing_host,
         publish_photos=publish_photos if photo_publisher is not None else None,
         image_fields=encoders,
         photos_protocol_confirmed=images.photos_encoder(profile, code) is not None,
-        publish_image_fields=(lambda: images.publish_images(store, order, profile, order_photos(), encoders))
+        use_invoice_po=use_invoice_po,
+        publish_image_fields=(lambda: images.publish_images(store, order, profile, original_photos(order), encoders))
         if encoders else None,
         publish_packing=(lambda: packing_publisher(packing_draft(order).getvalue()))
         if packing_publisher is not None else None,
     )
     transition(link, "new", "sending", attempt_at=datetime.utcnow(), tenant_origin=origin)
-    delivery_audit = {"image_rows_verified": len(order.invoice["declarations"]) if encoders else 0,
+    delivery_audit = {"image_rows_verified": len(order.invoice["declarations"])
+                      if encoders and not isinstance(store, files.DirectStore) else 0,
                       "omitted_legacy_address_fields": omitted}
+    if encoders and isinstance(store, files.DirectStore):
+        delivery_audit["image_rows_published"] = len(order.invoice["declarations"])
+    if po_rows := invoice_po_rows(invoice, supplement, rules, use_invoice_po):
+        delivery_audit["amazon_ref_sources"] = po_rows
     audit(link, "attempt", actor_id, {"state": "sending", **delivery_audit})
     db.session.commit()  # Commit the one-order reservation before contacting the supplier.
 
@@ -468,6 +490,57 @@ def order_supplement(order):
     if (supplement.get("agent_id"), supplement.get("service")) == (order.agent_id, order.agent_service):
         return supplement
     return {}
+
+
+def original_photos(order):
+    raw = order.workbook
+    if not raw or sha256(raw).hexdigest() != order.file_sha256:
+        raise nextsls.ProtocolError("保存的原始发票指纹不符，不能发布商品图片。")
+    try:
+        return product_photos(raw, order.invoice)
+    except InvoiceError as exc:
+        raise nextsls.ProtocolError(str(exc)) from None
+
+
+def preview_supplier_files(order, profile):
+    """Stage short-lived copies using the real publishers, without initiating a carrier operation."""
+    store = files.direct_store(order, profile)
+    if not store:
+        raise nextsls.ProtocolError("星睿 HTTPS 文件服务暂未就绪。")
+    photos = original_photos(order)
+    references = images.publish_images(store, order, profile, photos, {"photo_url": nextsls.product_photo_url},
+                                       preview=True)
+    packing = packing_draft(order).getvalue()
+    attachment = images.publish_packing(store, order, profile, packing, preview=True)
+    if nextsls.packing_url_host(attachment) != store.host:
+        raise nextsls.ProtocolError("装箱单链接域名或长度不符合要求。")
+    pairs = [(ref["photo_url"], mime, data) for ref, (mime, data) in zip(references, photos)]
+    pairs.append((attachment, files.PACKING_MIME, packing))
+    manifest = [{"url": url, "mime": mime, "bytes": len(data), "sha256": sha256(data).hexdigest()}
+                for url, mime, data in pairs]
+    rules = channel_rules(profile, order.agent_service)
+    if rules is None:
+        return manifest, {"error": "当前渠道规则未就绪，文件验收独立于下单。"}
+    _, encoders = images.image_delivery(order, profile, rules)
+    use_invoice_po = invoice_po_allowed(profile, order.agent_service)
+    invoice, _ = destination_for_create(order)
+    supplement = order_supplement(order)
+    try:
+        payload = nextsls.create_payload(
+            invoice, order.agent_service, "XR-PREVIEW", rules, profile.sender, supplement=supplement,
+            packing_host=store.host, publish_packing=lambda: attachment,
+            image_fields=encoders, photos_protocol_confirmed=images.photos_encoder(profile, order.agent_service) is not None,
+            publish_image_fields=lambda: [{field: encode(ref["photo_url"]) for field, encode in encoders.items()}
+                                          for ref in references],
+            use_invoice_po=use_invoice_po,
+        )["shipment"]
+    except nextsls.ProtocolError as error:
+        return manifest, {"error": str(error)}
+    rows = [row for parcel in payload["parcels"] for row in parcel["declarations"]]
+    return manifest, {
+        "combined": bool(payload.get("attachments") and any(nextsls.IMAGE_FIELDS & row.keys() for row in rows)),
+        "po_rows": len(invoice_po_rows(invoice, supplement, rules, use_invoice_po)),
+    }
 
 
 def reconcile_order(order, actor_id, *, transport=None):
