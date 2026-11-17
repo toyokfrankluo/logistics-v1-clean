@@ -151,6 +151,76 @@ def refresh_operation():
         unknown=sum(bool(rule.get("unknown_rules")) for rule in profile.verified[tms_carriers.CHANNEL_CATALOGUE]["rules"].values()))
 
 
+@operations.post("/verify-existing")
+def verify_existing_operation():
+    """Read a previously linked shipment with its saved account; never invoke creation."""
+    from tms_models import TmsOrder, TmsSupplierOrder
+    body = request.get_json(silent=True) or {}
+    if type(body.get("order_id")) is not int:
+        abort(400)
+    order = db.session.get(TmsOrder, body["order_id"])
+    link = db.session.get(TmsSupplierOrder, body["order_id"])
+    if not order or not link or link.state != "linked" or not link.supplier_number:
+        abort(409)
+    agent = db.session.get(CarrierAgent, order.agent_id)
+    profile = db.session.get(TmsAgentApi, order.agent_id)
+    shipment, _ = tms_carriers.approved_shipment(order)
+    if (not agent or not profile or profile.provider != "nextsls" or profile.base_url != link.tenant_origin or link.agent_id != agent.id
+            or shipment.shipment_id != link.supplier_number):
+        abort(409)
+    result={"order_id":order.id,"agent_id":agent.id,"supplier_number":link.supplier_number,
+            "create_called":False,"errors":{},"http":{}}
+    def observed(target, *, json, headers):
+        import carrier_http
+        method=target.api_url.rsplit("/",1)[-1]
+        try:
+            response=carrier_http.post(target,json=json,headers=headers)
+        except carrier_http.CarrierRequestError as error:
+            result["http"][method]=error.status
+            raise
+        result["http"][method]=response.status_code
+        return response
+    try:
+        data = nextsls.request_data(agent, profile.base_url, "/shipment/get_info",
+            {"shipment":{"shipment_id":link.supplier_number}},transport=observed)
+        info = nextsls.object_value(data.get("shipment"))
+        result["number_matches"]=nextsls.parse_supplier_number(data) == link.supplier_number
+        result["reference_matches"]=info.get("client_reference") == link.client_reference
+        service=info.get("service_code",info.get("service"))
+        if isinstance(service,dict):service=service.get("code")
+        result["channel_matches"]=(service == order.agent_service) if isinstance(service,str) else None
+    except nextsls.ProtocolError as error:
+        result["errors"]["get_info"]=str(error)
+    try:
+        listing = nextsls.request_data(agent, profile.base_url, "/shipment/list",
+            {"shipment":{"client_reference":link.client_reference,"page":1,"page_size":2}},transport=observed)
+        result["list_matches"]=nextsls.lookup_created(listing, link.client_reference) == link.supplier_number
+    except nextsls.ProtocolError as error:
+        result["errors"]["list"]=str(error)
+    return jsonify(result)
+
+
+@operations.post("/prepare-acceptance")
+def prepare_acceptance_operation():
+    import tms_acceptance
+    body=request.get_json(silent=True) or {}
+    sid=body.get("source_order_id")
+    if (type(sid) is not int or current_app.config.get("TMS_AGENT_IMPORT_SCOPE") != f"acceptance-prepare:{sid}"):
+        abort(404)
+    ids=body.get("agent_ids",[])
+    if not ids or len(ids)>12 or any(type(aid) is not int for aid in ids) or len(set(ids)) != len(ids):
+        abort(400)
+    try:
+        result=tms_acceptance.prepare(sid,ids,body.get("batch",""),body.get("reason",""),body.get("photo_agents",[]))
+    except nextsls.ProtocolError as error:
+        db.session.rollback()
+        return jsonify(error=str(error)),400
+    except SQLAlchemyError:
+        db.session.rollback()
+        return jsonify(error="验收副本未保存，本批已回滚。"),409
+    return jsonify(results=result,create_called=False,creation_granted=False)
+
+
 @operations.get("/create-control")
 def verify_create_control_operation():
     # Read-only receipt. The deployment credential can never change the site permission.

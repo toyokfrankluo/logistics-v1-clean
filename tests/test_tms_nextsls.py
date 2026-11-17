@@ -25,6 +25,7 @@ from tms_models import (TmsAccount, TmsAgentApi, TmsAudit, TmsOrder, TmsReceivab
 
 
 ORIGIN = "https://demo.nextsls.com"
+BC_ORIGIN = "https://bckjkj.nextsls.com"
 SUPPLIER_NUMBER = "TEST-SLS-1"
 TOKEN = "synthetic-test-token"
 SERVICE = {
@@ -647,7 +648,7 @@ class NextSLSTests(unittest.TestCase):
         self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
 
     def test_bc_creates_with_direct_media_and_reviewed_invoice_po_without_s3(self):
-        origin, code = tms_carriers.BC_ORIGIN, "B009-MD"
+        origin, code = BC_ORIGIN, "B009-MD"
         rule = SERVICE | {"code": code, "packing_list_required": 1,
                           "require_declaration_list": ["photos", "amazon_ref_id", "brand", "model",
                                                        "hscode", "material", "name_en", "name_zh", "qty",
@@ -753,7 +754,7 @@ class NextSLSTests(unittest.TestCase):
     def test_verified_channel_encoder_uses_private_storage_before_real_transport(self):
         code = "B009-MD"
         rule = SERVICE | {"code": code, "name": "虚构搏诚渠道", "require_declaration_list": ["photos"], "packing_list_required": 1}
-        origin = tms_carriers.BC_ORIGIN
+        origin = BC_ORIGIN
         self.profile(base_url=origin, service_codes=[code], rules={code: nextsls.preparation_rules(rule)})
         self.agent.api_url = ""
         db.session.commit()
@@ -862,7 +863,7 @@ class NextSLSTests(unittest.TestCase):
 
     def test_bc_no_model_and_channel_change_drop_unneeded_amazon_field(self):
         profile = self.profile(service_codes=["B009-4", "B009-10", "B009-MD"])
-        profile.base_url = tms_carriers.BC_ORIGIN
+        profile.base_url = BC_ORIGIN
         self.agent.api_url = ""
         both = SERVICE | {"require_declaration_list": ["amazon_ref_id", "model", "brand", "photos"]}
         basic = SERVICE

@@ -58,6 +58,7 @@ DUMMY_HASH = generate_password_hash(token_hex(32))
 STATUS_LABELS = {"draft": "待确认", "pending": "待审核", "approved": "审核通过", "rejected": "审核驳回"}
 AUDIT_LABELS = {
     "upload": "上传发票", "replace": "更正发票", "confirm": "提交审核",
+    "acceptance_copy": "经授权复用发票准备独立接口验收单（未提交供应商）",
     "approve": "审核通过", "reject": "审核驳回", "pricing_draft": "保存收费草稿", "adjust": "调整销售条款",
     "settle": "确认最终应收",
     "supplier_channel": "调整未提交的供应商或渠道",
@@ -1199,8 +1200,7 @@ def save_supplier_supplement(order, form):
         raw = form.get("tax_" + field, "").strip()
         if raw:
             taxes[field] = nextsls.tax_value(raw)
-    if profile.base_url == tms_carriers.BC_ORIGIN:
-        allowed.update(f"supplement_{index}_no_model" for index, fields in missing.items() if "model" in fields)
+    allowed.update(f"supplement_{index}_no_model" for index, fields in missing.items() if "model" in fields)
     if any(key.startswith("supplement_") and (key not in allowed or len(form.getlist(key)) != 1) for key in form):
         raise nextsls.ProtocolError("渠道所需资料已变化，请刷新页面后补充。")
     if "confirm_amazon_d4" in form:

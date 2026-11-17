@@ -1,0 +1,10 @@
+{
+  "https://bckjkj.nextsls.com": {
+    "invoice_po": {
+      "B009-MD": {
+        "source": "客户原始发票 PO",
+        "evidence": "既有搏诚 WOS 商品 PO Number 列绑定 amazon_ref_id，且已按审核发票完成经授权真实创建。"
+      }
+    }
+  }
+}

@@ -3,6 +3,8 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from hashlib import sha256
 from io import BytesIO
+import json
+from pathlib import Path
 from uuid import uuid4
 from types import SimpleNamespace
 
@@ -38,7 +40,7 @@ CREATE_DISABLED = "系统未开放真实下单"
 CREATE_GRANT = "nextsls_create_grant"
 CREATE_GRANT_REQUIRED = "请先授权本票真实下单"
 READ_DISABLED = "系统未开放 NextSLS 只读请求"
-BC_ORIGIN = "https://bckjkj.nextsls.com"
+DECLARATION_CONTRACTS = json.loads(Path(__file__).with_name("nextsls_declaration_contracts.json").read_text())
 
 
 def carrier_schema():
@@ -339,7 +341,7 @@ def supplier_preparation(order, profile, agent):
     code = order.agent_service
     blockers = create_blockers(profile, agent, code)
     result = {"blockers": blockers, "missing": {}, "packing_required": None, "required_photo_fields": None,
-              "allow_no_model": bool(profile and profile.provider == "nextsls" and profile.base_url == BC_ORIGIN),
+              "allow_no_model": bool(profile and profile.provider == "nextsls"),
               "image_count": sum(bool(item.get("image_part")) for item in order.invoice["declarations"])}
     invoice, omitted = destination_for_create(order)
     result["omitted_address_fields"] = omitted
@@ -391,9 +393,13 @@ def supplier_preparation(order, profile, agent):
 
 
 def invoice_po_allowed(profile, code):
-    # In Boch'eng WOS the B009-MD declaration grid's PO Number column
-    # binds directly to amazon_ref_id, matching the V5 account rule.
-    return profile.provider == "nextsls" and profile.base_url == BC_ORIGIN and code == "B009-MD"
+    if profile.provider != "nextsls":
+        return False
+    defaults = DECLARATION_CONTRACTS.get(profile.base_url, {}).get("invoice_po", {})
+    configured = (getattr(profile, "verified", None) or {}).get("declaration_contracts", {}).get("invoice_po", {})
+    contract = configured.get(code, defaults.get(code))
+    return bool(isinstance(contract, dict) and contract.get("source") == nextsls.INVOICE_PO_SOURCE
+                and contract.get("evidence"))
 
 
 def invoice_po_rows(invoice, supplement, rules, use_invoice_po):

@@ -10,7 +10,7 @@ import tms_carriers
 import tms_supplier_images
 from app import app
 from models import CarrierAgent, db
-from tms_models import TmsAgentApi, TmsOrder, TmsSupplierOrder, TmsSupplierEvent
+from tms_models import TmsAgentApi, TmsOrder, TmsSupplierOrder, TmsSupplierEvent, TmsCreateControl, TmsReceivable
 
 
 class UniversalV5Tests(unittest.TestCase):
@@ -149,3 +149,133 @@ class UniversalV5Tests(unittest.TestCase):
         self.assertEqual(response.status_code,302)
         self.assertEqual(CarrierAgent.query.count(),1)
         self.assertEqual(TmsAgentApi.query.count(),0)
+
+    def test_new_accounts_13_and_100_complete_onboarding_review_create_and_query_with_same_engine(self):
+        from urllib.parse import urlsplit
+        from io import BytesIO
+        from zipfile import ZipFile
+        self.staff_login()
+        db.session.add(TmsCreateControl(id=1,enabled=False,revision=1,history=[]));db.session.commit()
+        references=[]
+        with patch.dict(app.config,TMS_NEXTSLS_CREATE_MODE="admin",TMS_NEXTSLS_CREATE_ENABLED=False,
+                TMS_NEXTSLS_READ_ENABLED=True,TMS_NEXTSLS_REQUIRE_ORDER_GRANT=True,
+                TMS_NEXTSLS_FILE_ORIGIN="https://files.example.com"):
+            self.assertEqual(self.post(self.staff,"/tms/admin/settings/nextsls-create",
+                {"revision":1,"enabled":"yes","confirmed":"yes"},"/login").status_code,302)
+            for aid,legacy in ((13,False),(100,True)):
+                with self.subTest(account_id=aid,legacy=legacy):
+                    db.session.add(CarrierAgent(id=aid-1,name=f"Synthetic preexisting {aid-1}",is_active=True))
+                    db.session.commit()
+                    origin=f"https://new-{aid}.nextsls.com";token=f"synthetic-new-token-for-{aid}-only"
+                    code=f"US-{aid}";number=f"SYNTHETIC-{aid}";name=f"Synthetic supplier {aid}"
+                    service={"code":code,"name":"美国测试线"} if legacy else fixture.SERVICE | {
+                        "code":code,"name":"美国测试线","require_declaration_list":["photos","model"],"packing_list_required":1}
+                    captured={}
+                    anonymous=app.test_client()
+                    def read(url):
+                        target=urlsplit(url)
+                        with app.app_context():return anonymous.get(target.path+"?"+target.query)
+                    def transport(target,*,json,headers):
+                        method=target.api_url.rsplit("/",1)[-1]
+                        self.assertEqual(target.api_url,origin+"/api/v5/shipment/"+method)
+                        self.assertEqual(headers["Authorization"],"Bearer "+token)
+                        if method=="get_services":return fixture.success({"services":[service]})
+                        if method=="create":
+                            captured.update(json["shipment"])
+                            for parcel in captured["parcels"]:
+                                for row in parcel["declarations"]:
+                                    self.assertEqual(read(row["photos"]).data,fixture.fixture.PNG)
+                            attachment=captured["attachments"][0]
+                            self.assertEqual(attachment["file_type"],"order")
+                            with ZipFile(BytesIO(read(attachment["url"]).data)) as book:self.assertIsNone(book.testzip())
+                            return fixture.success({"shipment":{"shipment_id":number}})
+                        self.assertEqual(method,"get_info")
+                        data=fixture.snapshot(number=number)
+                        data["shipment"]["client_reference"]=captured["client_reference"]
+                        return fixture.success(data)
+                    with patch("carrier_http.get_document",return_value="/shipment/create /shipment/get_services"),patch("carrier_http.post",side_effect=transport):
+                        self.assertEqual(self.post(self.staff,"/agents",{"onboarding":"v5","name":name,
+                            "base_url":origin,"app_token":token},"/login").status_code,302)
+                    agent=CarrierAgent.query.filter_by(name=name).one();self.assertEqual(agent.id,aid)
+                    self.sign_in(self.alice,"customer-a")
+                    def products(book):
+                        for row in (23,24,25):
+                            book["星睿发票"][f"O{row}"]="无"
+                            if legacy:book["星睿发票"][f"P{row}"]="无"
+                    uploaded=self.upload(self.alice,fixture.fixture.workbook_bytes(
+                        order_number=f"SYNTHETIC-ORDER-{aid}",product_details=True,change=products))
+                    oid=int(uploaded.location.rsplit("/",1)[1])
+                    self.assertEqual(self.post(self.alice,f"/tms/customer/orders/{oid}/confirm",{"revision":1}).status_code,302)
+                    options=self.post(self.staff,f"/tms/admin/orders/{oid}/supplier-channels",{"agent_id":aid},"/login").json
+                    self.assertEqual(options["catalogue"],{code:"美国测试线"})
+                    self.assertEqual(self.decision(oid,2,decision="approve",**self.pricing(agent_id=aid,agent_service=code)).status_code,302)
+                    order=db.session.get(TmsOrder,oid)
+                    if not legacy:
+                        self.assertEqual(self.action(oid,"prepare",revision=order.revision,
+                            **{f"supplement_{i}_no_model":"yes" for i in range(3)}).status_code,302)
+                        db.session.expire_all()
+                    order=db.session.get(TmsOrder,oid)
+                    grant={"unknown_rules_confirmed":"yes","unknown_rules_basis":"Isolated synthetic account acceptance"} if legacy else {}
+                    self.assertEqual(self.action(oid,"grant_create",revision=order.revision,confirm="yes",**grant).status_code,302)
+                    db.session.expire_all()
+                    with patch("carrier_http.post",side_effect=transport) as http:
+                        self.assertEqual(self.action(oid,"create",confirm="yes").status_code,302)
+                        self.assertEqual(self.action(oid,"create",confirm="yes").status_code,400)
+                        self.assertEqual(self.action(oid,"sync").status_code,302)
+                    self.assertEqual(http.call_count,3)
+                    references.append(captured["client_reference"])
+                    self.assertEqual(db.session.get(TmsSupplierOrder,oid).supplier_number,number)
+                    shipment,_=tms_carriers.approved_shipment(order)
+                    self.assertEqual((shipment.shipment_id,shipment.agent_id),(number,aid))
+                    self.assertTrue(tms_carriers.latest_event(oid,"snapshot").details["identity_verified"])
+                    self.assertEqual(order.invoice["service"],"UPS红单")
+            self.assertEqual(len(references),2)
+            self.assertNotEqual(references[0],references[1])
+            self.assertEqual(self.post(self.staff,"/tms/admin/settings/nextsls-create",{"revision":2,"enabled":"no"},"/login").status_code,302)
+
+    def test_acceptance_sample_copies_preserve_original_images_and_never_grant_or_create(self):
+        from zipfile import ZipFile
+        from io import BytesIO
+        import tms_acceptance
+        self.profile();sid=self.approve();source=db.session.get(TmsOrder,sid);raw=source.workbook
+        agent=CarrierAgent(id=13,name="Synthetic destination",is_active=True,supports_api=True,app_token="synthetic-other-token")
+        profile=TmsAgentApi(agent_id=13,provider="nextsls",base_url="https://other.nextsls.com",enabled=["create"],service_codes=[],sender={},verified={})
+        tms_carriers.store_channel_catalogue(profile,{"US":"美国普通测试线"},{"US":nextsls.preparation_rules(fixture.SERVICE)})
+        db.session.add_all([agent,profile]);db.session.commit()
+        result=tms_acceptance.prepare(sid,[13],"e"*32,"Explicit sample reuse for API acceptance")
+        repeated=tms_acceptance.prepare(sid,[13],"e"*32,"Explicit sample reuse for API acceptance")
+        self.assertEqual(result,repeated)
+        copy=db.session.get(TmsOrder,result[0]["order_id"])
+        self.assertEqual(copy.status,"pending")
+        self.assertNotIn(tms_carriers.CREATE_GRANT,copy.invoice)
+        self.assertIsNone(db.session.get(TmsSupplierOrder,copy.id))
+        self.assertEqual(source.workbook,raw)
+        self.assertEqual(copy.invoice["boxes"],source.invoice["boxes"])
+        self.assertEqual(copy.invoice["declarations"],source.invoice["declarations"])
+        with ZipFile(BytesIO(raw)) as old,ZipFile(BytesIO(copy.workbook)) as new:
+            self.assertEqual(old.read("xl/media/demo.png"),new.read("xl/media/demo.png"))
+        self.assertNotEqual(copy.file_sha256,source.file_sha256)
+        self.carrier_post.assert_not_called()
+
+    def test_existing_success_receipt_uses_read_only_own_account_and_checks_identity(self):
+        import os,time
+        from hashlib import sha256
+        self.profile();oid=self.approve()
+        with patch.dict(app.config,TMS_NEXTSLS_CREATE_ENABLED=True),patch("carrier_http.post",side_effect=[
+            fixture.success({"services":[fixture.SERVICE]}),fixture.success({"shipment":{"shipment_id":"SYNTHETIC-EXISTING"}})]):
+            self.assertEqual(self.action(oid,"create",confirm="yes").status_code,302)
+        db.session.expire_all()
+        link=db.session.get(TmsSupplierOrder,oid)
+        info={"shipment":{"shipment_id":link.supplier_number,"client_reference":link.client_reference,"service_code":"TMS_DEMO"}}
+        listed={"shipment":[{"shipment_id":link.supplier_number,"client_reference":link.client_reference}]}
+        secret="synthetic-read-only-proof"
+        with patch.dict(os.environ,RENDER="true"),patch.dict(app.config,TMS_NEXTSLS_CREATE_ENABLED=False,
+                TMS_AGENT_IMPORT_SCOPE="preflight",TMS_AGENT_IMPORT_KEY_SHA256=sha256(secret.encode()).hexdigest(),
+                TMS_AGENT_IMPORT_KEY_EXPIRES=int(time.time())+600),patch("carrier_http.post",side_effect=[fixture.success(info),fixture.success(listed)]) as http:
+            result=self.staff.post("/tms/operations/agents/verify-existing",json={"order_id":oid},
+                headers={"Authorization":"Bearer "+secret})
+        self.assertEqual(result.status_code,200)
+        self.assertTrue(all(result.json[key] for key in ("number_matches","reference_matches","channel_matches","list_matches")))
+        self.assertFalse(result.json["create_called"])
+        self.assertEqual([call.args[0].api_url.rsplit("/",1)[-1] for call in http.call_args_list],["get_info","list"])
+        self.assertTrue(all(call.kwargs["headers"]["Authorization"]=="Bearer "+fixture.TOKEN for call in http.call_args_list))
