@@ -23,6 +23,7 @@ class SafeRenderLogger(Logger):
 
 
 if os.getenv("RENDER") == "true":
+    timeout = 120  # Batch imports verify multiple read-only carrier endpoints before committing.
     # U is the path only. Avoid query strings, raw request lines and referrers.
     access_log_format = '%(h)s %(t)s "%(m)s %(U)s %(H)s" %(s)s %(b)s'
     logger_class = SafeRenderLogger

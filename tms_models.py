@@ -113,6 +113,16 @@ class TmsAgentApi(db.Model, TimestampMixin):
     verified = db.Column(db.JSON, nullable=False)
 
 
+class TmsAgentImport(db.Model, TimestampMixin):
+    """Protected configuration backup. Credentials never leave this table through the UI."""
+    __tablename__ = "tms_agent_import"
+    id = db.Column(db.String(32), primary_key=True)
+    actor_id = db.Column(db.Integer, nullable=False)
+    source_digest = db.Column(db.String(80), nullable=False)
+    previous = db.Column(db.JSON, nullable=False)
+    result = db.Column(db.JSON, nullable=False)
+
+
 class TmsSupplierOrder(db.Model, TimestampMixin):
     __tablename__ = "tms_supplier_order"
     __table_args__ = (

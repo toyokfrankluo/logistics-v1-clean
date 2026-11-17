@@ -941,7 +941,7 @@ class NextSLSTests(unittest.TestCase):
             self.assertIn("请逐条补充申报：Amazon 参考号、品牌、型号", incomplete.get_data(as_text=True))
             self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
             fields = {f"supplement_{i}_{key}": f"fixture-{key}-{i}"
-                      for i in range(3) for key in nextsls.SUPPLEMENTAL_DECLARATIONS}
+                      for i in range(3) for key in ("amazon_ref_id", "brand", "model")}
             invalid = self.action(order_id, "prepare", revision=3, packing_name="packing.pdf",
                                   packing_url="http://127.0.0.1/private.pdf", **fields)
             self.assertEqual(invalid.status_code, 400)
@@ -1018,7 +1018,7 @@ class NextSLSTests(unittest.TestCase):
         self.assertEqual(self.decision(order_id, 2, decision="approve",
                                        **self.pricing(agent_service="B888")).status_code, 302)
         fields = {f"supplement_{index}_{key}": f"{key}-{index}" for index in range(36)
-                  for key in nextsls.SUPPLEMENTAL_DECLARATIONS}
+                  for key in ("amazon_ref_id", "brand", "model")}
         link = "https://files.example.com/packing.xlsx"
         self.assertEqual(self.action(order_id, "prepare", revision=3, **fields).status_code, 302)
         draft_path = f"/tms/admin/orders/{order_id}/supplier/packing-draft.xlsx"
@@ -1063,8 +1063,8 @@ class NextSLSTests(unittest.TestCase):
                 self.assertEqual(box["reference"], f"{index % 21 + 1:04}")
                 self.assertEqual(product["photo_url"], f"https://files.example.com/p/{index}")
                 self.assertEqual((product["qty"], product["unit_value"]), (index + 1, index + 0.25))
-                self.assertEqual([product[key] for key in nextsls.SUPPLEMENTAL_DECLARATIONS],
-                                 [f"{key}-{index}" for key in nextsls.SUPPLEMENTAL_DECLARATIONS])
+                self.assertEqual([product[key] for key in ("amazon_ref_id", "brand", "model")],
+                                 [f"{key}-{index}" for key in ("amazon_ref_id", "brand", "model")])
 
     def test_create_blocks_unreviewed_placeholder_on_historical_snapshot(self):
         invoice = fixture.parse_invoice(fixture.workbook_bytes())

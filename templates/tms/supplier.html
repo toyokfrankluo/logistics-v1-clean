@@ -110,7 +110,7 @@
         <legend>申报 {{ row_index + 1 }} · {{ row.box_number }} · {{ row.name_zh }}</legend>
         <div class="pricing-grid">
         {% for key in fields %}
-        <label>{{ supplier.supplement_fields[key] }}<input name="supplement_{{ row_index }}_{{ key }}" maxlength="120"
+        <label>{{ supplier.supplement_fields[key] }}<input name="supplement_{{ row_index }}_{{ key }}" maxlength="{{ 500 if key == 'sale_url' else 120 }}"
           {% if key == 'amazon_ref_id' %}placeholder="填入货主或承运商提供的真实参考号"{% endif %}></label>
         {% if key == 'amazon_ref_id' and row.amazon_po_candidate %}
         <label class="check-label"><input type="checkbox" name="confirm_amazon_po_line_{{ row_index }}" value="yes">已核对本行 PO {{ row.amazon_po_candidate }} 可用于该渠道</label>

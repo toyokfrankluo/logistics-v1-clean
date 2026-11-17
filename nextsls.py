@@ -36,6 +36,7 @@ BOX_DIMENSIONS = {"weight": "weight_kg", "length": "length_cm", "width": "width_
 DECLARATIONS = {"name_zh": "name_zh", "name_en": "name_en", "material": "material", "usage": "usage", "hscode": "hs_code"}
 SUPPLEMENTAL_DECLARATIONS = {
     "amazon_ref_id": "Amazon 参考号", "brand": "品牌", "model": "型号",
+    "sku": "真实商品 SKU", "sale_url": "真实商品销售链接",
 }
 REQUIRED_FLAGS = ("tel_required", "email_required", "company_required", "city_required",
                   "vat_number_required", "eori_required", "packing_list_required")
@@ -211,7 +212,15 @@ def preparation_rules(profile):
 
 
 def supplemental_value(invoice, field, value, *, confirmed_po=False):
-    value = supplied_text(value, 120)
+    value = supplied_text(value, 500 if field == "sale_url" else 120)
+    if field == "sale_url":
+        try:
+            parsed = urlsplit(value)
+            if (parsed.scheme not in ("https", "http") or not parsed.hostname or parsed.username
+                    or parsed.password or any(char.isspace() for char in value)):
+                raise ValueError()
+        except ValueError:
+            raise ProtocolError("请填写该商品真实的 HTTP 或 HTTPS 销售链接。") from None
     if field == "amazon_ref_id":
         invalid = {"无", "暂无", "不适用", "未知", "none", "n/a", "na", "null", "unknown", "-", "0",
                    invoice["customer_number"].casefold()}
@@ -387,7 +396,7 @@ def create_payload(invoice, code, reference, profile, sender, *, supplement=None
     if not image_fields <= IMAGE_FIELDS or (image_fields and publish_image_fields is None and not preflight):
         raise ProtocolError("商品图片传输配置无效。")
     supported = DECLARATIONS.keys() | SUPPLEMENTAL_DECLARATIONS.keys() | {
-        "unit_value", "qty", "is_battery",
+        "unit_value", "qty", "is_battery", "is_magnetic",
     } | IMAGE_FIELDS
     unsupported = sorted(set(requirements) - supported)
     packing_required = required_flag(profile, "packing_list_required")
@@ -435,6 +444,11 @@ def create_payload(invoice, code, reference, profile, sender, *, supplement=None
             raise ProtocolError("产品申报数量无效。")
         declaration.update(unit_value=float(numeric(item["unit_price_usd"])), qty=qty,
                            is_battery=int(item.get("battery") is True))
+        if "is_magnetic" in requirements:
+            magnetic = item.get("magnet", invoice["flags"].get("magnet"))
+            if type(magnetic) is not bool:
+                raise ProtocolError("渠道要求产品带磁属性，请核对原始发票中的真实带磁申报。")
+            declaration["is_magnetic"] = int(magnetic)
         if any(key not in declaration or declaration[key] in (None, "")
                for key in requirements if key not in IMAGE_FIELDS):
             raise ProtocolError("发票缺少代理渠道要求的申报项，请核对渠道规则。")

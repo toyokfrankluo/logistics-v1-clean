@@ -1,6 +1,6 @@
 {% set state = assignment.get(active_agent, {}) %}
 {% set managed = state.managed %}
-<div data-supplier-picker data-current-channel="{{ agent_service or '' }}" data-channel-url="{{ url_for('tms_staff.supplier_channels', order_id=order.id) }}">
+<div data-supplier-picker data-current-channel="{{ agent_service or '' }}" data-channel-url="{{ channel_url if channel_url is defined else url_for('tms_staff.supplier_channels', order_id=order.id) }}">
   <p>星睿销售服务：<strong>{{ invoice.service }}</strong></p>
   <label>实际物流供应商<select name="agent_id" required><option value="">请选择启用的供应商</option>
     {% for agent in agents %}<option value="{{ agent.id }}"{% if assignment[agent.id].managed %} data-channel-list="{{ agent.id }}"{% endif %}{% if agent.id == active_agent %} selected{% endif %}>{{ agent.name }}</option>{% endfor %}

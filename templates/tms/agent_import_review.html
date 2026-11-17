@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>管理员审核供应商与渠道联动验收</h1>
+<p>当前数据库配置的只读验收，不保存或提交订单。</p>
+<form><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+{% with active_agent=none, agent_service='' %}{% include 'tms/supplier_picker.html' %}{% endwith %}
+</form>
+{% endblock %}

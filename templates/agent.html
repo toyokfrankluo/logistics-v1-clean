@@ -2,6 +2,7 @@
 {% block content %}
 <div class="container mt-4">
     <h2>代理管理</h2>
+    <p><a class="button secondary" href="{{ url_for('tms_staff.import_agents') }}">批量接入 NextSLS V5 供应商</a></p>
 
     <!-- 添加代理表单 -->
     <form method="POST" action="{{ url_for('views.agents') }}" class="mb-4">
@@ -51,7 +52,7 @@
                 <th>原有轨迹 API 地址</th>
                 <th>App Key</th>
                 <th>App Token</th>
-                <th>状态 / 接口能力</th><th>关联运单</th>
+                <th>状态 / 接口能力</th><th>V5 API 租户 / 渠道</th><th>关联运单</th>
                 <th>操作</th>
             </tr>
         </thead>
@@ -64,6 +65,7 @@
                 <td>{{ "已配置" if agent.app_key else "未配置" }}</td>
                 <td>{{ "已配置" if agent.app_token else "未配置" }}</td>
                 <td><span class="badge {{ 'approved' if agent.is_active else '' }}">{{ '启用' if agent.is_active else '停用' }}</span>{% set profile = profiles.get(agent.id) %}{% if profile and profile.provider == 'nextsls' %}<small class="cell-note">NextSLS V5 · 已勾选 {{ profile.enabled|length }} 项</small>{% else %}<small class="cell-note">{{ '使用原有轨迹地址' if agent.supports_api and agent.api_url else '手工轨迹' }}</small>{% endif %}</td>
+                <td>{% if profile and profile.provider == 'nextsls' %}{{ profile.base_url }}<small class="cell-note">{{ (profile.verified.get('channel_catalogue', {}).get('channels', {}))|length }} 个渠道</small>{% else %}—{% endif %}</td>
                 <td>{{ shipment_counts.get(agent.id, 0) }}</td>
                 <td>
                     <a href="{{ url_for('views.edit_agent', agent_id=agent.id) }}" class="btn btn-sm btn-warning">编辑代理与功能接口</a>

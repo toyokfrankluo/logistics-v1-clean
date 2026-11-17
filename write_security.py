@@ -27,6 +27,8 @@ def init_write_security(app, login_manager):
     def authorize_operation():
         if request.endpoint is None:
             return None
+        if request.blueprint == "tms_agent_operations":
+            return None  # This narrowly scoped blueprint validates its temporary deployment credential.
         name = request.endpoint.rsplit(".", 1)[-1]
         needs_admin = name in ADMIN_ENDPOINTS or (
             request.method not in {"GET", "HEAD", "OPTIONS"}

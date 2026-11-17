@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="heading"><h1>批量接入 NextSLS V5 供应商</h1><a href="{{ url_for('views.agents') }}">返回代理管理</a></div>
+{% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+<form method="post" enctype="multipart/form-data" class="panel">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <label>代理接入填写表<input type="file" name="accounts" accept=".xlsx" required></label>
+  <p>根据供应商名称和租户匹配已有账号，新增缺失账号。保存前验证各账号渠道，并备份原配置。整批在同一事务中保存。</p>
+  <label class="check-label"><input type="checkbox" name="confirmed" value="yes" required>确认写入真实供应商配置，并保留已有停用状态</label>
+  <button type="submit">验证并保存供应商</button>
+</form>
+{% if result %}<div class="table-wrap"><table><thead><tr><th>代理 ID</th><th>供应商</th><th>API 租户</th><th>App Token</th><th>状态</th><th>渠道数</th><th>完整规则数</th><th>本次操作</th></tr></thead><tbody>
+{% for item in result %}<tr><td>{{ item.id }}</td><td>{{ item.name }}</td><td>{{ item.origin }}</td><td>{{ '已配置' if item.token_configured else '未配置' }}</td><td>{{ '启用' if item.active else '停用' }}</td><td>{{ item.channels }}</td><td>{{ item.complete_rules }}</td><td>{{ '新增' if item.created else '更新' }}</td></tr>{% endfor %}
+</tbody></table></div>{% endif %}
+{% endblock %}
