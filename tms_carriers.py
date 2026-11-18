@@ -651,11 +651,12 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
     if grant:
         order.invoice = {key: value for key, value in order.invoice.items() if key != CREATE_GRANT}
     transition(link, "new", "sending", attempt_at=datetime.utcnow(), tenant_origin=origin)
-    delivery_audit = {"image_rows_verified": len(order.invoice["declarations"])
-                      if encoders and not isinstance(store, files.DirectStore) else 0,
+    image_rows = sum(bool(nextsls.IMAGE_FIELDS & row.keys())
+                     for box in payload["shipment"]["parcels"] for row in box["declarations"])
+    delivery_audit = {"image_rows_verified": image_rows if not isinstance(store, files.DirectStore) else 0,
                       "omitted_legacy_address_fields": omitted}
-    if encoders and isinstance(store, files.DirectStore):
-        delivery_audit["image_rows_published"] = len(order.invoice["declarations"])
+    if image_rows and isinstance(store, files.DirectStore):
+        delivery_audit["image_rows_published"] = image_rows
     if po_rows := invoice_po_rows(invoice, supplement, rules, use_invoice_po):
         delivery_audit["amazon_ref_sources"] = po_rows
     if grant:
@@ -666,7 +667,8 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
         delivery_audit["unknown_rule_attempt"] = {"fields":rules["unknown_rules"],
             "review_basis":grant["review_basis"], "rules_digest":grant["rules_digest"],
             "compatibility_verified":False}
-    delivery_audit["photos_encoding"] = "v5_https_url" if "photos" in encoders else None
+    delivery_audit["photos_encoding"] = "v5_https_url" if any(
+        "photos" in row for box in payload["shipment"]["parcels"] for row in box["declarations"]) else None
     audit(link, "attempt", actor_id, {"state": "sending", **delivery_audit})
     db.session.commit()  # Commit the one-order reservation before contacting the supplier.
 

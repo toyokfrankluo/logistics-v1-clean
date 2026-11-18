@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from hashlib import sha256
 from http.client import HTTPSConnection
 import re
+import json
+from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from flask import current_app
@@ -14,6 +16,7 @@ from tms_xlsx_images import MAX_PHOTO_BYTES, MAX_PHOTO_TOTAL_BYTES
 
 
 # Shared V5 default selected by the operator. This is not evidence of vendor acceptance.
+DECLARATION_CONTRACTS = json.loads(Path(__file__).with_name("nextsls_declaration_contracts.json").read_text())
 IMAGE_TYPES = {"image/png": "png", "image/jpeg": "jpg"}
 MEDIA_ERROR = "未能生成可读取的 HTTPS 商品图片链接，未提交代理下单。"
 
@@ -33,22 +36,36 @@ class ImageStore:
 
 
 def image_delivery(order, profile, rules):
-    """Resolve only the configured account/channel and the fields it actually requires."""
+    """Resolve only the configured account/channel and the mandatory and documented optional fields."""
     encoders = image_field_encoders(order.invoice, profile, order.agent_service, rules)
     store = media_store(order, profile) if encoders else None
     return (store, encoders) if store else (None, {})
 
 
 def image_field_encoders(invoice, profile, channel, rules):
+    if not profile or profile.provider != "nextsls":
+        return {}
     required = nextsls.IMAGE_FIELDS.intersection(nextsls.declaration_requirements(rules))
-    if rules.get("require_declaration_list") is None and invoice["declarations"] and all(
-            item.get("image_part") for item in invoice["declarations"]):
-        required = {"photos"}
+    images_present = bool(invoice["declarations"]) and all(
+        item.get("image_part") for item in invoice["declarations"])
+    if rules.get("require_declaration_list") is None and images_present:
+        required = {"photos"}  # Preserve the legacy compatibility path for unpublished rules.
+    elif not required and images_present and optional_photo_url(profile, channel):
+        required = {"photo_url"}
     encoders = {"photo_url": str} if "photo_url" in required else {}
     encoder = photos_encoder(profile, channel)
     if "photos" in required and encoder is not None:
         encoders["photos"] = encoder
     return encoders
+
+
+def optional_photo_url(profile, channel):
+    configured = getattr(profile, "verified", None) or {}
+    overrides = configured.get("optional_declaration_images", {})
+    documented = DECLARATION_CONTRACTS.get(profile.base_url, {}).get("optional_declaration_image", {})
+    contract = overrides.get(channel, documented)
+    return (isinstance(contract, dict) and contract.get("field") == "photo_url"
+            and contract.get("encoding") == "https_url" and bool(contract.get("evidence")))
 
 
 def photos_encoder(profile, channel):

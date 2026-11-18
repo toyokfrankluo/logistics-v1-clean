@@ -4,6 +4,8 @@ import os
 import time
 from hashlib import sha256
 from unittest.mock import patch
+from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 import unittest
 
 import test_tms_nextsls as fixture
@@ -13,6 +15,7 @@ from tms_models import TmsOrder, TmsSupplierPreviewFile
 from tms_invoice import parse_invoice
 import tms_supplier_files as files
 import nextsls
+import tms_supplier_images as images
 
 
 class FinalAdaptationTests(unittest.TestCase):
@@ -84,12 +87,14 @@ class FinalAdaptationTests(unittest.TestCase):
             self.assertEqual(result.status_code,200)
             manifest=result.get_json()["results"][0]["files"]
             for item in manifest:
-                from urllib.parse import urlsplit
                 url=urlsplit(item["url"])
                 self.assertEqual(self.alice.get(url.path).status_code,404)
                 response=self.alice.get(url.path+"?"+url.query)
                 self.assertEqual(response.status_code,200)
                 self.assertEqual(sha256(response.data).hexdigest(),item["sha256"])
+                expiry = files.signer().loads(parse_qs(url.query)["s"][0])[2]
+                with patch("tms_supplier_files.time", return_value=expiry):
+                    self.assertEqual(self.alice.get(url.path+"?"+url.query).status_code, 404)
                 self.assertEqual(files.preview_reference(item["url"],self.agent.id,invoice,item["slot"]),item["url"])
                 with self.assertRaises(ValueError):files.preview_reference(item["url"],self.agent.id+1,invoice,item["slot"])
             deliveries={str(self.agent.id):{item["slot"]:item["url"] for item in manifest}}
@@ -103,3 +108,33 @@ class FinalAdaptationTests(unittest.TestCase):
                             json={"batch_id":"a"*32}).get_json()["deleted"],4)
             self.assertEqual(TmsSupplierPreviewFile.query.count(),0)
         self.carrier_post.assert_not_called()
+
+    def test_documented_optional_url_and_required_photos_keep_different_roles(self):
+        invoice = parse_invoice(fixture.fixture.workbook_bytes())
+        tenant = SimpleNamespace(provider="nextsls", base_url="https://zwgylx.nextsls.com", verified={})
+        other = SimpleNamespace(provider="nextsls", base_url="https://unregistered.nextsls.com", verified={})
+        rules = fixture.SERVICE | {"require_declaration_list": []}
+        def encoders(profile, requirements):
+            return images.image_field_encoders(invoice, profile, "TMS_DEMO", requirements)
+        self.assertEqual(set(encoders(tenant, rules)), {"photo_url"})
+        self.assertEqual(set(encoders(other, rules)), set())
+        links = [f"https://files.example.com/image-{i}.png" for i in range(len(invoice["declarations"]))]
+        def build(requirements, publisher, fields):
+            return nextsls.create_payload(invoice, "TMS_DEMO", "XR-DEMO", requirements, {},
+                image_fields=fields, publish_image_fields=publisher,
+                photos_protocol_confirmed=True)["shipment"]
+        fields = encoders(tenant, rules)
+        payload = build(rules, lambda: images.encode_image_urls(links, fields), fields)
+        rows = [row for box in payload["parcels"] for row in box["declarations"]]
+        self.assertCountEqual([row["photo_url"] for row in rows], links)
+        self.assertTrue(all("photos" not in row and "sale_url" not in row for row in rows))
+        self.assertEqual([len(b["declarations"]) for b in payload["parcels"]], [2, 1])
+        self.assertEqual(set(encoders(tenant, dict(rules, require_declaration_list=["photos"]))), {"photos"})
+        def failed_publish():
+            raise nextsls.ProtocolError("临时文件发布失败")
+        degraded = build(rules, failed_publish, fields)
+        self.assertFalse(any("photo_url" in row for box in degraded["parcels"] for row in box["declarations"]))
+        with self.assertRaisesRegex(nextsls.ProtocolError, "临时文件发布失败"):
+            build(dict(rules, require_declaration_list=["photo_url"]), failed_publish, fields)
+        invoice["declarations"][0].pop("image_part")
+        self.assertEqual(encoders(tenant, rules), {})

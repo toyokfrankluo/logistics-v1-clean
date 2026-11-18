@@ -579,7 +579,15 @@ def create_payload(invoice, code, reference, profile, sender, *, supplement=None
     if preflight:
         return None
     if image_fields:
-        references = publish_image_fields()
+        try:
+            references = publish_image_fields()
+        except ProtocolError:
+            # A documented optional image must not prevent a shipment that does not require one.
+            if rules_have_optional_image(profile, requirements, image_fields):
+                references = [{} for _ in declarations]
+                image_fields = frozenset()
+            else:
+                raise
         if not isinstance(references, (list, tuple)) or len(references) != len(declarations):
             raise ProtocolError("商品图片链接数量与申报行数不一致。")
         for declaration, values in zip(declarations, references):
@@ -599,6 +607,11 @@ def create_payload(invoice, code, reference, profile, sender, *, supplement=None
         shipment["attachments"] = [attachment]
     shipment.update(parcels=list(parcels.values()), parcel_count=str(len(parcels)))
     return {"shipment": shipment}
+
+
+def rules_have_optional_image(profile, requirements, fields):
+    return (profile.get("require_declaration_list") is not None
+            and not IMAGE_FIELDS.intersection(requirements) and fields == {"photo_url"})
 
 
 def product_photo_url(value):

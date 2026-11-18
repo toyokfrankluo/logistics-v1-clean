@@ -11,12 +11,71 @@
     "packing_attachment": {
       "file_type": null,
       "evidence": "官方 V5 文档 2-1 和 2-3 创建附件仅定义 name、url。https://jinsda.nextsls.com/api/v5/docs/markdown"
+    },
+    "optional_declaration_image": {
+      "field": "photo_url",
+      "encoding": "https_url",
+      "evidence": "https://jinsda.nextsls.com/api/v5/docs/markdown §2-3: declarations.photo_url is an optional String image link"
     }
   },
   "https://mtjgyl.nextsls.com": {
     "packing_attachment": {
       "file_type": null,
       "evidence": "官方 V5 文档 2-1 和 2-3 创建附件仅定义 name、url。https://mtjgyl.nextsls.com/api/v5/docs/markdown"
+    },
+    "optional_declaration_image": {
+      "field": "photo_url",
+      "encoding": "https_url",
+      "evidence": "https://mtjgyl.nextsls.com/api/v5/docs/markdown §2-3: declarations.photo_url is an optional String image link"
+    }
+  },
+  "https://zwgylx.nextsls.com": {
+    "optional_declaration_image": {
+      "field": "photo_url",
+      "encoding": "https_url",
+      "evidence": "https://zwgylx.nextsls.com/api/v5/docs/markdown §2-3: declarations.photo_url is an optional String image link"
+    }
+  },
+  "https://yiyang.nextsls.com": {
+    "optional_declaration_image": {
+      "field": "photo_url",
+      "encoding": "https_url",
+      "evidence": "https://yiyang.nextsls.com/api/v5/docs/markdown §2-3: declarations.photo_url is an optional String image link"
+    }
+  },
+  "https://gdltkj.nextsls.com": {
+    "optional_declaration_image": {
+      "field": "photo_url",
+      "encoding": "https_url",
+      "evidence": "https://gdltkj.nextsls.com/api/v5/docs/markdown §2-3: declarations.photo_url is an optional String image link"
+    }
+  },
+  "https://szlxgj.nextsls.com": {
+    "optional_declaration_image": {
+      "field": "photo_url",
+      "encoding": "https_url",
+      "evidence": "https://szlxgj.nextsls.com/api/v5/docs/markdown §2-3: declarations.photo_url is an optional String image link"
+    }
+  },
+  "https://xmsdwl.nextsls.com": {
+    "optional_declaration_image": {
+      "field": "photo_url",
+      "encoding": "https_url",
+      "evidence": "https://xmsdwl.nextsls.com/api/v5/docs/markdown §2-3: declarations.photo_url is an optional String image link"
+    }
+  },
+  "https://zjmrzx.nextsls.com": {
+    "optional_declaration_image": {
+      "field": "photo_url",
+      "encoding": "https_url",
+      "evidence": "https://zjmrzx.nextsls.com/api/v5/docs/markdown §2-3: declarations.photo_url is an optional String image link"
+    }
+  },
+  "https://szswxx.nextsls.com": {
+    "optional_declaration_image": {
+      "field": "photo_url",
+      "encoding": "https_url",
+      "evidence": "https://szswxx.nextsls.com/api/v5/docs/markdown §2-3: declarations.photo_url is an optional String image link"
     }
   }
 }
