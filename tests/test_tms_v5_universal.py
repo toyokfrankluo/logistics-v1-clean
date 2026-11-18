@@ -63,6 +63,21 @@ class UniversalV5Tests(unittest.TestCase):
             nextsls.create_payload(invoice,"PARTIAL","XR-PREVIEW",partial,{})
         with self.assertRaises(nextsls.ProtocolError):nextsls.preparation_rules({"email_required":"maybe"})
 
+    def test_packing_attachment_uses_each_documented_v5_shape(self):
+        url = "https://files.example.com/packing.xlsx"
+        for host, file_type in (("jinsda", None), ("mtjgyl", None), ("bckjkj", "order"), ("future", "order")):
+            with self.subTest(tenant=host):
+                profile = SimpleNamespace(base_url=f"https://{host}.nextsls.com")
+                rules = nextsls.preparation_rules({"code": "OCEAN"}) if file_type is None else (
+                    fixture.SERVICE | {"packing_list_required": 1})
+                payload = nextsls.create_payload(self.invoice(), "OCEAN", "XR-TEST", rules, {},
+                    packing_host="files.example.com", publish_packing=lambda: url, include_packing=True,
+                    packing_file_type=tms_carriers.packing_attachment_file_type(profile))
+                expected = {"name": "packing.xlsx", "url": url}
+                if file_type:
+                    expected["file_type"] = file_type
+                self.assertEqual(payload["shipment"]["attachments"], [expected])
+
     def test_unknown_rules_need_explicit_order_grant_and_timeout_locks_second_attempt(self):
         self.profile(rules={})
         oid=self.approve()

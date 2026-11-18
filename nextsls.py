@@ -444,7 +444,8 @@ def unverified_destination_fields(invoice):
 
 def create_payload(invoice, code, reference, profile, sender, *, supplement=None, packing_host="",
                    publish_photos=None, publish_packing=None, image_fields=(), publish_image_fields=None,
-                   photos_protocol_confirmed=False, use_invoice_po=False, preflight=False, include_packing=False):
+                   photos_protocol_confirmed=False, use_invoice_po=False, preflight=False, include_packing=False,
+                   packing_file_type="order"):
     """Translate a reviewed invoice; do not manufacture fields missing for the selected service."""
     if not CODE.fullmatch(code) or not CODE.fullmatch(reference):
         raise ProtocolError("渠道代码或系统对账参考号无效。")
@@ -592,7 +593,10 @@ def create_payload(invoice, code, reference, profile, sender, *, supplement=None
         url = publish_packing()
         if packing_url_host(url) != packing_host:
             raise ProtocolError("自动生成的装箱单链接与已授权的附件域名不一致。")
-        shipment["attachments"] = [{"name": "packing.xlsx", "file_type": "order", "url": url}]
+        attachment = {"name": "packing.xlsx", "url": url}
+        if packing_file_type is not None:
+            attachment["file_type"] = packing_file_type
+        shipment["attachments"] = [attachment]
     shipment.update(parcels=list(parcels.values()), parcel_count=str(len(parcels)))
     return {"shipment": shipment}
 

@@ -353,6 +353,7 @@ def preflight_operation():
                 payload = nextsls.create_payload(deepcopy(invoice), code, "XR-PREFLIGHT-NOT-SENT", rules,
                     profile.sender, image_fields=image_fields, packing_host=fixture_host,
                     include_packing=bool(store) and rules["packing_list_required"] is None,
+                    packing_file_type=tms_carriers.packing_attachment_file_type(profile),
                     photos_protocol_confirmed=bool(encoder),
                     publish_image_fields=(lambda: [{key: actual[str(i)] if actual else f"https://{fixture_host}/preflight-not-published/photo-{i}.png"
                                                    for key in image_fields} for i in range(len(invoice["declarations"]))])

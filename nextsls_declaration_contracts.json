@@ -6,5 +6,17 @@
         "evidence": "既有搏诚 WOS 商品 PO Number 列绑定 amazon_ref_id，且已按审核发票完成经授权真实创建。"
       }
     }
+  },
+  "https://jinsda.nextsls.com": {
+    "packing_attachment": {
+      "file_type": null,
+      "evidence": "官方 V5 文档 2-1 和 2-3 创建附件仅定义 name、url。https://jinsda.nextsls.com/api/v5/docs/markdown"
+    }
+  },
+  "https://mtjgyl.nextsls.com": {
+    "packing_attachment": {
+      "file_type": null,
+      "evidence": "官方 V5 文档 2-1 和 2-3 创建附件仅定义 name、url。https://mtjgyl.nextsls.com/api/v5/docs/markdown"
+    }
   }
 }

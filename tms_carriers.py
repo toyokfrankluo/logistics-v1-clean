@@ -446,6 +446,11 @@ def invoice_po_allowed(profile, code):
                 and contract.get("evidence"))
 
 
+def packing_attachment_file_type(profile):
+    contract = DECLARATION_CONTRACTS.get(profile.base_url, {}).get("packing_attachment", {})
+    return contract.get("file_type", "order")
+
+
 def invoice_po_rows(invoice, supplement, rules, use_invoice_po):
     if not use_invoice_po or "amazon_ref_id" not in nextsls.declaration_requirements(rules):
         return []
@@ -604,6 +609,7 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
         photos_protocol_confirmed=images.photos_encoder(profile, code) is not None,
         use_invoice_po=use_invoice_po,
         include_packing=bool(packing_store),
+        packing_file_type=packing_attachment_file_type(profile),
         publish_image_fields=(lambda: images.publish_images(store, order, profile, original_photos(order), encoders))
         if encoders else None,
         publish_packing=(lambda: packing_publisher(packing_draft(order).getvalue()))
@@ -721,6 +727,7 @@ def preview_supplier_files(order, profile):
                                           for ref in references],
             use_invoice_po=use_invoice_po,
             include_packing=rules["packing_list_required"] is None,
+            packing_file_type=packing_attachment_file_type(profile),
         )["shipment"]
     except nextsls.ProtocolError as error:
         return manifest, {"error": str(error)}
