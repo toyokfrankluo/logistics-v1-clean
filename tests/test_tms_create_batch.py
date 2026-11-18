@@ -16,13 +16,14 @@ class BatchTests(unittest.TestCase):
                  "action", "pending_order", "get_order", "sign_in", "upload", "decision", "pricing"):
         locals()[name] = getattr(fixture.NextSLSTests, name)
 
-    def prepared(self):
+    def prepared(self, *, grant=True):
         self.enterContext(patch.dict(app.config, TMS_NEXTSLS_CREATE_MODE="environment",
                                     TMS_NEXTSLS_CREATE_ENABLED=True, TMS_NEXTSLS_READ_ENABLED=True))
         self.profile()
         order_id = self.approve()
-        response = self.action(order_id, "grant_create", revision=3, confirm="yes")
-        self.assertEqual(response.status_code, 302)
+        if grant:
+            response = self.action(order_id, "grant_create", revision=3, confirm="yes")
+            self.assertEqual(response.status_code, 302)
         return order_id
 
     def preview(self):
@@ -77,7 +78,7 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(TmsCreateBatchItem.query.count(), 0)
 
     def test_uncertain_first_order_does_not_block_next_or_send_again(self):
-        first = self.prepared()
+        first = self.prepared(grant=False)
         first_agent = self.agent.id
         self.agent = CarrierAgent(name="另一个模拟代理", is_active=True)
         db.session.add(self.agent)
@@ -92,10 +93,16 @@ class BatchTests(unittest.TestCase):
         second = int(response.location.rsplit("/", 1)[1])
         self.assertEqual(self.post(self.alice, f"/tms/customer/orders/{second}/confirm", {"revision": 1}).status_code, 302)
         self.assertEqual(self.decision(second, 2, decision="approve", **self.pricing(agent_service="TMS_DEMO")).status_code, 302)
-        self.assertEqual(self.action(second, "grant_create", revision=3, confirm="yes").status_code, 302)
         response = self.post(self.staff, PATH, {"action": "preview",
             "agents": f"{first_agent},{self.agent.id}"}, "/login")
         batch = self.confirm(response.get_data(as_text=True)).location.split("?")[0]
+        for order_id in (first, second):
+            order = db.session.get(TmsOrder, order_id)
+            grant = order.invoice["nextsls_create_grant"]
+            self.assertEqual(grant["batch_id"], batch.rsplit("/", 1)[1])
+            self.assertEqual(grant["revision"], order.revision)
+            self.assertEqual(len(order.invoice["supplier_authorization_history"]), 1)
+            self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
         submissions = []
 
         def fake(target, *, json, headers):

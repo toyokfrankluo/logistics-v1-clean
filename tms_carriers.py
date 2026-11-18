@@ -459,6 +459,32 @@ def invoice_po_rows(invoice, supplement, rules, use_invoice_po):
             == nextsls.INVOICE_PO_SOURCE]
 
 
+def make_create_grant(order, profile, actor_id, *, preparation, unknown_confirmed=False,
+                      unknown_basis="", batch_id=None):
+    rules = channel_rules(profile, order.agent_service)
+    unknown = rules.get("unknown_rules", []) if rules else []
+    if unknown and not unknown_confirmed:
+        raise nextsls.ProtocolError("请明确确认渠道存在未知规则，且本票真实资料已完整核对。")
+    now = datetime.now(timezone.utc)
+    grant = {
+        "revision": order.revision + 1, "agent_id": order.agent_id, "service": order.agent_service,
+        "origin": profile.base_url, "actor_id": actor_id, "fees_and_pickup_confirmed": True,
+        "expires_at": int((now + timedelta(minutes=30)).timestamp()),
+    }
+    if approval := preparation["sample_approval"]:
+        grant["sample_approval"] = approval
+    if unknown:
+        grant.update(unknown_rules_confirmed=True, review_basis=nextsls.supplied_text(unknown_basis, 500),
+                     unknown_rules=unknown, rules_digest=nextsls.rules_digest(rules))
+    if batch_id:
+        grant["batch_id"] = batch_id
+    invoice = dict(order.invoice)
+    invoice[CREATE_GRANT] = grant
+    invoice["supplier_authorization_history"] = [*invoice.get("supplier_authorization_history", []),
+        {**grant, "at": now.isoformat(), "compatibility_verified": False if unknown else None}]
+    return invoice
+
+
 def current_create_grant(order, profile, approval=None):
     grant = order.invoice.get(CREATE_GRANT)
     if not grant or not profile:

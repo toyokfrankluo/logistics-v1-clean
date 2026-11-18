@@ -1,5 +1,4 @@
 """Persist a confirmed set of existing single-order grants and dispatch each once."""
-from datetime import datetime, timezone
 from uuid import uuid4
 
 from flask import abort, current_app, jsonify, redirect, render_template, request, url_for
@@ -36,7 +35,7 @@ def signer():
     return URLSafeTimedSerializer(current_app.secret_key, salt="tms-create-batch")
 
 
-def eligibility(order, *, preflight=True):
+def eligibility(order, *, preflight=True, confirm_business=False):
     shipment, agent, profile, link = carriers.operation_context(order, "create")
     if shipment.shipment_id or (link and (link.state != "new" or link.attempt_at)):
         raise nextsls.ProtocolError("本票已有提交记录，不纳入新批次。")
@@ -45,7 +44,8 @@ def eligibility(order, *, preflight=True):
     if blocker:
         raise nextsls.ProtocolError(blocker)
     grant = carriers.current_create_grant(order, profile, approval)
-    if not grant or grant.get("fees_and_pickup_confirmed") is not True:
+    if (not grant or grant.get("fees_and_pickup_confirmed") is not True) and (
+            not confirm_business or order.invoice.get("workbook_test_sample")):
         raise nextsls.ProtocolError("本票缺少有效的单票授权。")
     if preflight:
         blockers = carriers.supplier_preparation(order, profile, agent)["blockers"]
@@ -91,11 +91,13 @@ def register_routes(staff):
         actor = current_user.id
         latest = db.session.scalars(select(TmsCreateBatch).where(
             TmsCreateBatch.actor_id == actor).order_by(TmsCreateBatch.created_at.desc()).limit(20)).all()
-        rows, rejected, confirmation, next_after = [], [], None, None
+        rows, rejected, confirmation, next_after, unknown_ids = [], [], None, None, []
         if request.method == "POST" and request.form.get("action") == "confirm":
             try:
-                who, batch_id, manifest = signer().loads(request.form.get("preview", ""), max_age=600)
-            except BadData:
+                version, who, batch_id, manifest = signer().loads(request.form.get("preview", ""), max_age=600)
+                if version != 2:
+                    raise BadData("stale preview")
+            except (BadData, ValueError):
                 abort(409, "批次预览已过期，请重新核对。")
             if who != actor or request.form.get("confirmed") != "yes":
                 abort(403)
@@ -103,16 +105,36 @@ def register_routes(staff):
                 return redirect(url_for("tms_staff.create_batch_detail", batch_id=batch_id))
             if not control.enabled():
                 abort(409, "站点真实下单许可尚未开启。")
-            for snapshot in manifest:
+            staged = []
+            for snapshot, digest in manifest:
                 order = db.session.get(TmsOrder, snapshot[0], with_for_update=True)
                 try:
-                    if order is None or eligibility(order) != snapshot:
+                    if order is None or eligibility(order, confirm_business=True) != snapshot:
                         raise nextsls.ProtocolError("订单版本、渠道或授权已变化。")
-                    rows.append(snapshot)
+                    profile = db.session.get(TmsAgentApi, order.agent_id)
+                    rules = carriers.channel_rules(profile, order.agent_service)
+                    if nextsls.rules_digest(rules) != digest:
+                        raise nextsls.ProtocolError("渠道规则已变化，请重新预览。")
+                    agent = db.session.get(CarrierAgent, order.agent_id)
+                    grant = carriers.current_create_grant(order, profile,
+                        carriers.sample_create_approval(order, profile, agent))
+                    if not grant or grant.get("fees_and_pickup_confirmed") is not True:
+                        invoice = carriers.make_create_grant(order, profile, actor,
+                            preparation={"sample_approval": None}, batch_id=batch_id,
+                            unknown_confirmed=request.form.get("unknown_confirmed") == "yes",
+                            unknown_basis=request.form.get("unknown_basis", ""))
+                        staged.append((order, invoice))
+                        rows.append([snapshot[0], snapshot[1] + 1, *snapshot[2:]])
+                    else:
+                        rows.append(snapshot)
                 except nextsls.ProtocolError as error:
                     rejected.append((snapshot[0], str(error)))
             # Do not silently change the confirmed set. No requests are made on this route.
             if not rejected:
+                from tms_portal import history, update_order
+                for order, invoice in staged:
+                    update_order(order, {"invoice": invoice})
+                    history(order, "supplier_grant")
                 db.session.add(TmsCreateBatch(id=batch_id, actor_id=actor))
                 db.session.add_all(TmsCreateBatchItem(batch_id=batch_id, order_id=o, revision=r,
                                                       agent_id=a, channel=c) for o, r, a, c in rows)
@@ -132,23 +154,29 @@ def register_routes(staff):
                 abort(400)
             candidates = db.session.scalars(select(TmsOrder).where(
                 TmsOrder.agent_id.in_(chosen), TmsOrder.status == "approved", TmsOrder.id > after,
-                TmsOrder.invoice[carriers.CREATE_GRANT]["expires_at"].as_integer() > int(datetime.now(timezone.utc).timestamp()),
                 TmsOrder.invoice["order_archive"]["at"].as_string().is_(None),
                 ~select(TmsCreateBatchItem.order_id).where(TmsCreateBatchItem.order_id == TmsOrder.id,
                     TmsCreateBatchItem.revision == TmsOrder.revision).exists()
             ).order_by(TmsOrder.id).limit(LIMIT + 1)).all()
             if len(candidates) > LIMIT:
                 next_after = candidates[LIMIT - 1].id
+            manifest = []
             for order in candidates[:LIMIT]:
                 try:
-                    rows.append(eligibility(order))
+                    snapshot = eligibility(order, confirm_business=True)
+                    profile = db.session.get(TmsAgentApi, order.agent_id)
+                    rules = carriers.channel_rules(profile, order.agent_service)
+                    if rules.get("unknown_rules"):
+                        unknown_ids.append(order.id)
+                    rows.append(snapshot)
+                    manifest.append([snapshot, nextsls.rules_digest(rules)])
                 except nextsls.ProtocolError as error:
                     rejected.append((order.id, str(error)))
             if rows:
-                confirmation = signer().dumps([actor, uuid4().hex, rows])
+                confirmation = signer().dumps([2, actor, uuid4().hex, manifest])
         return render_template("tms/create_batch.html", staff=True, agents=agents, rows=rows,
                                rejected=rejected, preview=confirmation, latest=latest, enabled=control.enabled(),
-                               next_after=next_after, chosen=request.form.getlist("agents"))
+                               unknown_ids=unknown_ids, next_after=next_after, chosen=request.form.getlist("agents"))
 
     @staff.get("/nextsls-batches/<batch_id>")
     def create_batch_detail(batch_id):

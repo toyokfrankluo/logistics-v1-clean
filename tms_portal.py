@@ -1068,27 +1068,9 @@ def change_create_grant(order, *, revoke):
         blockers = preparation["blockers"]
         if blockers:
             raise nextsls.ProtocolError("；".join(blockers) + "。")
-        rules = tms_carriers.channel_rules(profile, order.agent_service)
-        unknown = rules.get("unknown_rules", []) if rules else []
-        basis = ""
-        if unknown:
-            if request.form.get("unknown_rules_confirmed") != "yes":
-                raise nextsls.ProtocolError("请明确确认渠道存在未知规则，且本票真实资料已完整核对。")
-            basis = nextsls.supplied_text(request.form.get("unknown_rules_basis"), 500)
-        grant = {
-            "revision": order.revision + 1, "agent_id": order.agent_id, "service": order.agent_service,
-            "origin": profile.base_url, "actor_id": current_user.id,
-            "fees_and_pickup_confirmed": True,
-            "expires_at": int((datetime.now(timezone.utc) + timedelta(minutes=30)).timestamp()),
-        }
-        if approval := preparation["sample_approval"]:
-            grant["sample_approval"] = approval
-        if unknown:
-            grant.update(unknown_rules_confirmed=True, review_basis=basis,
-                         unknown_rules=unknown, rules_digest=nextsls.rules_digest(rules))
-        invoice[tms_carriers.CREATE_GRANT] = grant
-        invoice["supplier_authorization_history"] = [*invoice.get("supplier_authorization_history", []),
-            {**grant, "at":datetime.now(timezone.utc).isoformat(), "compatibility_verified":False if unknown else None}]
+        invoice = tms_carriers.make_create_grant(order, profile, current_user.id, preparation=preparation,
+            unknown_confirmed=request.form.get("unknown_rules_confirmed") == "yes",
+            unknown_basis=request.form.get("unknown_rules_basis", ""))
     update_order(order, {"invoice": invoice})
     history(order, "supplier_revoke" if revoke else "supplier_grant")
     db.session.commit()
