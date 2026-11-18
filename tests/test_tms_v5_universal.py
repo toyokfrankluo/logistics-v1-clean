@@ -140,6 +140,15 @@ class UniversalV5Tests(unittest.TestCase):
         self.assertIsNone(tms_supplier_images.photos_encoder(profile,"ONE"))
         self.assertIs(tms_supplier_images.photos_encoder(profile,"OTHER"),nextsls.product_photo_url)
 
+    def test_current_list_alias_retains_exact_reference_and_uniqueness_checks(self):
+        record={"shipment_id":"SYNTHETIC-1","client_reference":"XR-REFERENCE"}
+        for key in ("shipment","list"):
+            self.assertEqual(nextsls.lookup_created({key:[record]},"XR-REFERENCE"),"SYNTHETIC-1")
+            self.assertIsNone(nextsls.lookup_created({key:[]},"XR-REFERENCE"))
+            for value in ({key:[record,record]},{key:[record | {"client_reference":"OTHER"}]},
+                          {key:{}},{"shipment":[record],"list":[record]}):
+                with self.assertRaises(nextsls.ProtocolError):nextsls.lookup_created(value,"XR-REFERENCE")
+
     def test_quick_connect_authentication_failure_saves_no_new_account(self):
         self.staff_login()
         with patch("carrier_http.get_document",side_effect=carrier_http.CarrierRequestError()), patch(

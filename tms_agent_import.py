@@ -193,6 +193,7 @@ def verify_existing_operation():
         result["invoice_reference_matches"]=info.get("client_reference") == order.invoice["customer_number"]
         result["reference_field_present"]="client_reference" in info
         result["reference_type"]=type(info.get("client_reference")).__name__
+        result["reference_empty"]=not info.get("client_reference")
         result["reference_1_matches"]=info.get("reference_1") == order.invoice["customer_number"]
         service=info.get("service_code",info.get("service"))
         if isinstance(service,dict):service=service.get("code")
@@ -202,7 +203,7 @@ def verify_existing_operation():
     try:
         listing = nextsls.request_data(agent, profile.base_url, "/shipment/list",
             {"shipment":{"client_reference":link.client_reference,"page":1,"page_size":2}},transport=observed)
-        rows=listing.get("shipment")
+        rows=nextsls.shipment_list(listing)
         result["list_shape"]={"keys":sorted(listing),"shipment_type":type(rows).__name__,
             "count":len(rows) if isinstance(rows,(list,dict)) else None}
         result["list_matches"]=nextsls.lookup_created(listing, link.client_reference) == link.supplier_number
@@ -211,7 +212,7 @@ def verify_existing_operation():
     try:
         by_id=nextsls.request_data(agent,profile.base_url,"/shipment/list",
             {"shipment":{"shipment_id":link.supplier_number,"page":1,"page_size":2}},transport=observed)
-        rows=by_id.get("shipment")
+        rows=nextsls.shipment_list(by_id)
         result["list_by_id_shape"]={"keys":sorted(by_id),"shipment_type":type(rows).__name__,
             "count":len(rows) if isinstance(rows,(list,dict)) else None}
         result["list_by_id_matches"]=(isinstance(rows,list) and len(rows)==1 and isinstance(rows[0],dict)

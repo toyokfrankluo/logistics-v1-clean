@@ -616,8 +616,17 @@ def required_flag(profile, name):
     return value in (1, "1")
 
 
+def shipment_list(data):
+    # Current gateways return data.list; older V5 docs show data.shipment.
+    # Never merge aliases or infer a match from an arbitrary response object.
+    keys = [key for key in ("shipment", "list") if key in data]
+    if len(keys) != 1 or not isinstance(data[keys[0]], list):
+        raise ProtocolError("查询结果格式无效，须人工对账。")
+    return data[keys[0]]
+
+
 def lookup_created(data, reference):
-    matches = data.get("shipment")
+    matches = shipment_list(data)
     if not isinstance(matches, list) or len(matches) > 1:
         raise ProtocolError("查询结果不唯一或格式无效，须人工对账。")
     if not matches:
