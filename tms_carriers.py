@@ -38,6 +38,7 @@ BRAND_ONLY_RULES = {"require_declaration_list": ["brand"]}
 CHANNEL_CATALOGUE_TTL = timedelta(hours=24)
 CREATE_DISABLED = "系统未开放真实下单"
 ACCEPTANCE_COPY_BLOCKER = "这张订单是历史接口验收副本，不能向供应商下单。请选择独立的真实货件。"
+WORKBOOK_SAMPLE_BLOCKER = "原发票标注为非真实货件测试样本，不能向供应商正式下单。"
 CREATE_GRANT = "nextsls_create_grant"
 CREATE_GRANT_REQUIRED = "请先授权本票真实下单"
 READ_DISABLED = "系统未开放 NextSLS 只读请求"
@@ -338,11 +339,19 @@ def destination_for_create(order):
     return dict(invoice, address={key: value for key, value in invoice["address"].items() if key not in omitted}), omitted
 
 
+def supplier_sample_blocker(invoice):
+    if "acceptance_source" in invoice:
+        return ACCEPTANCE_COPY_BLOCKER
+    if invoice.get("workbook_test_sample"):
+        return WORKBOOK_SAMPLE_BLOCKER
+    return None
+
+
 def supplier_preparation(order, profile, agent):
     code = order.agent_service
     blockers = create_blockers(profile, agent, code)
-    if "acceptance_source" in order.invoice:
-        blockers.append(ACCEPTANCE_COPY_BLOCKER)
+    if sample_blocker := supplier_sample_blocker(order.invoice):
+        blockers.append(sample_blocker)
     result = {"blockers": blockers, "missing": {}, "packing_required": None, "required_photo_fields": None,
               "allow_no_model": bool(profile and profile.provider == "nextsls"),
               "image_count": sum(bool(item.get("image_part")) for item in order.invoice["declarations"])}
@@ -493,8 +502,8 @@ def attach_number(shipment, link, number):
 
 
 def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing_publisher=None):
-    if "acceptance_source" in order.invoice:
-        raise nextsls.ProtocolError(ACCEPTANCE_COPY_BLOCKER)
+    if sample_blocker := supplier_sample_blocker(order.invoice):
+        raise nextsls.ProtocolError(sample_blocker)
     if ((photo_publisher is not None or packing_publisher is not None)
             and (transport is None or not current_app.config.get("ISOLATED_MODE"))):
         raise nextsls.ProtocolError("商品图片和装箱单发送目前只允许在隔离模拟中验证。")

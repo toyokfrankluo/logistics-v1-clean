@@ -459,12 +459,16 @@ def parse_invoice(raw):
                     declarations[-1]["amazon_po_candidate"] = po
         if number(rows[14][3], "D15（箱数）", whole=True) != len(boxes):
             raise InvoiceError("发票箱数与不同箱号的数量不一致。")
-        return {
+        invoice = {
             "customer_number": customer_number, "service": service,
             "address_code": address_code, "address": address, "address_source": "workbook", "flags": flags,
             "legacy_optional_placeholders": legacy_placeholders,
             "metadata": metadata, "boxes": list(boxes.values()), "declarations": declarations,
         }
+        if (str(rows[0][0].value or "").lstrip().startswith("【测试样本｜非真实新货件】")
+                or "禁止将样本作为生产新货件提交" in str(rows[20][0].value or "")):
+            invoice["workbook_test_sample"] = True
+        return invoice
 
 
 def product_photos(raw, invoice):

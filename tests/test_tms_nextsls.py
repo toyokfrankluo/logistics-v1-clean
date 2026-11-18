@@ -213,6 +213,41 @@ class NextSLSTests(unittest.TestCase):
         receivable = db.session.get(TmsReceivable, order_id)
         self.assertIsNone(db.session.get(Shipment, receivable.shipment_id).shipment_id)
 
+    def test_marked_workbook_can_be_reviewed_but_never_sent(self):
+        self.profile()
+        for marker_cell, marker in (
+            ("A1", "【测试样本｜非真实新货件】 星睿物流"),
+            ("A21", "仅供测试，禁止将样本作为生产新货件提交"),
+        ):
+            with self.subTest(cell=marker_cell):
+                def mark_sample(book):
+                    sheet = book["星睿发票"]
+                    sheet[marker_cell] = marker
+                    sheet["D4"] = f"TEST-{marker_cell}"
+
+                raw = fixture.workbook_bytes(change=mark_sample)
+                self.assertEqual(self.sign_in(self.alice, "customer-a").status_code, 302)
+                self.assertEqual(self.staff_login().status_code, 302)
+                upload = self.upload(self.alice, raw)
+                self.assertEqual(upload.status_code, 302)
+                order_id = int(upload.location.rsplit("/", 1)[-1])
+                self.assertTrue(db.session.get(TmsOrder, order_id).invoice["workbook_test_sample"])
+                self.assertEqual(self.post(self.alice, upload.location + "/confirm",
+                                           {"revision": 1}).status_code, 302)
+                self.assertEqual(self.decision(order_id, 2, decision="approve", **self.pricing(
+                    agent_service="TMS_DEMO")).status_code, 302)
+                with patch.dict(app.config, TMS_NEXTSLS_CREATE_ENABLED=True, TMS_NEXTSLS_REQUIRE_ORDER_GRANT=True):
+                    page = self.get(self.staff, f"/tms/admin/orders/{order_id}").get_data(as_text=True)
+                    self.assertIn(tms_carriers.WORKBOOK_SAMPLE_BLOCKER, page)
+                    self.assertNotIn('value="grant_create"', page)
+                    self.assertNotIn('value="create"', page)
+                    for action in ("grant_create", "create"):
+                        rejected = self.action(order_id, action, revision=3, confirm="yes")
+                        self.assertEqual(rejected.status_code, 400)
+                        self.assertIn(tms_carriers.WORKBOOK_SAMPLE_BLOCKER, rejected.get_data(as_text=True))
+                self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
+        self.carrier_post.assert_not_called()
+
     def test_approved_excel_creates_once_and_keeps_distinct_identifiers(self):
         order_id = self.pending_order()
         self.assertEqual(self.post(self.staff, "/agents", {
