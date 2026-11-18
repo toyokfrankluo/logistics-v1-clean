@@ -52,9 +52,9 @@ def candidate(invoice, agent, profile, prefer_photos):
     matching_photos=0
     matching=0
     for code, name in tms_carriers.channel_catalogue(profile).items():
-        if invoice["address"]["country"] == "US" and not re.search(r"美国|美西|美东|美森|\bUSA?\b", name, re.I):
+        if invoice["address"]["country"] == "US" and not re.search(r"美国|美西|美东|美森|纽约|萨凡纳|洛杉矶|芝加哥|休斯顿|长滩|\bUSA?\b|DHL|UPS|FedEx", name, re.I):
             continue
-        if re.search("危险|纯电|电池|敏感|电子烟|化妆|自提|自打单|商业地址|带电|食品|纺织",name):
+        if re.search("危险|纯电|电池|敏感|电子烟|化妆|自提|自打单|商业地址|带电|食品|纺织|加拿大|欧洲|英国|日本|澳洲|澳大利亚|德国|法国",name):
             continue
         west={"CA","OR","WA","NV","AZ","UT","ID","MT","WY","CO","NM"}
         if invoice["address"].get("region") not in west and re.search("美西|西岸",name) and not re.search("全美|外州|美东",name):
@@ -70,7 +70,7 @@ def candidate(invoice, agent, profile, prefer_photos):
         packing = images.media_store(order,profile) if rules["packing_list_required"] != 0 else None
         try:
             nextsls.create_payload(invoice,code,"XR-CASE-PREFLIGHT",rules,profile.sender,
-                supplement=tms_carriers.order_supplement(order),image_fields=encoders,
+                supplement=invoice.get("nextsls_supplement",{}),image_fields=encoders,
                 packing_host=packing.host if packing else "",include_packing=bool(packing),
                 use_invoice_po=tms_carriers.invoice_po_allowed(profile,code),preflight=True,
                 photos_protocol_confirmed=images.photos_encoder(profile,code) is not None)
@@ -110,17 +110,26 @@ def prepare(source_id, agent_ids, batch, reason, photo_agents=(), *, revise=Fals
         existing=db.session.scalar(select(TmsOrder).where(TmsOrder.agent_id==aid,
             TmsOrder.invoice["acceptance_source"]["batch"].as_string()==batch))
         if existing:
+            db.session.refresh(existing,with_for_update=True)
             chosen=existing.invoice["acceptance_source"]["candidate"]
-            if revise and existing.status == "pending" and existing.revision == 1 and not existing.invoice.get(tms_carriers.CREATE_GRANT):
+            last_version=existing.invoice["acceptance_source"].get("planner_revision")
+            if last_version is None:
+                last_audit=db.session.scalar(select(TmsAudit).where(TmsAudit.order_id==existing.id).order_by(TmsAudit.id.desc()).limit(1))
+                last_version=existing.revision if last_audit and last_audit.actor_type=="operator" and last_audit.action in {
+                    "acceptance_copy","acceptance_channel"} else 1
+            if revise and existing.status == "pending" and existing.revision == last_version and not existing.invoice.get(tms_carriers.CREATE_GRANT):
                 before=chosen
                 chosen=candidate(existing.invoice,agent,profile,aid in photo_agents)
                 invoice=deepcopy(existing.invoice)
                 invoice["acceptance_source"].update(candidate=chosen)
+                invoice["acceptance_source"]["planner_revision"]=existing.revision+1
                 invoice["acceptance_source"].setdefault("candidate_history",[]).append(before)
                 if chosen.get("code"):
                     invoice.update(supplier_channel={"code":chosen["code"],"name":chosen["name"]},supplier_tenant_origin=profile.base_url)
                 else:
                     invoice.pop("supplier_channel",None)
+                if invoice.get("nextsls_supplement"):
+                    invoice["nextsls_supplement"].update(agent_id=aid,service=chosen.get("code") or "")
                 existing.invoice=invoice
                 existing.agent_service=chosen.get("code")
                 existing.revision+=1

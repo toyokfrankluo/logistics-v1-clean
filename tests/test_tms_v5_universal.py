@@ -257,6 +257,26 @@ class UniversalV5Tests(unittest.TestCase):
         self.assertNotEqual(copy.file_sha256,source.file_sha256)
         self.carrier_post.assert_not_called()
 
+    def test_acceptance_planner_reuses_verified_facts_and_excludes_other_countries(self):
+        import tms_acceptance
+        invoice=self.invoice()
+        invoice["address"].update(country="US",region="PA")
+        invoice["nextsls_supplement"]={"agent_id":4,"service":"ORIGINAL","declarations":{
+            str(i):{"brand":"无","model":"无"} for i in range(len(invoice["declarations"]))}}
+        for row in invoice["declarations"]:
+            row.pop("brand",None);row.pop("model",None)
+        agent=SimpleNamespace(id=13)
+        rule=nextsls.preparation_rules(fixture.SERVICE | {"require_declaration_list":["brand","model"]})
+        profile=SimpleNamespace(provider="nextsls",agent_id=13,base_url="https://other.nextsls.com",sender={})
+        catalogue={"CAN":"CA加拿大美森正班限时达","US":"美国普通测试线"}
+        with patch("tms_carriers.channel_catalogue",return_value=catalogue),patch(
+                "tms_carriers.channel_rules",return_value=rule):
+            chosen=tms_acceptance.candidate(invoice,agent,profile,False)
+        self.assertEqual(chosen["code"],"US")
+        self.assertFalse(chosen["business_suitability_confirmed"])
+        self.assertEqual(invoice["nextsls_supplement"]["agent_id"],4)
+        self.carrier_post.assert_not_called()
+
     def test_existing_success_receipt_uses_read_only_own_account_and_checks_identity(self):
         import os,time
         from hashlib import sha256
@@ -274,11 +294,12 @@ class UniversalV5Tests(unittest.TestCase):
         secret="synthetic-read-only-proof"
         with patch.dict(os.environ,RENDER="true"),patch.dict(app.config,TMS_NEXTSLS_CREATE_ENABLED=False,
                 TMS_AGENT_IMPORT_SCOPE="preflight",TMS_AGENT_IMPORT_KEY_SHA256=sha256(secret.encode()).hexdigest(),
-                TMS_AGENT_IMPORT_KEY_EXPIRES=int(time.time())+600),patch("carrier_http.post",side_effect=[fixture.success(info),fixture.success(listed)]) as http:
+                TMS_AGENT_IMPORT_KEY_EXPIRES=int(time.time())+600),patch("carrier_http.post",side_effect=[fixture.success(info),fixture.success(listed),fixture.success(listed)]) as http:
             result=self.staff.post("/tms/operations/agents/verify-existing",json={"order_id":oid},
                 headers={"Authorization":"Bearer "+secret})
         self.assertEqual(result.status_code,200)
         self.assertTrue(all(result.json[key] for key in ("number_matches","reference_matches","channel_matches","list_matches")))
         self.assertFalse(result.json["create_called"])
-        self.assertEqual([call.args[0].api_url.rsplit("/",1)[-1] for call in http.call_args_list],["get_info","list"])
+        self.assertTrue(result.json["list_by_id_matches"])
+        self.assertEqual([call.args[0].api_url.rsplit("/",1)[-1] for call in http.call_args_list],["get_info","list","list"])
         self.assertTrue(all(call.kwargs["headers"]["Authorization"]=="Bearer "+fixture.TOKEN for call in http.call_args_list))
