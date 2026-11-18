@@ -651,11 +651,11 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
     if grant:
         order.invoice = {key: value for key, value in order.invoice.items() if key != CREATE_GRANT}
     transition(link, "new", "sending", attempt_at=datetime.utcnow(), tenant_origin=origin)
-    image_rows = sum(bool(nextsls.IMAGE_FIELDS & row.keys())
-                     for box in payload["shipment"]["parcels"] for row in box["declarations"])
+    image_delivery = image_delivery_summary(payload["shipment"], encoders)
+    image_rows = image_delivery["rows_in_request"]
     delivery_audit = {"image_rows_verified": image_rows if not isinstance(store, files.DirectStore) else 0,
-                      "omitted_legacy_address_fields": omitted}
-    if image_rows and isinstance(store, files.DirectStore):
+                      "image_delivery": image_delivery, "omitted_legacy_address_fields": omitted}
+    if isinstance(store, files.DirectStore):
         delivery_audit["image_rows_published"] = image_rows
     if po_rows := invoice_po_rows(invoice, supplement, rules, use_invoice_po):
         delivery_audit["amazon_ref_sources"] = po_rows
@@ -692,7 +692,7 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
         link = db.session.get(TmsSupplierOrder, order.id)
         transition(link, "sending", "uncertain")
         reason = str(error) if isinstance(error, nextsls.ProtocolError) else "供应商结果未能关联，请先对账。"
-        details = {"state": "uncertain", "reason": reason}
+        details = {"state": "uncertain", "reason": reason, **delivery_audit}
         if approval:
             details["sample_approval"] = approval
         if isinstance(error, nextsls.CreateRejected):
@@ -727,14 +727,37 @@ def original_photos(order):
         raise nextsls.ProtocolError(str(exc)) from None
 
 
+def image_delivery_summary(shipment, fields):
+    rows = [row for parcel in shipment.get("parcels", []) for row in parcel["declarations"]]
+    encoded = nextsls.IMAGE_FIELDS.intersection(key for row in rows for key in row)
+    return {"fields_in_request": sorted(encoded),
+            "rows_in_request": sum(bool(nextsls.IMAGE_FIELDS & row.keys()) for row in rows),
+            "status": ("included" if encoded else
+                       "optional_publication_failed" if fields else "not_included")}
+
+
 def preview_supplier_files(order, profile):
     """Stage short-lived copies using the real publishers, without initiating a carrier operation."""
     store = files.direct_store(order, profile)
     if not store:
         raise nextsls.ProtocolError("星睿 HTTPS 文件服务暂未就绪。")
-    photos = original_photos(order) if all(item.get("image_part") for item in order.invoice["declarations"]) else []
-    references = (images.publish_images(store, order, profile, photos, {"photo_url": nextsls.product_photo_url},
-                                       preview=True) if photos else [])
+    rules = channel_rules(profile, order.agent_service)
+    encoders = images.image_delivery(order, profile, rules)[1] if rules is not None else {}
+    photo_error = None
+    photos, references = [], []
+    try:
+        if all(item.get("image_part") for item in order.invoice["declarations"]):
+            photos = original_photos(order)
+            references = images.publish_images(store, order, profile, photos,
+                {"photo_url": nextsls.product_photo_url}, preview=True) if photos else []
+    except nextsls.ProtocolError as error:
+        photo_error = error
+
+    def preview_image_fields():
+        if photo_error:
+            raise photo_error
+        return images.encode_image_urls((ref["photo_url"] for ref in references), encoders)
+
     packing = packing_draft(order).getvalue()
     attachment = images.publish_packing(store, order, profile, packing, preview=True)
     if nextsls.packing_url_host(attachment) != store.host:
@@ -743,10 +766,8 @@ def preview_supplier_files(order, profile):
     pairs.append((attachment, files.PACKING_MIME, packing))
     manifest = [{"url": url, "mime": mime, "bytes": len(data), "sha256": sha256(data).hexdigest()}
                 for url, mime, data in pairs]
-    rules = channel_rules(profile, order.agent_service)
     if rules is None:
         return manifest, {"error": "当前渠道规则未就绪，文件验收独立于下单。"}
-    _, encoders = images.image_delivery(order, profile, rules)
     use_invoice_po = invoice_po_allowed(profile, order.agent_service)
     invoice, _ = destination_for_create(order)
     supplement = order_supplement(order)
@@ -755,7 +776,7 @@ def preview_supplier_files(order, profile):
             invoice, order.agent_service, "XR-PREVIEW", rules, profile.sender, supplement=supplement,
             packing_host=store.host, publish_packing=lambda: attachment,
             image_fields=encoders, photos_protocol_confirmed=images.photos_encoder(profile, order.agent_service) is not None,
-            publish_image_fields=lambda: images.encode_image_urls((ref["photo_url"] for ref in references), encoders),
+            publish_image_fields=preview_image_fields,
             use_invoice_po=use_invoice_po,
             include_packing=rules["packing_list_required"] is None,
             packing_file_type=packing_attachment_file_type(profile),
@@ -766,6 +787,7 @@ def preview_supplier_files(order, profile):
     return manifest, {
         "status": "规则未知，首次真实提交待验证" if rules.get("unknown_rules") else "通用请求预检通过",
         "unknown_rules":rules.get("unknown_rules", []), "payload":{"shipment":payload},
+        "image_delivery": image_delivery_summary(payload, encoders),
         "combined": bool(payload.get("attachments") and any(nextsls.IMAGE_FIELDS & row.keys() for row in rows)),
         "po_rows": len(invoice_po_rows(invoice, supplement, rules, use_invoice_po)),
     }

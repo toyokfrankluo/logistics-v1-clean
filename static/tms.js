@@ -126,7 +126,10 @@ document.addEventListener("submit", async (event) => {
     const draftStatus = draft.error ? `下单预览：${draft.error}`
       : draft.combined ? `下单预览同时包含图片和装箱单，${draft.po_rows} 行使用客户原始发票 PO。`
       : "下单预览已通过当前渠道规则。";
-    status.textContent = `外部 HTTPS 验收通过：${images} 张商品图及 packing.xlsx 均无 Cookie 读取成功，字节一致；无签名请求被拒绝。装箱单链接 ${attachments[0]} 字符。${draft.status || draftStatus}`;
+    const imageStatus = draft.image_delivery?.status === "optional_publication_failed"
+      ? " 可选图片发布失败，创建预览不包含图片。"
+      : draft.image_delivery ? ` 创建预览包含 ${draft.image_delivery.rows_in_request} 行图片链接。` : "";
+    status.textContent = `外部 HTTPS 验收通过：${images} 张商品图及 packing.xlsx 均无 Cookie 读取成功，字节一致；无签名请求被拒绝。装箱单链接 ${attachments[0]} 字符。${draft.error ? draftStatus : (draft.status || draftStatus)}${imageStatus}`;
   } catch {
     status.textContent = "外部 HTTPS 验收未通过。请刷新订单页后重试。";
   } finally {

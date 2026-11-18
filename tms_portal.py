@@ -928,7 +928,7 @@ def staff_detail(order, **context):
             supplier = {
                 "link": link, "snapshot": snapshot, "cost": cost, "supplier_number": shipment.shipment_id,
                 "last_attempt": (tms_carriers.latest_event(order.id, "attempt")
-                                 if link and link.state == "uncertain" else None),
+                                 if link and link.state in {"sending", "uncertain", "not_found", "linked"} else None),
                 "agent_name": agent.name if agent else "—",
                 "agent_active": bool(agent and agent.is_active),
                 "preparation": preparation, "agent_id": agent.id if agent else None,

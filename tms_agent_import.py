@@ -32,6 +32,18 @@ operations = Blueprint("tms_agent_operations", __name__, url_prefix="/tms/operat
 def authorize_operation():
     # A temporary deployment credential grants scoped configuration and read-only verification.
     # Only its SHA-256 digest is stored in Render. It cannot create shipments or log in as a user.
+    # The short-lived media verifier can only stage, inspect and clean up preview files.
+    media_digest = os.getenv("TMS_MEDIA_ACCEPTANCE_DIGEST", "")
+    media_expiry = os.getenv("TMS_MEDIA_ACCEPTANCE_EXPIRES", "")
+    supplied = request.headers.get("Authorization", "").removeprefix("Bearer ")
+    if media_digest and compare_digest(sha256(supplied.encode()).hexdigest(), media_digest):
+        if (os.getenv("RENDER") != "true" or tms_create_control.enabled()
+                or not current_app.config.get("TMS_ENABLED")
+                or not media_expiry.isdigit() or time() >= int(media_expiry)
+                or request.endpoint not in {"tms_agent_operations.preflight_operation",
+                                            "tms_agent_operations.preflight_files_operation"}):
+            abort(404)
+        return
     digest = current_app.config.get("TMS_AGENT_IMPORT_KEY_SHA256", "")
     expiry = current_app.config.get("TMS_AGENT_IMPORT_KEY_EXPIRES", 0)
     supplied = request.headers.get("Authorization", "").removeprefix("Bearer ")
@@ -434,7 +446,7 @@ def preflight_files_operation():
         manifest = files.stage_preview_files(store, batch_id, agent.id, invoice, uploads)
         results.append({"agent_id": agent.id, "name": agent.name, "files": manifest})
     db.session.commit()
-    return jsonify(batch_id=batch_id, results=results)
+    return jsonify(batch_id=batch_id, results=results, production_file_ttl_seconds=store.ttl)
 
 
 def parse_accounts(raw):

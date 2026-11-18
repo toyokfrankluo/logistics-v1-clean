@@ -19,7 +19,7 @@
     真实创建：{{ '站点已开放' if supplier.site_create_enabled else '等待管理员启用' }} ·
     本票授权：{{ '有效' if supplier.create_grant else '未授权' }}</p>
   {% set states = {'new':'待提交代理', 'sending':'提交中 · 已预留', 'uncertain':'待对账 · 提交结果未确认', 'not_found':'列表无匹配，待人工核实', 'linked':'代理已接单 · 单号已关联'} %}
-  <p><span class="badge">{% if supplier.last_attempt and supplier.last_attempt.details.supplier_rejected %}代理返回失败 · 待对账{% else %}{{ states[link.state] if link else ('已录入供应商单号' if supplier.supplier_number else '待提交代理') }}{% endif %}</span>
+  <p><span class="badge">{% if link and link.state == "uncertain" and supplier.last_attempt and supplier.last_attempt.details.supplier_rejected %}代理返回失败 · 待对账{% else %}{{ states[link.state] if link else ('已录入供应商单号' if supplier.supplier_number else '待提交代理') }}{% endif %}</span>
     {% if supplier.supplier_number %} · {{ supplier.supplier_number }}{% endif %}
     {% if link %} · 对账参考号 <code>{{ link.client_reference }}</code>{% endif %}</p>
   {% if preparation %}
@@ -48,6 +48,12 @@
       {% else %}当前渠道规则未要求图片字段{% endif %}</dd></div>
     {% if preparation.photos_protocol_confirmed and (preparation.required_photo_fields is none or 'photos' in preparation.required_photo_fields) %}
     <div><dt>图片编码</dt><dd>通用 V5 默认：photos 使用完整签名 HTTPS URL 字符串；实际兼容以供应商响应为准</dd></div>
+    {% endif %}
+    {% if supplier.last_attempt and supplier.last_attempt.details.image_delivery %}
+    {% set delivery = supplier.last_attempt.details.image_delivery %}
+    <div><dt>本次创建请求的图片</dt><dd>{% if delivery.status == 'optional_publication_failed' %}可选图片发布失败，创建请求未包含图片。
+      {% elif delivery.rows_in_request %}请求包含 {{ delivery.rows_in_request }} 行图片链接；不代表供应商已读取。
+      {% else %}创建请求未包含图片。{% endif %}</dd></div>
     {% endif %}
     <div><dt>供应商读取图片</dt><dd>提交前可验收星睿链接；供应商实际读取以创建结果为准</dd></div>
     <div><dt>装箱单</dt><dd>{% if preparation.packing_required is true %}

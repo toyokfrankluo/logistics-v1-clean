@@ -16,6 +16,7 @@ from tms_invoice import parse_invoice
 import tms_supplier_files as files
 import nextsls
 import tms_supplier_images as images
+import tms_carriers
 
 
 class FinalAdaptationTests(unittest.TestCase):
@@ -25,6 +26,7 @@ class FinalAdaptationTests(unittest.TestCase):
     get = fixture.NextSLSTests.get
     staff_login = fixture.NextSLSTests.staff_login
     profile = fixture.NextSLSTests.profile
+    approve = fixture.NextSLSTests.approve
     pending_order = fixture.NextSLSTests.pending_order
     get_order = fixture.NextSLSTests.get_order
     sign_in = fixture.NextSLSTests.sign_in
@@ -138,3 +140,63 @@ class FinalAdaptationTests(unittest.TestCase):
             build(dict(rules, require_declaration_list=["photo_url"]), failed_publish, fields)
         invoice["declarations"][0].pop("image_part")
         self.assertEqual(encoders(tenant, rules), {})
+
+    def test_failed_optional_publication_is_explicit_in_admin_preview(self):
+        self.profile(base_url="https://zwgylx.nextsls.com")
+        self.agent.api_url = "https://zwgylx.nextsls.com/api/v5/shipment/get_tracking"
+        db.session.commit()
+        order_id = self.approve()
+        order = db.session.get(TmsOrder, order_id)
+        profile = tms_carriers.agent_profile(order.agent_id)
+        with app.test_request_context(), patch.dict(app.config, TMS_NEXTSLS_FILE_ORIGIN="https://files.example.com"), patch(
+                "tms_carriers.original_photos", side_effect=nextsls.ProtocolError("模拟图片发布失败")):
+            manifest, draft = tms_carriers.preview_supplier_files(order, profile)
+            self.assertEqual([item["mime"] for item in manifest], [files.PACKING_MIME])
+            self.assertEqual(draft["image_delivery"], {"status": "optional_publication_failed",
+                "fields_in_request": [], "rows_in_request": 0})
+            self.assertFalse(draft["combined"])
+            tms_carriers.store_channel_catalogue(profile, {"TMS_DEMO": "Fixture"},
+                {"TMS_DEMO": nextsls.preparation_rules(fixture.SERVICE | {"require_declaration_list": ["photos"]})})
+            _, blocked = tms_carriers.preview_supplier_files(order, profile)
+            self.assertIn("模拟图片发布失败", blocked["error"])
+            self.assertNotIn("payload", blocked)
+
+    def test_media_verifier_cannot_access_other_operations(self):
+        secret = "fixture-media-verifier"
+        headers = {"Authorization": "Bearer " + secret}
+        with patch.dict(os.environ, RENDER="true",
+                TMS_MEDIA_ACCEPTANCE_DIGEST=sha256(secret.encode()).hexdigest(),
+                TMS_MEDIA_ACCEPTANCE_EXPIRES=str(int(time.time())+600)):
+            for route in ("import", "refresh", "prepare-acceptance", "verify-existing", "activate"):
+                self.assertEqual(self.staff.post("/tms/operations/agents/"+route, headers=headers).status_code, 404)
+            response = self.staff.post("/tms/operations/agents/preflight", headers=headers, json={})
+            self.assertEqual(response.status_code, 400)
+
+    def test_submission_audit_reports_optional_failure_and_required_failure_never_posts(self):
+        self.profile(base_url="https://zwgylx.nextsls.com")
+        self.agent.api_url = "https://zwgylx.nextsls.com/api/v5/shipment/get_tracking"
+        db.session.commit()
+        order_id = self.approve()
+        order = db.session.get(TmsOrder, order_id)
+        calls = []
+        requirements = ["photos"]
+        def transport(target, *, json, headers):
+            if target.api_url.endswith("/get_services"):
+                return fixture.success({"services":[fixture.SERVICE | {"require_declaration_list":requirements}]})
+            calls.append(json["shipment"])
+            return fixture.success({"shipment":{"shipment_id":fixture.SUPPLIER_NUMBER}})
+        with app.test_request_context(), patch.dict(app.config, TMS_NEXTSLS_FILE_ORIGIN="https://files.example.com",
+                TMS_NEXTSLS_CREATE_MODE="environment", TMS_NEXTSLS_CREATE_ENABLED=True, TMS_NEXTSLS_REQUIRE_ORDER_GRANT=False), patch(
+                "tms_carriers.original_photos", side_effect=nextsls.ProtocolError("模拟图片发布失败")):
+            with self.assertRaisesRegex(nextsls.ProtocolError, "模拟图片发布失败"):
+                tms_carriers.send_order(order, 1, transport=transport)
+            db.session.rollback()
+            self.assertEqual(calls, [])
+            requirements.clear()
+            self.assertEqual(tms_carriers.send_order(order, 1, transport=transport), "linked")
+            self.assertEqual(len(calls), 1)
+            self.assertFalse(any(nextsls.IMAGE_FIELDS & row.keys() for box in calls[0]["parcels"]
+                                 for row in box["declarations"]))
+            event = tms_carriers.latest_event(order.id, "attempt")
+            self.assertEqual(event.details["image_delivery"]["status"], "optional_publication_failed")
+            self.assertEqual(event.details["image_rows_published"], 0)
