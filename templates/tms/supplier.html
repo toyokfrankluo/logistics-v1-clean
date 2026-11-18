@@ -23,6 +23,7 @@
     {% if supplier.supplier_number %} · {{ supplier.supplier_number }}{% endif %}
     {% if link %} · 对账参考号 <code>{{ link.client_reference }}</code>{% endif %}</p>
   {% if preparation %}
+  {% if preparation.sample_approval %}<p class="notice">本票已有供应商测试许可，依据 {{ preparation.sample_approval.evidence_id }}。本次限一次测试建单，请核对费用和不揽收安排。</p>{% endif %}
   {% if preparation.unknown_rules %}
   <p class="notice">规则未知，首次真实提交待验证。已知基础字段仍校验；未知项：{{ preparation.unknown_rules|join('、') }}。通用预览可生成，不能视为供应商已接受。</p>
   {% else %}<p>按当前渠道规则进行通用请求预检；供应商实际接单以返回真实运单号为准。</p>{% endif %}
@@ -184,7 +185,7 @@
     </form>{% else %}
     <p class="notice">创建结果未确认，已锁定重复提交。请联系代理按上方唯一参考号核实；如需系统查询，可由管理员单独启用查询创建结果功能。</p>
     {% endif %}
-    {% if link.state == 'not_found' %}<details><summary>人工核实后解除重试锁</summary>
+    {% if link.state == 'not_found' and not invoice.workbook_test_sample %}<details><summary>人工核实后解除重试锁</summary>
       <form method="post" action="{{ url_for('tms_staff.supplier_action', order_id=order.id) }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <label class="check-label"><input type="checkbox" name="confirm" value="yes" required>供应商已确认未创建这票运单</label>

@@ -38,7 +38,8 @@ BRAND_ONLY_RULES = {"require_declaration_list": ["brand"]}
 CHANNEL_CATALOGUE_TTL = timedelta(hours=24)
 CREATE_DISABLED = "系统未开放真实下单"
 ACCEPTANCE_COPY_BLOCKER = "这张订单是历史接口验收副本，不能向供应商下单。请选择独立的真实货件。"
-WORKBOOK_SAMPLE_BLOCKER = "原发票标注为非真实货件测试样本，不能向供应商正式下单。"
+WORKBOOK_SAMPLE_BLOCKER = "原发票标注为非真实货件测试样本，缺少与本票、账号及渠道匹配的有效供应商测试许可"
+SAMPLE_RETRY_BLOCKER = "此测试样本只允许提交一次，不能解除重试锁。"
 CREATE_GRANT = "nextsls_create_grant"
 CREATE_GRANT_REQUIRED = "请先授权本票真实下单"
 READ_DISABLED = "系统未开放 NextSLS 只读请求"
@@ -339,10 +340,39 @@ def destination_for_create(order):
     return dict(invoice, address={key: value for key, value in invoice["address"].items() if key not in omitted}), omitted
 
 
-def supplier_sample_blocker(invoice):
+def sample_create_approval(order, profile, agent):
+    """Read operator-verified supplier permission from protected deployment configuration."""
+    if ("acceptance_source" in order.invoice or not order.invoice.get("workbook_test_sample")
+            or not profile or not agent or not agent.app_token or profile.provider != "nextsls"):
+        return None
+    raw = current_app.config.get("TMS_NEXTSLS_SAMPLE_CREATE_APPROVALS", "")
+    try:
+        approvals = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        return None
+    approval = approvals.get(str(order.id)) if isinstance(approvals, dict) else None
+    if not isinstance(approval, dict):
+        return None
+    evidence_id, expires_at = approval.get("evidence_id"), approval.get("expires_at")
+    if (not isinstance(evidence_id, str) or not nextsls.CODE.fullmatch(evidence_id)
+            or type(expires_at) is not int or expires_at <= datetime.now(timezone.utc).timestamp()
+            or type(approval.get("agent_id")) is not int
+            or approval.get("no_pickup") is not True
+            or (approval.get("agent_id"), approval.get("origin"), approval.get("service"),
+                approval.get("workbook_sha256"), approval.get("token_sha256"))
+            != (agent.id, profile.base_url, order.agent_service, order.file_sha256,
+                sha256(agent.app_token.encode()).hexdigest())
+            or agent.id != order.agent_id or profile.agent_id != order.agent_id
+            or not order.workbook or sha256(order.workbook).hexdigest() != order.file_sha256):
+        return None
+    return {"evidence_id": evidence_id,
+            "digest": sha256(json.dumps(approval, sort_keys=True).encode()).hexdigest()}
+
+
+def supplier_sample_blocker(invoice, approval):
     if "acceptance_source" in invoice:
         return ACCEPTANCE_COPY_BLOCKER
-    if invoice.get("workbook_test_sample"):
+    if invoice.get("workbook_test_sample") and not approval:
         return WORKBOOK_SAMPLE_BLOCKER
     return None
 
@@ -350,11 +380,13 @@ def supplier_sample_blocker(invoice):
 def supplier_preparation(order, profile, agent):
     code = order.agent_service
     blockers = create_blockers(profile, agent, code)
-    if sample_blocker := supplier_sample_blocker(order.invoice):
+    approval = sample_create_approval(order, profile, agent)
+    if sample_blocker := supplier_sample_blocker(order.invoice, approval):
         blockers.append(sample_blocker)
     result = {"blockers": blockers, "missing": {}, "packing_required": None, "required_photo_fields": None,
               "allow_no_model": bool(profile and profile.provider == "nextsls"),
-              "image_count": sum(bool(item.get("image_part")) for item in order.invoice["declarations"])}
+              "image_count": sum(bool(item.get("image_part")) for item in order.invoice["declarations"]),
+              "sample_approval": approval}
     invoice, omitted = destination_for_create(order)
     result["omitted_address_fields"] = omitted
     if nextsls.unverified_destination_fields(invoice):
@@ -422,12 +454,15 @@ def invoice_po_rows(invoice, supplement, rules, use_invoice_po):
             == nextsls.INVOICE_PO_SOURCE]
 
 
-def current_create_grant(order, profile):
+def current_create_grant(order, profile, approval=None):
     grant = order.invoice.get(CREATE_GRANT)
     if not grant or not profile:
         return None
     if (grant["revision"], grant["agent_id"], grant["service"], grant["origin"]) != (
             order.revision, order.agent_id, order.agent_service, profile.base_url):
+        return None
+    if order.invoice.get("workbook_test_sample") and (
+            not approval or grant.get("sample_approval") != approval or grant.get("fees_and_pickup_confirmed") is not True):
         return None
     return grant if grant["expires_at"] > datetime.now(timezone.utc).timestamp() else None
 
@@ -502,22 +537,24 @@ def attach_number(shipment, link, number):
 
 
 def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing_publisher=None):
-    if sample_blocker := supplier_sample_blocker(order.invoice):
-        raise nextsls.ProtocolError(sample_blocker)
     if ((photo_publisher is not None or packing_publisher is not None)
             and (transport is None or not current_app.config.get("ISOLATED_MODE"))):
         raise nextsls.ProtocolError("商品图片和装箱单发送目前只允许在隔离模拟中验证。")
     if transport is not None and not current_app.config.get("ISOLATED_MODE"):
         raise nextsls.ProtocolError("真实环境禁止使用模拟供应商传输。")
     agent = db.session.get(CarrierAgent, order.agent_id) if order.agent_id else None
-    blockers = create_blockers(agent_profile(order.agent_id) if agent else None, agent, order.agent_service)
+    profile = agent_profile(order.agent_id) if agent else None
+    approval = sample_create_approval(order, profile, agent)
+    if sample_blocker := supplier_sample_blocker(order.invoice, approval):
+        raise nextsls.ProtocolError(sample_blocker)
+    blockers = create_blockers(profile, agent, order.agent_service)
     if blockers:
         raise nextsls.ProtocolError("；".join(blockers) + "。")
     shipment, agent, profile, link = operation_context(order, "create")
-    if shipment.shipment_id or (link and link.state != "new"):
+    if shipment.shipment_id or (link and (link.state != "new" or (approval and link.attempt_at))):
         raise nextsls.ProtocolError("订单已有供应商单号或提交记录。请先对账，避免重复下单。")
-    grant_required = current_app.config.get("TMS_NEXTSLS_REQUIRE_ORDER_GRANT")
-    if grant_required and not current_create_grant(order, profile):
+    grant_required = current_app.config.get("TMS_NEXTSLS_REQUIRE_ORDER_GRANT") or bool(approval)
+    if grant_required and not current_create_grant(order, profile, approval):
         raise nextsls.ProtocolError(CREATE_GRANT_REQUIRED)
     code = order.agent_service or ""
     if code not in channel_catalogue(profile):
@@ -532,15 +569,17 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
     db.session.refresh(shipment, with_for_update=True)
     if (profile.base_url != origin or agent.app_token != token or code not in channel_catalogue(profile)
             or order.agent_service != code or order.revision != revision
-            or shipment.shipment_id or (link and link.state != "new")):
+            or shipment.shipment_id or (link and (link.state != "new" or (approval and link.attempt_at)))):
         raise nextsls.ProtocolError("订单或代理配置已变化，请刷新后重新核对。")
-    if grant_required and not current_create_grant(order, profile):
+    if approval and sample_create_approval(order, profile, agent) != approval:
+        raise nextsls.ProtocolError(WORKBOOK_SAMPLE_BLOCKER)
+    if grant_required and not current_create_grant(order, profile, approval):
         raise nextsls.ProtocolError(CREATE_GRANT_REQUIRED)
     link = link or ensure_link(order)
 
     rules = nextsls.preparation_rules(service)
     if rules.get("unknown_rules"):
-        grant = current_create_grant(order, profile)
+        grant = current_create_grant(order, profile, approval)
         if (not grant or not grant.get("unknown_rules_confirmed") or not grant.get("review_basis")
                 or grant.get("rules_digest") != nextsls.rules_digest(rules)):
             raise nextsls.ProtocolError("渠道规则未知或已变化，请管理员核对真实资料并明确授权本票首次提交。")
@@ -570,7 +609,7 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
         publish_packing=(lambda: packing_publisher(packing_draft(order).getvalue()))
         if packing_publisher is not None else None,
     )
-    grant = current_create_grant(order, profile)
+    grant = current_create_grant(order, profile, approval)
     if grant_required and not grant:
         raise nextsls.ProtocolError(CREATE_GRANT_REQUIRED)
     if grant:
@@ -585,6 +624,8 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
         delivery_audit["amazon_ref_sources"] = po_rows
     if grant:
         delivery_audit["authorized_by"] = grant["actor_id"]
+    if approval:
+        delivery_audit["sample_approval"] = approval
     if rules.get("unknown_rules"):
         delivery_audit["unknown_rule_attempt"] = {"fields":rules["unknown_rules"],
             "review_basis":grant["review_basis"], "rules_digest":grant["rules_digest"],
@@ -598,6 +639,8 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
         if (link.state != "sending" or profile.base_url != origin or agent.app_token != token
                 or shipment.shipment_id or order.revision != revision or code not in channel_catalogue(profile)):
             raise nextsls.ProtocolError("提交预留已变化。")
+        if approval and sample_create_approval(order, profile, agent) != approval:
+            raise nextsls.ProtocolError(WORKBOOK_SAMPLE_BLOCKER)
         data = nextsls.request_data(agent, origin, "/shipment/create", payload, transport=transport)
         attach_number(shipment, link, nextsls.parse_supplier_number(data))
         shipment.status = "代理已接单"
@@ -612,6 +655,8 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
         transition(link, "sending", "uncertain")
         reason = str(error) if isinstance(error, nextsls.ProtocolError) else "供应商结果未能关联，请先对账。"
         details = {"state": "uncertain", "reason": reason}
+        if approval:
+            details["sample_approval"] = approval
         if isinstance(error, nextsls.CreateRejected):
             details["supplier_rejected"] = True
             details["missing_fields"] = list(error.fields)
@@ -721,6 +766,8 @@ def unlock_retry(order, actor_id, reason):
     link = db.session.get(TmsSupplierOrder, order.id)
     if not link or link.state != "not_found" or shipment.shipment_id:
         raise nextsls.ProtocolError("只有对账无匹配且经代理人工确认后才能解除重试锁。")
+    if order.invoice.get("workbook_test_sample"):
+        raise nextsls.ProtocolError(SAMPLE_RETRY_BLOCKER)
     transition(link, "not_found", "new")
     audit(link, "retry", actor_id, {"reason": nextsls.supplied_text(reason, 500)})
     db.session.commit()

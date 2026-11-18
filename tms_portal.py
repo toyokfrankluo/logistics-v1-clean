@@ -100,6 +100,7 @@ def init_tms(app):
         TMS_NEXTSLS_READ_ENABLED=os.getenv("TMS_NEXTSLS_READ_ENABLED") == "1",
         TMS_NEXTSLS_CREATE_ENABLED=os.getenv("TMS_NEXTSLS_CREATE_ENABLED") == "1",
         TMS_NEXTSLS_REQUIRE_ORDER_GRANT=not app.config.get("ISOLATED_MODE"),
+        TMS_NEXTSLS_SAMPLE_CREATE_APPROVALS=os.getenv("TMS_NEXTSLS_SAMPLE_CREATE_APPROVALS", ""),
         TMS_NEXTSLS_PACKING_ATTACHMENT_HOST=os.getenv("TMS_NEXTSLS_PACKING_ATTACHMENT_HOST", "").strip().lower(),
     )
     for suffix in ("SCOPE", "BUCKET", "REGION", "URL_TTL_SECONDS", "ACCESS_KEY_ID", "SECRET_ACCESS_KEY",
@@ -925,8 +926,9 @@ def staff_detail(order, **context):
                 "agent_name": agent.name if agent else "—",
                 "agent_active": bool(agent and agent.is_active),
                 "preparation": preparation, "agent_id": agent.id if agent else None,
-                "create_grant_required": current_app.config["TMS_NEXTSLS_REQUIRE_ORDER_GRANT"],
-                "create_grant": tms_carriers.current_create_grant(order, profile),
+                "create_grant_required": (current_app.config["TMS_NEXTSLS_REQUIRE_ORDER_GRANT"]
+                                          or order.invoice.get("workbook_test_sample")),
+                "create_grant": tms_carriers.current_create_grant(order, profile, preparation.get("sample_approval")),
                 "site_create_enabled": tms_create_control.enabled(),
                 "blocker_groups": tms_carriers.supplier_blocker_groups(preparation.get("blockers", [])),
                 "address_corrections": supplier_address_corrections(order)
@@ -1047,7 +1049,8 @@ def change_create_grant(order, *, revoke):
         raise nextsls.ProtocolError("请刷新页面并明确确认本票下单授权。")
     shipment, _ = tms_carriers.approved_shipment(order)
     link = db.session.get(TmsSupplierOrder, order.id)
-    if shipment.shipment_id or (link and link.state != "new"):
+    if shipment.shipment_id or (link and (link.state != "new"
+                                          or (order.invoice.get("workbook_test_sample") and link.attempt_at))):
         raise nextsls.ProtocolError("本票已有供应商单号或提交记录。")
     invoice = dict(order.invoice)
     if revoke:
@@ -1055,7 +1058,8 @@ def change_create_grant(order, *, revoke):
     else:
         agent = db.session.get(CarrierAgent, order.agent_id)
         profile = db.session.get(TmsAgentApi, order.agent_id)
-        blockers = tms_carriers.supplier_preparation(order, profile, agent)["blockers"]
+        preparation = tms_carriers.supplier_preparation(order, profile, agent)
+        blockers = preparation["blockers"]
         if blockers:
             raise nextsls.ProtocolError("；".join(blockers) + "。")
         rules = tms_carriers.channel_rules(profile, order.agent_service)
@@ -1071,6 +1075,8 @@ def change_create_grant(order, *, revoke):
             "fees_and_pickup_confirmed": True,
             "expires_at": int((datetime.now(timezone.utc) + timedelta(minutes=30)).timestamp()),
         }
+        if approval := preparation["sample_approval"]:
+            grant["sample_approval"] = approval
         if unknown:
             grant.update(unknown_rules_confirmed=True, review_basis=basis,
                          unknown_rules=unknown, rules_digest=nextsls.rules_digest(rules))

@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 from functools import partial
 from hashlib import sha256
 from io import BytesIO
+import json
 import re
 from time import time
 from types import SimpleNamespace
@@ -246,6 +247,62 @@ class NextSLSTests(unittest.TestCase):
                         self.assertEqual(rejected.status_code, 400)
                         self.assertIn(tms_carriers.WORKBOOK_SAMPLE_BLOCKER, rejected.get_data(as_text=True))
                 self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
+        self.carrier_post.assert_not_called()
+
+    def test_supplier_sample_approval_is_bound_and_requires_a_single_order_grant(self):
+        self.profile()
+        order_id = self.approve()
+        order = db.session.get(TmsOrder, order_id)
+        order.invoice = dict(order.invoice, workbook_test_sample=True)
+        db.session.commit()
+        approval = {"evidence_id": "SUPPLIER-TEST-1", "agent_id": self.agent.id, "origin": ORIGIN,
+                    "service": "TMS_DEMO", "workbook_sha256": order.file_sha256,
+                    "token_sha256": sha256(TOKEN.encode()).hexdigest(),
+                    "expires_at": int(time()) + 3600, "no_pickup": True}
+        key = "TMS_NEXTSLS_SAMPLE_CREATE_APPROVALS"
+        page = f"/tms/admin/orders/{order_id}"
+        with patch.dict(app.config, TMS_NEXTSLS_CREATE_ENABLED=True, TMS_NEXTSLS_REQUIRE_ORDER_GRANT=False):
+            for changed in ({"agent_id": self.agent.id + 1}, {"origin": "https://other.nextsls.com"},
+                            {"service": "OTHER"}, {"workbook_sha256": "wrong"}, {"token_sha256": "wrong"},
+                            {"expires_at": int(time()) - 1}, {"no_pickup": False}, {"evidence_id": ""}):
+                app.config[key] = json.dumps({str(order_id): approval | changed})
+                rejected = self.action(order_id, "grant_create", revision=3, confirm="yes")
+                self.assertEqual(rejected.status_code, 400)
+                self.assertIn(tms_carriers.WORKBOOK_SAMPLE_BLOCKER, rejected.get_data(as_text=True))
+            app.config[key] = json.dumps({str(order_id + 1): approval})
+            self.assertEqual(self.action(order_id, "grant_create", revision=3, confirm="yes").status_code, 400)
+            app.config[key] = json.dumps({str(order_id): approval})
+            self.assertIn('value="grant_create"', self.get(self.staff, page).get_data(as_text=True))
+            self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 400)
+            self.assertEqual(self.action(order_id, "grant_create", revision=3, confirm="yes").status_code, 302)
+            db.session.expire_all()
+            self.assertEqual(order.invoice[tms_carriers.CREATE_GRANT]["sample_approval"]["evidence_id"],
+                             approval["evidence_id"])
+            self.assertIn('value="create"', self.get(self.staff, page).get_data(as_text=True))
+            with patch.dict(app.config, TMS_NEXTSLS_CREATE_ENABLED=False):
+                blocked = self.action(order_id, "create", confirm="yes")
+                self.assertIn(tms_carriers.CREATE_DISABLED, blocked.get_data(as_text=True))
+            # Stop at the outbound boundary. This test does not simulate a successful supplier response.
+            with patch("nextsls.request_data", side_effect=nextsls.ProtocolError("test outbound boundary")) as outbound:
+                self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 400)
+                self.assertEqual(outbound.call_args.args[1:3], (ORIGIN, "/shipment/get_services"))
+                outbound.assert_called_once()
+            app.config[key] = json.dumps({str(order_id): approval | {"evidence_id": "SUPERSEDING-APPROVAL"}})
+            self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 400)
+            self.assertNotIn('value="create"', self.get(self.staff, page).get_data(as_text=True))
+            app.config[key] = json.dumps({str(order_id): approval})
+            order.invoice = dict(order.invoice, acceptance_source={"order_id": 100})
+            db.session.commit()
+            historic = self.action(order_id, "create", confirm="yes")
+            self.assertEqual(historic.status_code, 400)
+            self.assertIn(tms_carriers.ACCEPTANCE_COPY_BLOCKER, historic.get_data(as_text=True))
+            order.invoice = {key: value for key, value in order.invoice.items() if key != "acceptance_source"}
+            db.session.add(TmsSupplierOrder(order_id=order_id, agent_id=self.agent.id, client_reference="XR-SAMPLE",
+                                           tenant_origin=ORIGIN, state="not_found", attempt_at=datetime.utcnow()))
+            db.session.commit()
+            retry = self.action(order_id, "retry", confirm="yes", reason="隔离验证不能重复尝试")
+            self.assertEqual(retry.status_code, 400)
+            self.assertIn(tms_carriers.SAMPLE_RETRY_BLOCKER, retry.get_data(as_text=True))
         self.carrier_post.assert_not_called()
 
     def test_approved_excel_creates_once_and_keeps_distinct_identifiers(self):
