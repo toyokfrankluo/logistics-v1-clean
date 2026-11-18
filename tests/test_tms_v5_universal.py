@@ -43,6 +43,31 @@ class UniversalV5Tests(unittest.TestCase):
                     publish_image_fields=lambda:[{"photos":bad}]*3,packing_host="files.example.com",
                     publish_packing=lambda:"https://files.example.com/packing.xlsx")
 
+    def test_image_fields_are_independent_of_sale_url_and_follow_channel_rules(self):
+        invoice = self.invoice()
+        profile = SimpleNamespace(provider="nextsls", base_url=fixture.ORIGIN, verified={})
+        urls = [f"https://files.example.com/row-{index}.png?signature=fixture" for index in range(3)]
+
+        def build(fields):
+            rule = fixture.SERVICE | {"require_declaration_list": fields}
+            encoders = tms_supplier_images.image_field_encoders(invoice, profile, "OCEAN", rule)
+            return nextsls.create_payload(invoice, "OCEAN", "XR-TEST", rule, {}, image_fields=encoders,
+                publish_image_fields=lambda: tms_supplier_images.encode_image_urls(urls, encoders))
+
+        for field in ("photos", "photo_url"):
+            with self.subTest(field=field):
+                parcels = build([field])["shipment"]["parcels"]
+                entries = [row for parcel in parcels for row in parcel["declarations"]]
+                self.assertEqual([row[field] for row in entries], urls)
+                self.assertTrue(all("sale_url" not in row for row in entries))
+                self.assertTrue(all(set(row) & nextsls.IMAGE_FIELDS == {field} for row in entries))
+        with self.assertRaisesRegex(nextsls.PreparationError, "真实商品销售链接"):
+            build(["photos", "sale_url"])
+        legacy = nextsls.preparation_rules({})
+        self.assertEqual(set(tms_supplier_images.image_field_encoders(invoice, profile, "OCEAN", legacy)), {"photos"})
+        invoice["declarations"][0].pop("image_part")
+        self.assertEqual(tms_supplier_images.image_field_encoders(invoice, profile, "OCEAN", legacy), {})
+
     def test_legacy_and_partial_rules_remain_unknown_but_preview_validates_known_requirements(self):
         invoice=self.invoice()
         for row in invoice["declarations"]:row.update(brand="无",model="无",sku="REAL-SYNTHETIC-SKU")

@@ -34,18 +34,21 @@ class ImageStore:
 
 def image_delivery(order, profile, rules):
     """Resolve only the configured account/channel and the fields it actually requires."""
+    encoders = image_field_encoders(order.invoice, profile, order.agent_service, rules)
+    store = media_store(order, profile) if encoders else None
+    return (store, encoders) if store else (None, {})
+
+
+def image_field_encoders(invoice, profile, channel, rules):
     required = nextsls.IMAGE_FIELDS.intersection(nextsls.declaration_requirements(rules))
-    if rules.get("require_declaration_list") is None and all(
-            item.get("image_part") for item in order.invoice["declarations"]):
+    if rules.get("require_declaration_list") is None and invoice["declarations"] and all(
+            item.get("image_part") for item in invoice["declarations"]):
         required = {"photos"}
-    store = media_store(order, profile) if required else None
-    if not store:
-        return None, {}
     encoders = {"photo_url": str} if "photo_url" in required else {}
-    encoder = photos_encoder(profile, order.agent_service)
+    encoder = photos_encoder(profile, channel)
     if "photos" in required and encoder is not None:
         encoders["photos"] = encoder
-    return store, encoders
+    return encoders
 
 
 def photos_encoder(profile, channel):
@@ -120,6 +123,10 @@ def publish_images(store, order, profile, photos, encoders, *, preview=False):
         raise nextsls.ProtocolError(MEDIA_ERROR)
     files = [(str(index), IMAGE_TYPES[mime], mime, data) for index, (mime, data) in enumerate(photos)]
     urls = publish_files(store, order, profile, files, MEDIA_ERROR, preview=preview)
+    return encode_image_urls(urls, encoders)
+
+
+def encode_image_urls(urls, encoders):
     try:
         return [{name: encoder(url) for name, encoder in encoders.items()} for url in urls]
     except Exception:

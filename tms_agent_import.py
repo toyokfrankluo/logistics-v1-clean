@@ -337,9 +337,7 @@ def preflight_operation():
                 continue
             encoder = tms_supplier_images.photos_encoder(profile, code)
             known_fields = nextsls.declaration_requirements(rules)
-            image_fields = {"photo_url"} if "photo_url" in known_fields else set()
-            if encoder and ("photos" in known_fields or rules.get("require_declaration_list") is None):
-                image_fields.add("photos")
+            image_fields = tms_supplier_images.image_field_encoders(invoice, profile, code, rules)
             try:
                 nextsls.create_payload(deepcopy(invoice), code, "XR-PREFLIGHT-NOT-SENT", rules,
                     profile.sender, preflight=True, image_fields=image_fields,
@@ -355,8 +353,9 @@ def preflight_operation():
                     include_packing=bool(store) and rules["packing_list_required"] is None,
                     packing_file_type=tms_carriers.packing_attachment_file_type(profile),
                     photos_protocol_confirmed=bool(encoder),
-                    publish_image_fields=(lambda: [{key: actual[str(i)] if actual else f"https://{fixture_host}/preflight-not-published/photo-{i}.png"
-                                                   for key in image_fields} for i in range(len(invoice["declarations"]))])
+                    publish_image_fields=(lambda: tms_supplier_images.encode_image_urls(
+                        (actual[str(i)] if actual else f"https://{fixture_host}/preflight-not-published/photo-{i}.png"
+                         for i in range(len(invoice["declarations"]))), image_fields))
                                           if image_fields else None,
                     publish_packing=lambda: actual["packing"] if actual else f"https://{fixture_host}/preflight-not-published/packing.xlsx")
             except nextsls.ProtocolError as error:

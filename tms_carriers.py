@@ -723,8 +723,7 @@ def preview_supplier_files(order, profile):
             invoice, order.agent_service, "XR-PREVIEW", rules, profile.sender, supplement=supplement,
             packing_host=store.host, publish_packing=lambda: attachment,
             image_fields=encoders, photos_protocol_confirmed=images.photos_encoder(profile, order.agent_service) is not None,
-            publish_image_fields=lambda: [{field: encode(ref["photo_url"]) for field, encode in encoders.items()}
-                                          for ref in references],
+            publish_image_fields=lambda: images.encode_image_urls((ref["photo_url"] for ref in references), encoders),
             use_invoice_po=use_invoice_po,
             include_packing=rules["packing_list_required"] is None,
             packing_file_type=packing_attachment_file_type(profile),
