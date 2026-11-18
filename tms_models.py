@@ -188,3 +188,22 @@ class TmsSupplierFile(db.Model):
     mime = db.Column(db.String(100), nullable=False)
     expires_at = db.Column(db.BigInteger, nullable=False, index=True)
     content = db.Column(db.LargeBinary, nullable=False)
+
+
+class TmsCreateBatch(db.Model, TimestampMixin):
+    __tablename__ = "tms_create_batch"
+    id = db.Column(db.String(32), primary_key=True)
+    actor_id = db.Column(db.Integer, nullable=False)
+
+
+class TmsCreateBatchItem(db.Model):
+    __tablename__ = "tms_create_batch_item"
+    __table_args__ = (db.UniqueConstraint("order_id", "revision", name="uq_create_batch_order_revision"),)
+    batch_id = db.Column(db.String(32), db.ForeignKey("tms_create_batch.id"), primary_key=True)
+    order_id = db.Column(db.Integer, db.ForeignKey("tms_order.id"), primary_key=True)
+    revision = db.Column(db.Integer, nullable=False)
+    agent_id = db.Column(db.Integer, nullable=False)
+    channel = db.Column(db.String(64), nullable=False)
+    state = db.Column(db.String(20), nullable=False, default="queued")
+    number = db.Column(db.String(64))
+    detail = db.Column(db.String(500))

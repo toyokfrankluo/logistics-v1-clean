@@ -1,0 +1,63 @@
+{% extends 'tms/layout.html' %}
+{% block content %}
+<h1>批量真实下单</h1>
+<p class="notice">站点创建许可：{{ '已开启' if enabled else '已关闭' }}</p>
+{% if batch %}
+<p>批次 {{ batch.id }}。每票独立提交、回写及查询。关闭页面会暂停尚未发出的请求；重新打开可继续。已经处理或结果不明的订单不会再次发送。</p>
+{% set states = {'queued':'待提交','processing':'处理中或中断','blocked':'未提交 / 有阻断','linked':'已回写，查询待核对','queried':'已回写并查询核对','uncertain':'待对账，禁止重发'} %}
+<table>
+<thead><tr><th>订单</th><th>代理</th><th>渠道</th><th>状态</th><th>供应商单号</th><th>说明</th></tr></thead>
+<tbody>
+{% for item in items %}
+{% set endpoint = url_for('tms_staff.run_batch_item', batch_id=batch.id, order_id=item.order_id) %}
+<tr{% if item.state == 'queued' %} data-batch-queued="{{ endpoint }}"{% endif %}>
+<td><a href="{{ url_for('tms_staff.review', order_id=item.order_id) }}">#{{ item.order_id }}</a></td>
+<td>#{{ item.agent_id }}</td><td>{{ item.channel }}</td><td>{{ states.get(item.state, item.state) }}</td>
+<td>{{ item.number or '—' }}</td><td>{{ item.detail or '' }}
+{% if item.state in ('processing','uncertain','linked','queried') %}
+<button type="button" class="secondary" data-batch-query="{{ endpoint }}">只查询／对账</button>
+{% endif %}</td></tr>
+{% endfor %}
+</tbody></table>
+<form id="batch-runner" data-start="{{ ('yes' if enabled and start and (items | selectattr('state','equalto','queued') | list | length == items | length) else 'no') }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+{% if enabled and items | selectattr('state','equalto','queued') | list %}<button type="submit">继续待提交订单</button>{% endif %}
+<p id="batch-progress" role="status"></p>
+</form>
+<script src="{{ url_for('static', filename='tms-create-batch.js') }}" defer></script>
+<p><a href="{{ url_for('tms_staff.create_batches') }}">返回批次列表</a></p>
+{% else %}
+<form class="panel" method="post" id="batch-select">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<input type="hidden" name="action" value="preview">
+<label>选择代理（可多选）<select name="agents" multiple required size="10">{% for agent in agents %}<option value="{{ agent.id }}"{% if agent.id|string in chosen %} selected{% endif %}>{{ agent.name }} · #{{ agent.id }}</option>{% endfor %}</select></label>
+<button>匹配订单并预览</button>
+</form>
+{% if request.method == 'POST' and not rows and not rejected %}<p>所选代理没有已审核、已获单票授权且未进入批次的订单。</p>{% endif %}
+{% for order_id, reason in rejected %}<p class="error">{{ order_id }}：{{ reason }}</p>{% endfor %}
+{% if rows %}
+<table><thead><tr><th>订单</th><th>版本</th><th>代理</th><th>渠道</th></tr></thead><tbody>
+{% for order_id, revision, agent_id, channel in rows %}
+<tr><td><a href="{{ url_for('tms_staff.review', order_id=order_id) }}">#{{ order_id }}</a></td><td>{{ revision }}</td><td>#{{ agent_id }}</td><td>{{ channel }}</td></tr>
+{% endfor %}</tbody></table>
+{% endif %}
+{% if preview and enabled %}
+<form class="panel" method="post">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<input type="hidden" name="action" value="confirm">
+<input type="hidden" name="preview" value="{{ preview }}">
+<label><input type="checkbox" name="confirmed" value="yes" required>我确认只提交上表中的 {{ rows | length }} 票，并已核对费用及揽收安排。</label>
+<button type="submit">确认批次并正式下单</button>
+</form>
+{% endif %}
+{% if next_after %}
+<form method="post">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<input type="hidden" name="action" value="preview"><input type="hidden" name="after" value="{{ next_after }}">
+{% for id in chosen %}<input type="hidden" name="agents" value="{{ id }}">{% endfor %}
+<button type="submit" class="secondary">预览下一组订单</button>
+</form>
+{% endif %}
+{% if latest %}<h2>最近批次</h2><ul>{% for one in latest %}<li><a href="{{ url_for('tms_staff.create_batch_detail', batch_id=one.id) }}">{{ one.created_at }} · {{ one.id }}</a></li>{% endfor %}</ul>{% endif %}
+{% endif %}
+{% endblock %}

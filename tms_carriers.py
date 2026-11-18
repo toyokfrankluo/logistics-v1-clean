@@ -541,7 +541,8 @@ def attach_number(shipment, link, number):
     shipment.shipment_id = number
 
 
-def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing_publisher=None):
+def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing_publisher=None,
+               require_grant=False, expected_snapshot=None):
     if ((photo_publisher is not None or packing_publisher is not None)
             and (transport is None or not current_app.config.get("ISOLATED_MODE"))):
         raise nextsls.ProtocolError("商品图片和装箱单发送目前只允许在隔离模拟中验证。")
@@ -558,7 +559,9 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
     shipment, agent, profile, link = operation_context(order, "create")
     if shipment.shipment_id or (link and (link.state != "new" or (approval and link.attempt_at))):
         raise nextsls.ProtocolError("订单已有供应商单号或提交记录。请先对账，避免重复下单。")
-    grant_required = current_app.config.get("TMS_NEXTSLS_REQUIRE_ORDER_GRANT") or bool(approval)
+    if expected_snapshot is not None and expected_snapshot != [order.id, order.revision, order.agent_id, order.agent_service]:
+        raise nextsls.ProtocolError("订单版本、代理或渠道已变化。")
+    grant_required = require_grant or current_app.config.get("TMS_NEXTSLS_REQUIRE_ORDER_GRANT") or bool(approval)
     if grant_required and not current_create_grant(order, profile, approval):
         raise nextsls.ProtocolError(CREATE_GRANT_REQUIRED)
     code = order.agent_service or ""
@@ -574,6 +577,7 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
     db.session.refresh(shipment, with_for_update=True)
     if (profile.base_url != origin or agent.app_token != token or code not in channel_catalogue(profile)
             or order.agent_service != code or order.revision != revision
+            or (expected_snapshot is not None and order.agent_id != expected_snapshot[2])
             or shipment.shipment_id or (link and (link.state != "new" or (approval and link.attempt_at)))):
         raise nextsls.ProtocolError("订单或代理配置已变化，请刷新后重新核对。")
     if approval and sample_create_approval(order, profile, agent) != approval:

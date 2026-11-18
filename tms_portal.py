@@ -45,11 +45,13 @@ from tms_models import TmsAgentApi, TmsSupplierEvent, TmsSupplierFile, TmsSuppli
 import tms_supplier_files
 import tms_agent_import
 import tms_create_control
+import tms_create_batch
 
 client = Blueprint("tms_client", __name__, url_prefix="/tms/customer")
 staff = Blueprint("tms_staff", __name__, url_prefix="/tms/admin")
 tms_agent_import.register_routes(staff)
 tms_create_control.register_routes(staff)
+tms_create_batch.register_routes(staff)
 SESSION_KEY = "xingrui_customer"
 CUSTOMER_COOKIE = "xingrui_customer_session"
 CLIENT_POSTS = frozenset(f"tms_client.{name}" for name in ("sign_in", "sign_out", "upload", "confirm", "delete_order"))
@@ -115,6 +117,7 @@ def init_tms(app):
     tms_supplier_files.init_app(app)
     tms_agent_import.init_app(app)
     tms_create_control.init_app(app)
+    tms_create_batch.init_app(app)
 
     @app.before_request
     def check_tms_availability():
@@ -178,6 +181,9 @@ def create_tms_schema():
         tms_agent_import.TmsAgentImport.__table__.create(connection, checkfirst=True)
         tms_supplier_files.TmsSupplierPreviewFile.__table__.create(connection, checkfirst=True)
         tms_create_control.TmsCreateControl.__table__.create(connection, checkfirst=True)
+        if current_app.config["TMS_BATCH_ENABLED"]:
+            for table in tms_create_batch.TABLES:
+                table.create(connection, checkfirst=True)
 
 
 @client.before_request
