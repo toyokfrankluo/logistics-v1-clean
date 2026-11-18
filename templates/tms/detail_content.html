@@ -1,6 +1,6 @@
 {% set invoice = order.invoice %}
 <article class="order-detail" data-order-detail>
-{% if invoice.acceptance_source %}<p class="notice">接口验收副本 · 来源订单 #{{ invoice.acceptance_source.order_id }}（{{ invoice.acceptance_source.original_customer_reference }}）。不安排揽收或发货。保留原始样本与审计；此副本仍须审核、单票确认后才能提交供应商。</p>{% endif %}
+{% if invoice.acceptance_source %}<p class="notice">历史接口验收副本 · 来源订单 #{{ invoice.acceptance_source.order_id }}（{{ invoice.acceptance_source.original_customer_reference }}）。仅供查阅，不能向供应商正式下单。</p>{% endif %}
 <div class="heading"><div><p class="kicker">{{ '导入预览' if order.status == 'draft' else '运单详情' }}{% if staff %} · XR-{{ order.id }}{% endif %}</p>
 <h1>{{ invoice.customer_number }}</h1><p>{{ business_date(order.created_at) }}（北京时间）</p></div>
 <a class="button secondary" href="{{ url_for('tms_staff.staff_download' if staff else 'tms_client.download', order_id=order.id) }}">下载原始发票</a></div>

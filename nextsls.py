@@ -126,8 +126,11 @@ def request_data(agent, origin, path, payload, *, transport=None):
         })
         data = response.json()
     except carrier_http.CarrierRequestError as error:
-        if path == "/shipment/get_services" and error.status in (401, 403):
-            raise ProtocolError(f"NextSLS 拒绝渠道认证（HTTP {error.status}），请核对 App Token 或账号权限。") from None
+        if error.status in (401, 403):
+            operation = {"/shipment/get_services": "渠道读取", "/shipment/create": "创建运单"}.get(path, "查询")
+            raise ProtocolError(f"NextSLS 拒绝{operation}认证（HTTP {error.status}），请核对 App Token 或账号权限。") from None
+        if type(error.status) is int and 400 <= error.status <= 599:
+            raise ProtocolError(f"NextSLS 返回 HTTP {error.status}。") from None
         raise ProtocolError("NextSLS 请求失败或响应不可解析。") from None
     except ValueError:
         raise ProtocolError("NextSLS 请求失败或响应不可解析。") from None

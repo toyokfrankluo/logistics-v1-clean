@@ -5,7 +5,15 @@
 {% if supplier_error %}<p class="error" role="alert">{{ supplier_error }}</p>{% endif %}
 <section class="panel" id="supplier-order">
   <h2>供应商下单</h2>
-  {% if link and link.state == 'linked' and supplier.supplier_number %}<p>已有真实创建成功记录：{{ supplier.supplier_number }}</p>{% endif %}
+  {% if link and link.state == 'linked' and supplier.supplier_number %}
+  <p>供应商运单号：{{ supplier.supplier_number }}</p>
+  {% if supplier.can_sync %}
+  <form method="post" action="{{ url_for('tms_staff.supplier_action', order_id=order.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <button class="secondary" name="action" value="query">查询供应商运单</button>
+  </form>
+  {% endif %}
+  {% endif %}
   <p>供应商：{{ '已启用' if supplier.agent_active else '未启用' }} ·
     渠道：{{ order.agent_service or '待选择' }} ·
     真实创建：{{ '站点已开放' if supplier.site_create_enabled else '等待管理员启用' }} ·
@@ -76,6 +84,7 @@
     <p><a href="{{ url_for('views.edit_agent', agent_id=supplier.agent_id, _anchor='channel-mapping') }}">前往代理设置核对渠道规则</a></p>
     {% endif %}
   {% elif supplier.create_grant_required and not supplier.create_grant %}
+  <p>提交会在供应商建立正式运单，可能产生费用或触发揽收。请先核对代理报价与揽收安排。</p>
   <form method="post" action="{{ url_for('tms_staff.supplier_action', order_id=order.id) }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input type="hidden" name="revision" value="{{ order.revision }}">
@@ -83,15 +92,15 @@
     <label class="check-label"><input type="checkbox" name="unknown_rules_confirmed" value="yes" required>已完整核对实际货物、地址及申报资料，知悉渠道有未知要求，授权本票尝试一次真实提交</label>
     <label>本票资料核对依据<textarea name="unknown_rules_basis" maxlength="500" required></textarea></label>
     {% endif %}
-    <label class="check-label"><input type="checkbox" name="confirm" value="yes" required>确认仅授权本票按当前资料向选定代理真实下单一次</label>
+    <label class="check-label"><input type="checkbox" name="confirm" value="yes" required>我已确认本票的费用和揽收安排，仅授权向选定代理真实下单一次</label>
     <button class="secondary" name="action" value="grant_create">授权本单真实下单</button>
   </form>
   {% else %}
   <form method="post" action="{{ url_for('tms_staff.supplier_action', order_id=order.id) }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input type="hidden" name="revision" value="{{ order.revision }}">
-    <label class="check-label"><input type="checkbox" name="confirm" value="yes" required>确认向审核选定的代理提交本票资料</label>
-    <button name="action" value="create">提交代理下单</button>
+    <label class="check-label"><input type="checkbox" name="confirm" value="yes" required>确认将当前订单提交给所选代理，并接受已核对的费用和揽收安排</label>
+    <button name="action" value="create">创建运单 · 正式提交</button>
     {% if supplier.create_grant %}<button class="secondary" name="action" value="revoke_create">撤销本单授权</button>{% endif %}
   </form>
   {% endif %}

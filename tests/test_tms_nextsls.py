@@ -377,6 +377,25 @@ class NextSLSTests(unittest.TestCase):
         self.assertNotIn("synthetic-private-message", body)
         self.assertNotIn("synthetic-private-message", str(attempt.details))
 
+    def test_linked_supplier_query_does_not_depend_on_billing_data_or_rebind_reference(self):
+        self.profile()
+        order_id = self.approve()
+        with patch.dict(app.config, TMS_NEXTSLS_CREATE_ENABLED=True), patch("carrier_http.post", side_effect=[
+                success({"services": [SERVICE]}), success({"shipment": {"shipment_id": SUPPLIER_NUMBER}})]):
+            self.assertEqual(self.action(order_id, "create", confirm="yes").status_code, 302)
+        db.session.expire_all()
+        client_reference = db.session.get(TmsSupplierOrder, order_id).client_reference
+        with patch.dict(app.config, TMS_NEXTSLS_READ_ENABLED=True), patch("carrier_http.post", return_value=success({
+                "shipment": {"shipment_id": SUPPLIER_NUMBER, "service": "TMS_DEMO", "client_reference": "external-ref"},
+        })) as transport:
+            response = self.action(order_id, "query")
+            self.assertEqual(response.status_code, 302)
+            self.assertEqual(transport.call_args.args[0].api_url, ORIGIN + "/api/v5/shipment/get_info")
+            self.assertEqual(transport.call_args.kwargs["json"], {"shipment": {"shipment_id": SUPPLIER_NUMBER}})
+        self.assertIn("供应商客户参考号未与星睿记录匹配", self.get(self.staff, response.location).get_data(as_text=True))
+        self.assertEqual(db.session.get(TmsSupplierOrder, order_id).client_reference, client_reference)
+        self.assertIsNone(TmsSupplierEvent.query.filter_by(order_id=order_id, kind="snapshot").first())
+
     def test_only_staff_can_correct_unsubmitted_supplier_address_placeholders(self):
         order_id = self.approve()
         self.profile()

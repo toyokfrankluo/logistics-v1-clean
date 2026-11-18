@@ -976,7 +976,8 @@ def review(order_id):
 def supplier_action(order_id):
     order = reviewable_order(order_id)
     action = request.form.get("action")
-    if action not in {"create", "channel", "prepare", "address", "reconcile", "retry", "sync", "cost",
+    category = "success"
+    if action not in {"create", "channel", "prepare", "address", "reconcile", "retry", "sync", "query", "cost",
                       "measurement_review", "grant_create", "revoke_create"}:
         abort(400)
     try:
@@ -988,6 +989,17 @@ def supplier_action(order_id):
             state = tms_carriers.send_order(order, current_user.id)
             message = ("已保存供应商运单号。" if state == "linked"
                        else "未取得代理运单号。请先对账，系统不会自动重试。")
+            if state != "linked":
+                category = "warning"
+        elif action == "query":
+            number, channel_matches, reference_matches = tms_carriers.query_linked_shipment(order)
+            message = f"供应商已查到运单 {number}。"
+            if not channel_matches:
+                message += "供应商未返回渠道。"
+            if not reference_matches:
+                message += "供应商客户参考号未与星睿记录匹配，请人工核对。"
+            if not channel_matches or not reference_matches:
+                category = "warning"
         elif action in {"grant_create", "revoke_create"}:
             message = change_create_grant(order, revoke=action == "revoke_create")
         elif action == "channel":
@@ -1003,6 +1015,8 @@ def supplier_action(order_id):
             state = tms_carriers.reconcile_order(order, current_user.id)
             message = ("已核对并保存供应商运单号。" if state == "linked"
                        else "列表未找到匹配运单。请向供应商核实后再解除重试锁。")
+            if state != "linked":
+                category = "warning"
         elif action == "retry":
             if request.form.get("confirm") != "yes":
                 raise nextsls.ProtocolError("请确认供应商已核实没有创建运单。")
@@ -1023,7 +1037,7 @@ def supplier_action(order_id):
     except SQLAlchemyError:
         db.session.rollback()
         abort(409, "代理数据未能保存。若已提交下单，请先对账。")
-    flash(message, "success")
+    flash(message, category)
     return redirect(url_for("tms_staff.review", order_id=order.id))
 
 
@@ -1054,6 +1068,7 @@ def change_create_grant(order, *, revoke):
         grant = {
             "revision": order.revision + 1, "agent_id": order.agent_id, "service": order.agent_service,
             "origin": profile.base_url, "actor_id": current_user.id,
+            "fees_and_pickup_confirmed": True,
             "expires_at": int((datetime.now(timezone.utc) + timedelta(minutes=30)).timestamp()),
         }
         if unknown:

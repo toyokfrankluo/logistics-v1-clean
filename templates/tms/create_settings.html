@@ -3,7 +3,7 @@
 <h1>真实下单控制</h1>
 <p class="notice">当前状态：{{ '允许已审核、已单票授权的订单提交' if site_enabled else '真实创建已关闭' }}</p>
 {% if emergency %}<p class="error">部署层紧急停止已开启，管理员页面不能覆盖。</p>{% endif %}
-<p>站点开放后，每票仍须核对当前供应商、渠道与资料，单独授权并确认创建。已提交或结果未明的订单继续锁定重复提交。</p>
+<p>管理员可在此开放真实下单入口。每票仍须审核资料、确认费用与揽收安排，再单独授权。只有点击订单上的「创建运单 · 正式提交」才会联系供应商。</p>
 {% if admin_mode and control %}
 <form method="post" class="panel">
  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="revision" value="{{ control.revision }}">

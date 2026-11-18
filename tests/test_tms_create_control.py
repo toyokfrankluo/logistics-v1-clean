@@ -8,7 +8,7 @@ from unittest.mock import patch
 import test_tms_nextsls as fixture
 from app import app
 from models import db
-from tms_models import TmsAgentImport, TmsCreateControl, TmsSupplierOrder
+from tms_models import TmsAgentImport, TmsCreateControl, TmsOrder, TmsSupplierOrder
 import tms_create_control
 
 
@@ -69,6 +69,21 @@ class CreateControlTests(unittest.TestCase):
         with patch.dict(app.config,TMS_NEXTSLS_CREATE_EMERGENCY_STOP=True):
             self.assertEqual(self.post(self.staff,path,{"revision":1,"enabled":"yes","confirmed":"yes"},"/login").status_code,400)
             self.assertFalse(tms_create_control.enabled())
+
+    def test_previously_copied_acceptance_order_cannot_be_granted_or_sent(self):
+        self.control()
+        self.profile()
+        order_id = self.approve()
+        order = db.session.get(TmsOrder, order_id)
+        order.invoice = {**order.invoice, "acceptance_source": {"order_id": 99}}
+        db.session.commit()
+        self.assertEqual(self.post(self.staff, "/tms/admin/settings/nextsls-create",
+            {"revision": 1, "enabled": "yes", "confirmed": "yes"}, "/login").status_code, 302)
+        for action in ("grant_create", "create"):
+            response = self.action(order_id, action, confirm="yes", revision=3)
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("历史接口验收副本", response.get_data(as_text=True))
+        self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
 
     def test_scoped_activation_checks_identity_backs_up_and_preserves_credentials(self):
         self.control()

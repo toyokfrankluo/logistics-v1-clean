@@ -76,6 +76,7 @@ if not ISOLATED_MODE:
     requests.sessions.Session.request = deny_network
     requests.sessions.Session.send = deny_network
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {"hide_parameters": True}
 
 db.init_app(app)
 migrate = Migrate(app, db)
