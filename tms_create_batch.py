@@ -118,6 +118,32 @@ def pending_review(order):
         raise nextsls.ProtocolError("；".join(blockers))
     return [order.id, order.revision, agent.id, service], profile, form, terms
 
+
+def refresh_preview_catalogues(candidates):
+    """Refresh each candidate account once, before pricing validation locks any rows."""
+    agent_ids = set()
+    for order in candidates:
+        if order.invoice.get("order_archive") or "acceptance_source" in order.invoice:
+            continue
+        if order.status == "pending":
+            draft = db.session.get(TmsReceivable, order.id)
+            if draft and draft.agent_id and not order.invoice.get("workbook_test_sample"):
+                agent_ids.add(draft.agent_id)
+        elif order.agent_id:
+            link = db.session.get(TmsSupplierOrder, order.id)
+            if not link or (link.state == "new" and not link.attempt_at):
+                agent_ids.add(order.agent_id)
+    errors = {}
+    for agent_id in sorted(agent_ids):
+        agent = db.session.get(CarrierAgent, agent_id)
+        profile = db.session.get(TmsAgentApi, agent_id)
+        if agent and agent.is_active:
+            error = carriers.refresh_expired_channel_catalogue(profile, agent)
+            if error:
+                errors[agent_id] = error
+    return errors
+
+
 def ids(raw):
     if len(raw) > 1000:
         abort(400)
@@ -245,10 +271,15 @@ def register_routes(staff):
             ).order_by(TmsOrder.id).limit(LIMIT + 1)).all()
             if len(candidates) > LIMIT:
                 next_after = candidates[LIMIT - 1].id
+            refresh_errors = refresh_preview_catalogues(candidates[:LIMIT])
             manifest = []
             for order in candidates[:LIMIT]:
                 try:
                     needs_review = order.status == "pending"
+                    draft = db.session.get(TmsReceivable, order.id) if needs_review else None
+                    agent_id = draft.agent_id if draft else order.agent_id
+                    if agent_id in refresh_errors:
+                        raise nextsls.ProtocolError(f"渠道自动刷新失败：{refresh_errors[agent_id]}")
                     if needs_review:
                         snapshot, profile, _, terms = pending_review(order)
                         review_details[order.id] = {"terms": terms, "address": order.invoice["address"], "pending": True}

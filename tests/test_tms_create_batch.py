@@ -95,6 +95,30 @@ class BatchTests(unittest.TestCase):
         for action in ("approve", "supplier_grant"):
             self.assertEqual(TmsAudit.query.filter_by(order_id=order_id, action=action).count(), 1)
 
+    def test_preview_refreshes_stale_catalogue_for_pending_quote_without_creating(self):
+        import tms_carriers
+        from tms_models import TmsAgentApi
+        self.enterContext(patch.dict(app.config, TMS_NEXTSLS_CREATE_MODE="environment",
+                                    TMS_NEXTSLS_CREATE_ENABLED=False))
+        self.profile()
+        order_id = self.pending_order()
+        self.assertEqual(self.decision(order_id, 2, decision="draft",
+                         **self.pricing(agent_service="TMS_DEMO")).status_code, 302)
+        profile = db.session.get(TmsAgentApi, self.agent.id)
+        key = tms_carriers.CHANNEL_CATALOGUE
+        profile.verified = {**profile.verified, key: {
+            **profile.verified[key], "fetched_at": "2000-01-01T00:00:00"}}
+        db.session.commit()
+        with patch("carrier_http.post", return_value=fixture.success({"services": [fixture.SERVICE]})) as http:
+            html = self.preview()
+        self.assertIn("待随批审核", html)
+        self.assertEqual(http.call_count, 1)
+        self.assertTrue(http.call_args.args[0].api_url.endswith("/shipment/get_services"))
+        self.assertIsNotNone(tms_carriers.fresh_channel_cache(profile))
+        self.assertEqual(db.session.get(TmsOrder, order_id).status, "pending")
+        self.assertEqual(TmsCreateBatchItem.query.count(), 0)
+        self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
+
     def test_batch_does_not_send_when_a_known_rule_changes_after_confirmation(self):
         order_id = self.prepared(grant=False)
         batch = self.confirm(self.preview()).location.split("?")[0]
