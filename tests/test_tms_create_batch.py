@@ -6,7 +6,7 @@ from unittest.mock import patch
 import test_tms_nextsls as fixture
 from app import app
 from models import CarrierAgent, db
-from tms_models import TmsCreateBatchItem, TmsOrder, TmsSupplierOrder
+from tms_models import TmsAudit, TmsCreateBatchItem, TmsOrder, TmsReceivable, TmsSupplierOrder
 
 PATH = "/tms/admin/nextsls-batches"
 
@@ -65,6 +65,35 @@ class BatchTests(unittest.TestCase):
                 self.assertEqual(response.json, {"state": "queried"})
         self.assertEqual(len(submissions), 1)
         self.assertEqual(db.session.get(TmsSupplierOrder, order_id).supplier_number, fixture.SUPPLIER_NUMBER)
+
+    def test_pending_business_draft_is_reviewed_and_granted_in_one_confirmation(self):
+        self.enterContext(patch.dict(app.config, TMS_NEXTSLS_CREATE_MODE="environment",
+                                    TMS_NEXTSLS_CREATE_ENABLED=False))
+        self.profile()
+        order_id = self.pending_order()
+        self.assertEqual(self.decision(order_id, 2, decision="draft",
+                         **self.pricing(agent_service="TMS_DEMO")).status_code, 302)
+        order = db.session.get(TmsOrder, order_id)
+        self.assertEqual(order.status, "pending")
+        revision = order.revision
+        with patch("carrier_http.post", side_effect=AssertionError("must not send before dispatch")):
+            self.assertIn("待随批审核", self.preview())
+            self.assertNotIn('name="preview"', self.preview())
+            app.config["TMS_NEXTSLS_CREATE_ENABLED"] = True
+            html = self.preview()
+            result = self.confirm(html)
+            self.assertEqual(result.status_code, 302)
+            self.assertEqual(self.confirm(html).status_code, 302)
+        db.session.expire_all()
+        order = db.session.get(TmsOrder, order_id)
+        item = TmsCreateBatchItem.query.one()
+        self.assertEqual((order.status, order.revision), ("approved", revision + 2))
+        self.assertEqual((item.revision, item.state), (order.revision, "queued"))
+        self.assertEqual(order.invoice["nextsls_create_grant"]["batch_id"], item.batch_id)
+        self.assertIsNotNone(db.session.get(TmsReceivable, order_id).shipment_id)
+        self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
+        for action in ("approve", "supplier_grant"):
+            self.assertEqual(TmsAudit.query.filter_by(order_id=order_id, action=action).count(), 1)
 
     def test_preview_rechecks_changed_revision_and_ignores_historical_copy(self):
         order_id = self.prepared()

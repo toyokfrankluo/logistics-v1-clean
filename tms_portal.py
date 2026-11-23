@@ -1410,8 +1410,8 @@ def reviewed_invoice(invoice, form):
                                     "verified_optional": {key: address[key] for key in suspicious}})
 
 
-def save_pricing(order, decision):
-    form = request.form
+def save_pricing(order, decision, form=None):
+    form = request.form if form is None else form
     if decision == "settle":
         save_settlement(order, form)
         return

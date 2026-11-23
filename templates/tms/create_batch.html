@@ -34,12 +34,15 @@
 <label>选择代理（可多选）<select name="agents" multiple required size="10">{% for agent in agents %}<option value="{{ agent.id }}"{% if agent.id|string in chosen %} selected{% endif %}>{{ agent.name }} · #{{ agent.id }}</option>{% endfor %}</select></label>
 <button>预览正常业务订单</button>
 </form>
-{% if request.method == 'POST' and not rows and not rejected %}<p>所选代理没有已审核且未进入批次的订单。</p>{% endif %}
+{% if request.method == 'POST' and not rows and not rejected %}<p>所选代理没有可提交的已审核订单或报价草稿。</p>{% endif %}
 {% for order_id, reason in rejected %}<p class="error">{{ order_id }}：{{ reason }}</p>{% endfor %}
 {% if rows %}
-<table><thead><tr><th>订单</th><th>版本</th><th>代理</th><th>渠道</th></tr></thead><tbody>
+<table><thead><tr><th>订单</th><th>版本</th><th>代理</th><th>渠道</th><th>批次审核</th></tr></thead><tbody>
 {% for order_id, revision, agent_id, channel in rows %}
-<tr><td><a href="{{ url_for('tms_staff.review', order_id=order_id) }}">#{{ order_id }}</a></td><td>{{ revision }}</td><td>#{{ agent_id }}</td><td>{{ channel }}</td></tr>
+<tr><td><a href="{{ url_for('tms_staff.review', order_id=order_id) }}">#{{ order_id }}</a></td><td>{{ revision }}</td><td>#{{ agent_id }}</td><td>{{ channel }}</td><td>{% if review_details.get(order_id) %}{% set review = review_details[order_id] %}
+{{ '待随批审核' if review.pending else '已审核' }}{% if review.terms.rate is defined %} · {{ review.terms.currency }} {{ review.terms.rate }} / {{ review.terms.unit }}；附加费用 {{ review.terms.extras_total }}{% endif %}
+<br>{{ review.address.recipient }} · {{ review.address.street }} {{ review.address.street2 }} {{ review.address.street3 }} · {{ review.address.city }} {{ review.address.region }} {{ review.address.postal_code }} {{ review.address.country }}
+{% else %}已审核{% endif %}</td></tr>
 {% endfor %}</tbody></table>
 {% endif %}
 {% if preview and enabled %}

@@ -77,7 +77,7 @@
                 <td>{{ "已配置" if agent.app_key else "未配置" }}</td>
                 <td>{{ "已配置" if agent.app_token else "未配置" }}</td>
                 <td><span class="badge {{ 'approved' if agent.is_active else '' }}">{{ '启用' if agent.is_active else '停用' }}</span>{% set profile = profiles.get(agent.id) %}{% if profile and profile.provider == 'nextsls' %}<small class="cell-note">NextSLS V5 · 已勾选 {{ profile.enabled|length }} 项</small>{% else %}<small class="cell-note">{{ '使用原有轨迹地址' if agent.supports_api and agent.api_url else '手工轨迹' }}</small>{% endif %}</td>
-                <td>{% if profile and profile.provider == 'nextsls' %}{{ profile.base_url }}<small class="cell-note">{{ (profile.verified.get('channel_catalogue', {}).get('channels', {}))|length }} 个渠道</small>{% else %}—{% endif %}</td>
+                <td>{% if profile and profile.provider == 'nextsls' %}{{ profile.base_url }}{% if acceptance is defined and acceptance.get(agent.id) %}{% set evidence = acceptance[agent.id] %}<small class="cell-note">API 实时连接及创建请求预检通过，生产创建未验证 · {{ evidence.channel }} · {{ evidence.date }}</small>{% endif %}<small class="cell-note">{{ (profile.verified.get('channel_catalogue', {}).get('channels', {}))|length }} 个渠道</small>{% else %}—{% endif %}</td>
                 <td>{{ shipment_counts.get(agent.id, 0) }}</td>
                 <td>
                     <a href="{{ url_for('views.edit_agent', agent_id=agent.id) }}" class="btn btn-sm btn-warning">编辑代理与功能接口</a>

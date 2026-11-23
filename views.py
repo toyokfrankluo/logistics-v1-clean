@@ -501,8 +501,10 @@ def agents():
                                     .group_by(Shipment.agent_id)).all())
     profiles = ({row.agent_id: row for row in db.session.scalars(select(TmsAgentApi))}
                 if ready else {})
+    from tms_create_batch import recorded_preflight
+    acceptance = {p.agent_id: recorded_preflight(p) for p in profiles.values()} if os.getenv("RENDER") == "true" else {}
     return render_template("agent.html", agents=data, shipment_counts=counts,
-                           profiles=profiles, providers=tms_carriers.PROVIDERS,
+                           profiles=profiles, providers=tms_carriers.PROVIDERS, acceptance=acceptance,
                            integration_ready=ready, capabilities=nextsls.CAPABILITIES)
 
 @views.route("/agents/<int:agent_id>/edit", methods=["GET", "POST"])
