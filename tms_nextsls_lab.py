@@ -253,7 +253,8 @@ def register_routes(staff):
                         except ValueError as reason:
                             output["blockers"].append(str(reason))
                     if action == "stage" or (action == "preview_one" and not output["blockers"]):
-                        policy = db.session.get(TmsNextslsTestPolicy, request.form.get("policy_id"))
+                        if action == "stage":
+                            policy = db.session.get(TmsNextslsTestPolicy, request.form.get("policy_id"))
                         if not applicable(policy, profile, agent, code) or (action == "stage" and request.form.get("fees_confirm") != "yes"):
                             raise nextsls.ProtocolError("此账号和渠道没有适用的联调依据，或未确认费用；未保存测试单。")
                         if db.engine.dialect.name == "postgresql":

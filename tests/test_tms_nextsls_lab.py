@@ -133,7 +133,6 @@ class LabTests(unittest.TestCase):
         self.staff_login()
         self.profile()
         self.assertEqual(self.record_policy(f"{self.agent.id}:TMS_DEMO").status_code, 302)
-        policy = TmsNextslsTestPolicy.query.one()
         calls, references = [], []
 
         def supplier(target, *, json, headers):
@@ -150,7 +149,7 @@ class LabTests(unittest.TestCase):
                         TMS_NEXTSLS_CREATE_ENABLED=True, TMS_NEXTSLS_READ_ENABLED=True):
             with patch("carrier_http.post", side_effect=supplier):
                 preview = self.send(action="preview_one", agent_id=self.agent.id, code="TMS_DEMO",
-                                    policy_id=policy.id, workbook=self.sample()).get_data(as_text=True)
+                                    workbook=self.sample()).get_data(as_text=True)
                 found = re.search(r'name="ticket" value="([^"]+)"', preview)
                 self.assertTrue(found, "Preflight did not show final confirmation")
                 self.assertEqual(TmsOrder.query.one().status, "pending")
