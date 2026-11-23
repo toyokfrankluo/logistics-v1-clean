@@ -1,5 +1,6 @@
 {% set invoice = order.invoice %}
 <article class="order-detail" data-order-detail>
+{% if staff and invoice.nextsls_lab_case %}<p class="notice">API 联调测试单 · 非客户委托 · <a href="{{ url_for('tms_staff.nextsls_lab') }}">返回联调中心</a>。</p>{% endif %}
 {% if invoice.acceptance_source %}<p class="notice">历史接口验收副本 · 来源订单 #{{ invoice.acceptance_source.order_id }}（{{ invoice.acceptance_source.original_customer_reference }}）。仅供查阅，不能向供应商正式下单。</p>{% endif %}
 {% if invoice.workbook_test_sample %}<p class="notice">原发票标注为非真实货件测试样本。只有供应商许可覆盖本票且管理员完成单票授权时，才可提交一次供应商测试建单。</p>{% endif %}
 <div class="heading"><div><p class="kicker">{{ '导入预览' if order.status == 'draft' else '运单详情' }}{% if staff %} · XR-{{ order.id }}{% endif %}</p>

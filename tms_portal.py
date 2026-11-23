@@ -46,12 +46,14 @@ import tms_supplier_files
 import tms_agent_import
 import tms_create_control
 import tms_create_batch
+import tms_nextsls_lab
 
 client = Blueprint("tms_client", __name__, url_prefix="/tms/customer")
 staff = Blueprint("tms_staff", __name__, url_prefix="/tms/admin")
 tms_agent_import.register_routes(staff)
 tms_create_control.register_routes(staff)
 tms_create_batch.register_routes(staff)
+tms_nextsls_lab.register_routes(staff)
 SESSION_KEY = "xingrui_customer"
 CUSTOMER_COOKIE = "xingrui_customer_session"
 CLIENT_POSTS = frozenset(f"tms_client.{name}" for name in ("sign_in", "sign_out", "upload", "confirm", "delete_order"))
@@ -60,6 +62,7 @@ DUMMY_HASH = generate_password_hash(token_hex(32))
 STATUS_LABELS = {"draft": "待确认", "pending": "待审核", "approved": "审核通过", "rejected": "审核驳回"}
 AUDIT_LABELS = {
     "upload": "上传发票", "replace": "更正发票", "confirm": "提交审核",
+    "lab_stage": "登记 API 联调测试单（非客户委托）",
     "acceptance_copy": "经授权复用发票准备独立接口验收单（未提交供应商）",
     "approve": "审核通过", "reject": "审核驳回", "pricing_draft": "保存收费草稿", "adjust": "调整销售条款",
     "settle": "确认最终应收",
@@ -118,6 +121,7 @@ def init_tms(app):
     tms_agent_import.init_app(app)
     tms_create_control.init_app(app)
     tms_create_batch.init_app(app)
+    tms_nextsls_lab.init_app(app)
 
     @app.before_request
     def check_tms_availability():
@@ -125,7 +129,7 @@ def init_tms(app):
             return
         if not app.config["TMS_ENABLED"]:
             abort(404)
-        if request.endpoint in {"tms_client.upload", "tms_staff.address_book"} and request.method == "POST":
+        if request.endpoint in {"tms_client.upload", "tms_staff.address_book", "tms_staff.nextsls_lab"} and request.method == "POST":
             if request.content_length is None or request.content_length > MAX_UPLOAD_BYTES + 64 * 1024:
                 abort(413, UPLOAD_LIMIT_TEXT)
 
@@ -181,6 +185,8 @@ def create_tms_schema():
         tms_agent_import.TmsAgentImport.__table__.create(connection, checkfirst=True)
         tms_supplier_files.TmsSupplierPreviewFile.__table__.create(connection, checkfirst=True)
         tms_create_control.TmsCreateControl.__table__.create(connection, checkfirst=True)
+        if current_app.config.get("TMS_NEXTSLS_LAB_ENABLED"):
+            tms_nextsls_lab.TmsNextslsTestPolicy.__table__.create(connection, checkfirst=True)
         if current_app.config["TMS_BATCH_ENABLED"]:
             for table in tms_create_batch.TABLES:
                 table.create(connection, checkfirst=True)
@@ -691,8 +697,9 @@ def accounts():
     username = account_name(raw_username)
     password = request.form.get("password", "")
     errors = {}
-    if not customer_id or not 0 < customer_id <= 2_147_483_647 or not db.session.get(Customer, customer_id):
-        errors["customer_id"] = "请选择一个已有客户。"
+    customer = db.session.get(Customer, customer_id) if customer_id and 0 < customer_id <= 2_147_483_647 else None
+    if not customer or customer.name == tms_nextsls_lab.TEST_CUSTOMER:
+        errors["customer_id"] = "请选择一个可开通登录的业务客户。"
     if not valid_account_name(username):
         errors["username"] = "账号须为 2–80 个字符，以中文、字母或数字开头，可包含 _ . @ + -。"
     if not 12 <= len(password) <= 128 or not password.strip():
@@ -712,7 +719,7 @@ def accounts():
 
 
 def accounts_page(*, errors=None, customer_id=None, username=""):
-    customers = Customer.query.order_by(Customer.name).all()
+    customers = Customer.query.filter(Customer.name != tms_nextsls_lab.TEST_CUSTOMER).order_by(Customer.name).all()
     accounts = db.session.execute(select(TmsAccount.id, TmsAccount.username, TmsAccount.active, Customer.name)
                                  .join(Customer, Customer.id == TmsAccount.customer_id)
                                  .order_by(TmsAccount.id.desc())).all()
@@ -927,6 +934,8 @@ def staff_detail(order, **context):
                 preparation["blockers"].append(f"渠道自动刷新失败：{refresh_error}")
             supplier = {
                 "link": link, "snapshot": snapshot, "cost": cost, "supplier_number": shipment.shipment_id,
+                "lab_query": (tms_carriers.latest_event(order.id, "reconcile")
+                              if "nextsls_lab_case" in order.invoice and link else None),
                 "last_attempt": (tms_carriers.latest_event(order.id, "attempt")
                                  if link and link.state in {"sending", "uncertain", "not_found", "linked"} else None),
                 "agent_name": agent.name if agent else "—",
@@ -1001,6 +1010,12 @@ def supplier_action(order_id):
                 category = "warning"
         elif action == "query":
             number, channel_matches, reference_matches = tms_carriers.query_linked_shipment(order)
+            if "nextsls_lab_case" in order.invoice:
+                link = db.session.get(TmsSupplierOrder, order.id)
+                tms_carriers.audit(link, "reconcile", current_user.id, {
+                    "source": "lab_get_info", "supplier_number": number,
+                    "channel_matches": channel_matches, "reference_matches": reference_matches})
+                db.session.commit()
             message = f"供应商已查到运单 {number}。"
             if not channel_matches:
                 message += "供应商未返回渠道。"

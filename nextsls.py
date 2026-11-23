@@ -109,7 +109,7 @@ def endpoint(origin, path):
     return origin + "/api/v5" + path
 
 
-def request_data(agent, origin, path, payload, *, transport=None):
+def request_data(agent, origin, path, payload, *, transport=None, receipt=None):
     if path not in PATHS or not origin or base_url(origin, "nextsls") != origin:
         raise ProtocolError("未配置 NextSLS 租户或接口未获支持。")
     if not agent.is_active or not agent.supports_api or not agent.app_token:
@@ -124,8 +124,14 @@ def request_data(agent, origin, path, payload, *, transport=None):
             "Authorization": "Bearer " + agent.app_token, "Accept": "application/json",
             "Accept-Language": "zh-CN", "Content-Type": "application/json",
         })
+        if receipt is not None:
+            receipt["http_status"] = response.status_code
         data = response.json()
+        if receipt is not None and isinstance(data, dict) and type(data.get("status")) is int:
+            receipt["api_status"] = data["status"]
     except carrier_http.CarrierRequestError as error:
+        if receipt is not None and type(error.status) is int:
+            receipt["http_status"] = error.status
         if error.status in (401, 403):
             operation = {"/shipment/get_services": "渠道读取", "/shipment/create": "创建运单"}.get(path, "查询")
             raise ProtocolError(f"NextSLS 拒绝{operation}认证（HTTP {error.status}），请核对 App Token 或账号权限。") from None

@@ -1,0 +1,62 @@
+{% extends "tms/layout.html" %}
+{% block title %}NextSLS V5 联调中心{% endblock %}
+{% block content %}
+<h1>NextSLS V5 API 联调中心</h1>
+<p>渠道读取成功只证明读取权限。站点真实创建：{{ '开启' if enabled else '关闭' }}（{{ '管理员控制' if config.TMS_NEXTSLS_CREATE_MODE == 'admin' else '部署配置控制' }}）。联调中心不会自行发送创建请求。</p>
+<p><a href="{{ url_for('views.agents') }}">代理管理／新增 V5 账号</a> · <a href="{{ url_for('tms_staff.create_settings') }}">真实下单控制</a></p>
+<h2>A · 技术预检（不写入供应商）</h2>
+<table><thead><tr><th>代理</th><th>官方文档</th><th>渠道记录</th><th>创建证据</th></tr></thead><tbody>
+{% for a in accounts %}
+<tr><td>{{ a.name }} · #{{ a.id }}</td><td><a href="{{ a.base_url }}/api/v5/docs">V5 文档</a> · <a href="{{ a.base_url }}/api/v5/docs/markdown">Markdown</a>{% set docs = a.verified.get('onboarding', {}).get('docs', {}) %}{% if docs %}<small>{{ '文档出现测试相关字样，须核实具体适用条件' if docs.get('markdown', {}).get('test_terms_present') or docs.get('docs', {}).get('test_terms_present') else '已抓取文档；未记录测试入口' }}</small>{% endif %}</td>
+<td>{{ (a.verified.get('channel_catalogue', {}).get('channels', {}))|length }} 个（最近保存）</td>
+<td>{{ '已配置创建功能' if 'create' in a.enabled else '未配置创建功能' }}；{{ '有真实创建成功记录' if a.verified.get('create') else '创建权限尚无实际响应证据' }}</td></tr>
+{% endfor %}
+</tbody></table>
+<form class="panel" method="post" enctype="multipart/form-data">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<label>代理 <select name="agent_id" required>
+{% for a in accounts %}<option value="{{ a.id }}"{% if selected == a.id %} selected{% endif %}>{{ a.name }} #{{ a.id }}</option>{% endfor %}
+</select></label>
+<button name="action" value="refresh">实时读取渠道</button>
+<label>渠道 <input name="code" list="lab-channels" maxlength="64"></label>
+<datalist id="lab-channels">{% for code, label in catalogue.items() %}<option value="{{ code }}">{{ label }}</option>{% endfor %}</datalist>
+<label>已标记的测试 Excel <input type="file" name="workbook" accept=".xlsx"></label>
+<button name="action" value="preview">只做资料及附件预检</button>
+{% if active %}
+<h3>B · 登记独立测试订单</h3>
+<label>适用依据 <select name="policy_id"><option value="">选择依据</option>
+{% for p in policies if p.id in active %}<option value="{{ p.id }}">{{ p.evidence }} · {{ p.fees }}</option>{% endfor %}
+</select></label>
+<label><input name="fees_confirm" type="checkbox" value="yes">本票符合该依据，且已确认费用、不揽收和不实际承运条件</label>
+<button name="action" value="stage">登记测试单（不发给供应商）</button>
+{% endif %}
+</form>
+{% if output %}
+<p>{{ output.code }} · {{ output.boxes }} 箱 · {{ output.rows }} 条申报 · {{ output.pictures }} 张原图 · 装箱单 {{ output.packing_bytes }} 字节。尚未发布或发送附件。</p>
+<p>未知渠道规则：{{ output.unknown|join('、') or '无已识别的未知项' }}。必填图片：{{ (output.photo_fields or [])|join('、') or '无已确认的必填图片' }}。</p>
+{% if output.blockers %}<ul>{% for message in output.blockers %}<li>{{ message }}</li>{% endfor %}</ul>{% endif %}
+{% endif %}
+<h2>B · 受控实际建单</h2>
+<p>使用已核验的沙箱或既有合同、平台条款、账号授权等可核实依据。多代理可共用同一依据，但只覆盖明确登记的账号和渠道。记录不会开启站点下单许可；登记测试单后仍须审核、单票授权，再从订单页提交。</p>
+<form class="panel" method="post">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<label>依据名称、版本或可核验记录编号（勿填密钥） <input name="evidence" maxlength="500" required></label>
+<label>范围（每项为代理 ID:渠道代码，以空格或换行隔开；先读取该账号渠道） <textarea name="scope" maxlength="80000" required placeholder="123:CHANNEL"></textarea></label>
+<label>计费 <select name="fee_type" required><option value="">请选择已核对的条件</option><option value="free">免计费</option><option value="confirmed">费用已另行获准</option></select></label>
+<label>费用及处理条件 <input name="fees" maxlength="200" required></label>
+<label>有效天数 <input type="number" name="days" min="1" max="366" value="30" required></label>
+<label><input name="evidence_confirm" type="checkbox" value="yes" required>已查阅外部依据；确认覆盖所列账号、渠道及测试样本</label>
+<label><input name="no_pickup" type="checkbox" value="yes" required>该范围下不揽收、不实际承运</label>
+<button name="action" value="policy">保存可复用联调依据</button>
+</form>
+{% for p in policies %}
+<form class="panel" method="post">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<input type="hidden" name="policy_id" value="{{ p.id }}">
+{{ p.evidence }} · {{ p.fees }} · 到期 {{ expiry[p.id] }} · {% for item in p.scope %}#{{ item.id }}:{{ item.service }} {% endfor %}
+{% if p.id in active %}<button name="action" value="revoke">撤销</button>{% else %}已过期或撤销{% endif %}
+</form>
+{% endfor %}
+<h3>已登记联调单</h3>
+<ul>{% for c in cases %}<li><a href="{{ url_for('tms_staff.review',order_id=c.id) }}">#{{ c.id }}</a> · {{ c.status }} · {{ c.state or '未发送' }} · {{ c.supplier_number or '—' }}</li>{% else %}<li>尚无。</li>{% endfor %}</ul>
+{% endblock %}

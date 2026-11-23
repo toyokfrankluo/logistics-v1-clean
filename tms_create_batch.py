@@ -38,6 +38,8 @@ def signer():
 
 
 def eligibility(order, *, preflight=True, confirm_business=False):
+    if "nextsls_lab_case" in order.invoice:
+        raise nextsls.ProtocolError("联调测试单请从联调中心单票处理。")
     if preflight and confirm_business:
         shipment, _ = carriers.approved_shipment(order)
         agent = db.session.get(CarrierAgent, order.agent_id)

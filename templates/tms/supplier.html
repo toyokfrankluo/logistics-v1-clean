@@ -22,6 +22,13 @@
   <p><span class="badge">{% if link and link.state == "uncertain" and supplier.last_attempt and supplier.last_attempt.details.supplier_rejected %}代理返回失败 · 待对账{% else %}{{ states[link.state] if link else ('已录入供应商单号' if supplier.supplier_number else '待提交代理') }}{% endif %}</span>
     {% if supplier.supplier_number %} · {{ supplier.supplier_number }}{% endif %}
     {% if link %} · 对账参考号 <code>{{ link.client_reference }}</code>{% endif %}</p>
+  {% if supplier.last_attempt and supplier.last_attempt.details.lab_response is defined %}
+  {% set receipt = supplier.last_attempt.details.lab_response %}
+  <p>联调创建回执：HTTP {{ receipt.http_status|default('无响应') }} · V5 状态 {{ receipt.api_status|default('未返回') }}{% if receipt.shipment_id %} · 单号 {{ receipt.shipment_id }}{% endif %}</p>
+  {% endif %}
+  {% if supplier.lab_query and supplier.lab_query.details.source == 'lab_get_info' %}
+  <p>联调查询：单号已匹配 · 渠道 {{ '匹配' if supplier.lab_query.details.channel_matches else '未核实' }} · 客户参考号 {{ '匹配' if supplier.lab_query.details.reference_matches else '未核实' }}。</p>
+  {% endif %}
   {% if preparation %}
   {% if preparation.sample_approval %}<p class="notice">本票已有供应商测试许可，依据 {{ preparation.sample_approval.evidence_id }}。本次限一次测试建单，请核对费用和不揽收安排。</p>{% endif %}
   {% if preparation.unknown_rules %}

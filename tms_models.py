@@ -207,3 +207,15 @@ class TmsCreateBatchItem(db.Model):
     state = db.Column(db.String(20), nullable=False, default="queued")
     number = db.Column(db.String(64))
     detail = db.Column(db.String(500))
+
+
+class TmsNextslsTestPolicy(db.Model, TimestampMixin):
+    """Administrator-recorded external test conditions; never a production capability grant."""
+    __tablename__ = "tms_nextsls_test_policy"
+    id = db.Column(db.String(32), primary_key=True)
+    actor_id = db.Column(db.Integer, nullable=False)
+    evidence = db.Column(db.String(500), nullable=False)
+    scope = db.Column(db.JSON, nullable=False)
+    fees = db.Column(db.String(200), nullable=False)
+    expires_at = db.Column(db.BigInteger, nullable=False)
+    revoked_by = db.Column(db.Integer)

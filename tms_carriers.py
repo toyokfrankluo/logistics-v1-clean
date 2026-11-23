@@ -4,6 +4,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from hashlib import sha256
 from io import BytesIO
 import json
+import re
 from pathlib import Path
 from uuid import uuid4
 from types import SimpleNamespace
@@ -188,7 +189,8 @@ def quick_connect(name, origin, token):
             document = carrier_http.get_document(SimpleNamespace(is_active=True, supports_api=True, api_url=origin+path))
             valid = bool(document.strip()) and (path.endswith("/docs") or all(
                 value in document for value in ("/shipment/create", "/shipment/get_services")))
-            docs[path.rsplit("/", 1)[-1]] = {"available":valid,"sha256":sha256(document.encode()).hexdigest()}
+            docs[path.rsplit("/", 1)[-1]] = {"available":valid,"sha256":sha256(document.encode()).hexdigest(),
+                "test_terms_present": bool(re.search(r"(?i)\bsandbox\b|test[_ -]mode|沙箱|测试环境|测试建单|测试账号", document))}
         except carrier_http.CarrierRequestError:
             docs[path.rsplit("/", 1)[-1]] = {"available":False}
     catalogue, rules = read_channel_catalogue(temporary, candidate)
@@ -345,6 +347,9 @@ def sample_create_approval(order, profile, agent):
     if ("acceptance_source" in order.invoice or not order.invoice.get("workbook_test_sample")
             or not profile or not agent or not agent.app_token or profile.provider != "nextsls"):
         return None
+    if "nextsls_lab_case" in order.invoice:
+        from tms_nextsls_lab import approval_for
+        return approval_for(order, profile, agent)
     raw = current_app.config.get("TMS_NEXTSLS_SAMPLE_CREATE_APPROVALS", "")
     try:
         approvals = json.loads(raw) if raw else {}
@@ -673,6 +678,7 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
     audit(link, "attempt", actor_id, {"state": "sending", **delivery_audit})
     db.session.commit()  # Commit the one-order reservation before contacting the supplier.
 
+    receipt = {} if "nextsls_lab_case" in order.invoice else None
     try:
         _, agent, profile, link = operation_context(order, "create")
         if (link.state != "sending" or profile.base_url != origin or agent.app_token != token
@@ -680,8 +686,14 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
             raise nextsls.ProtocolError("提交预留已变化。")
         if approval and sample_create_approval(order, profile, agent) != approval:
             raise nextsls.ProtocolError(WORKBOOK_SAMPLE_BLOCKER)
-        data = nextsls.request_data(agent, origin, "/shipment/create", payload, transport=transport)
+        if receipt is not None:
+            data = nextsls.request_data(agent, origin, "/shipment/create", payload, transport=transport, receipt=receipt)
+            delivery_audit["lab_response"] = receipt
+        else:
+            data = nextsls.request_data(agent, origin, "/shipment/create", payload, transport=transport)
         attach_number(shipment, link, nextsls.parse_supplier_number(data))
+        if receipt is not None:
+            receipt["shipment_id"] = link.supplier_number
         shipment.status = "代理已接单"
         if transport is None and not current_app.config.get("ISOLATED_MODE"):
             mark_verified(profile, {"create"})
@@ -694,6 +706,8 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
         transition(link, "sending", "uncertain")
         reason = str(error) if isinstance(error, nextsls.ProtocolError) else "供应商结果未能关联，请先对账。"
         details = {"state": "uncertain", "reason": reason, **delivery_audit}
+        if receipt is not None:
+            details["lab_response"] = receipt
         if approval:
             details["sample_approval"] = approval
         if isinstance(error, nextsls.CreateRejected):
