@@ -5,11 +5,12 @@
 <p>渠道读取成功只证明读取权限。站点真实创建：{{ '开启' if enabled else '关闭' }}（{{ '管理员控制' if config.TMS_NEXTSLS_CREATE_MODE == 'admin' else '部署配置控制' }}）。联调中心不会自行发送创建请求。</p>
 <p><a href="{{ url_for('views.agents') }}">代理管理／新增 V5 账号</a> · <a href="{{ url_for('tms_staff.create_settings') }}">真实下单控制</a></p>
 <h2>A · 技术预检（不写入供应商）</h2>
-<table><thead><tr><th>代理</th><th>官方文档</th><th>渠道记录</th><th>创建证据</th></tr></thead><tbody>
+<table><thead><tr><th>代理</th><th>官方文档</th><th>渠道记录</th><th>创建证据</th><th>本次外部建单条件</th></tr></thead><tbody>
 {% for a in accounts %}
 <tr><td>{{ a.name }} · #{{ a.id }}</td><td><a href="{{ a.base_url }}/api/v5/docs">V5 文档</a> · <a href="{{ a.base_url }}/api/v5/docs/markdown">Markdown</a>{% set docs = a.verified.get('onboarding', {}).get('docs', {}) %}{% if docs %}<small>{{ '文档出现测试相关字样，须核实具体适用条件' if docs.get('markdown', {}).get('test_terms_present') or docs.get('docs', {}).get('test_terms_present') else '已抓取文档；未记录测试入口' }}</small>{% endif %}</td>
 <td>{{ (a.verified.get('channel_catalogue', {}).get('channels', {}))|length }} 个（最近保存）</td>
-<td>{{ '已配置创建功能' if 'create' in a.enabled else '未配置创建功能' }}；{{ '有真实创建成功记录' if a.verified.get('create') else '创建权限尚无实际响应证据' }}</td></tr>
+<td>{{ '已配置创建功能' if 'create' in a.enabled else '未配置创建功能' }}；{{ '有真实创建成功记录' if a.verified.get('create') else '创建权限尚无实际响应证据' }}</td>
+<td>{% if a.authorized_codes %}有有效联调依据：{{ a.authorized_codes|join('、') }}。仍须审核和单票授权。{% else %}外部真实创建未获准：没有匹配此账号凭据和渠道的有效联调依据。{% endif %}</td></tr>
 {% endfor %}
 </tbody></table>
 <form class="panel" method="post" enctype="multipart/form-data">
@@ -37,7 +38,7 @@
 {% if output.blockers %}<ul>{% for message in output.blockers %}<li>{{ message }}</li>{% endfor %}</ul>{% endif %}
 {% endif %}
 <h2>B · 受控实际建单</h2>
-<p>使用已核验的沙箱或既有合同、平台条款、账号授权等可核实依据。多代理可共用同一依据，但只覆盖明确登记的账号和渠道。记录不会开启站点下单许可；登记测试单后仍须审核、单票授权，再从订单页提交。</p>
+<p>使用已核验的沙箱或既有合同、平台条款、账号授权等可核实依据。多代理可共用同一依据，但只覆盖明确登记的账号和渠道。记录不会开启站点下单许可；登记测试单后仍须审核、单票授权，再从订单页点击「一键创建电子运单」。星睿只发创建和只读核验请求，不预约揽收、不提交交仓。</p>
 <form class="panel" method="post">
 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 <label>依据名称、版本或可核验记录编号（勿填密钥） <input name="evidence" maxlength="500" required></label>

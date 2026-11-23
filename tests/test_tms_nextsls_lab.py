@@ -37,6 +37,7 @@ class LabTests(unittest.TestCase):
         body = self.send(action="preview", agent_id=self.agent.id, code="TMS_DEMO",
                          workbook=self.sample()).get_data(as_text=True)
         self.assertIn("3 张原图", body)
+        self.assertIn("外部真实创建未获准", body)
         self.assertNotIn(fixture.TOKEN, body)
         self.assertEqual(TmsOrder.query.count(), 0)
         self.carrier_post.assert_not_called()
@@ -114,9 +115,8 @@ class LabTests(unittest.TestCase):
                         TMS_NEXTSLS_CREATE_ENABLED=True, TMS_NEXTSLS_READ_ENABLED=True):
             self.assertEqual(self.action(oid, "grant_create", revision=2, confirm="yes").status_code, 302)
             with patch("carrier_http.post", side_effect=reply):
-                self.assertEqual(self.action(oid, "create", confirm="yes").status_code, 302)
-                self.assertEqual(self.action(oid, "create", confirm="yes").status_code, 400)
-                self.assertEqual(self.action(oid, "query").status_code, 302)
+                self.assertEqual(self.action(oid, "create", confirm="yes", verify_after_create="yes").status_code, 302)
+                self.assertEqual(self.action(oid, "create", confirm="yes", verify_after_create="yes").status_code, 400)
         self.assertEqual(calls, ["get_services", "create", "get_info"])
         event = tms_carriers.latest_event(oid, "attempt")
         self.assertEqual(event.details["lab_response"], {"http_status": 200, "api_status": 1,

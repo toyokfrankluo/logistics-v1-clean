@@ -6,7 +6,7 @@ from uuid import uuid4
 
 from flask import abort, current_app, redirect, render_template, request, url_for
 from flask_login import current_user
-from sqlalchemy import inspect, select, text
+from sqlalchemy import inspect, or_, select, text
 from sqlalchemy.exc import IntegrityError
 
 import nextsls
@@ -193,17 +193,36 @@ def register_routes(staff):
         except IntegrityError:
             db.session.rollback()
             error = "测试文件已登记或数据发生变化；请查看已有联调记录。"
-        accounts = db.session.execute(select(CarrierAgent.id, CarrierAgent.name, TmsAgentApi.base_url,
-                TmsAgentApi.enabled, TmsAgentApi.verified).join(TmsAgentApi)
+        account_rows = db.session.execute(select(CarrierAgent.id, CarrierAgent.name, TmsAgentApi.base_url,
+                TmsAgentApi.enabled, TmsAgentApi.verified, CarrierAgent.app_token).join(TmsAgentApi)
                 .where(TmsAgentApi.provider == "nextsls", CarrierAgent.is_active.is_(True))
                 .order_by(CarrierAgent.name)).all()
-        policies = db.session.scalars(select(TmsNextslsTestPolicy).order_by(TmsNextslsTestPolicy.created_at.desc()).limit(100)).all()
+        current_time = now()
+        policy_list = select(TmsNextslsTestPolicy).order_by(TmsNextslsTestPolicy.created_at.desc())
+        valid_policies = db.session.scalars(policy_list.where(TmsNextslsTestPolicy.revoked_by.is_(None),
+                                                               TmsNextslsTestPolicy.expires_at > current_time)).all()
+        archived_policies = db.session.scalars(policy_list.where(or_(TmsNextslsTestPolicy.revoked_by.is_not(None),
+                                                                     TmsNextslsTestPolicy.expires_at <= current_time))
+                                               .limit(100)).all()
+        policies = [*valid_policies, *archived_policies]
+        active = {policy.id for policy in valid_policies}
+        binding_by_account = {row.id: (row.base_url, sha256(row.app_token.encode()).hexdigest())
+                              for row in account_rows if row.app_token}
+        scopes = {}
+        for policy in valid_policies:
+            for scope in policy.scope:
+                aid = scope["id"]
+                if binding_by_account.get(aid) == (scope["origin"], scope["token_sha256"]):
+                    scopes.setdefault(aid, set()).add(scope["service"])
+        accounts = [SimpleNamespace(id=row.id, name=row.name, base_url=row.base_url,
+                    enabled=row.enabled, verified=row.verified, authorized_codes=sorted(scopes.get(row.id, ())))
+                    for row in account_rows]
         cases = db.session.execute(select(TmsOrder.id, TmsOrder.status, TmsSupplierOrder.state,
                 TmsSupplierOrder.supplier_number).outerjoin(TmsSupplierOrder)
                 .where(TmsOrder.invoice["nextsls_lab_case"]["policy_id"].as_string().is_not(None))
                 .order_by(TmsOrder.id.desc()).limit(30)).all()
         return render_template("tms/nextsls_lab.html", staff=True, error=error, output=output, accounts=accounts,
                                selected=selected, catalogue=catalogue, policies=policies, cases=cases,
-                               active={p.id for p in policies if not p.revoked_by and p.expires_at > now()},
+                               active=active,
                                expiry={p.id: datetime.fromtimestamp(p.expires_at, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
                                        for p in policies}, enabled=control.enabled())

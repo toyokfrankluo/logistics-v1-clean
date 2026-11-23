@@ -66,6 +66,73 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(len(submissions), 1)
         self.assertEqual(db.session.get(TmsSupplierOrder, order_id).supplier_number, fixture.SUPPLIER_NUMBER)
 
+    def test_electronic_waybill_records_identity_mismatch_without_resending(self):
+        import tms_carriers
+        order_id = self.prepared()
+        url = f"/tms/admin/orders/{order_id}"
+        self.assertIn("一键创建电子运单", self.get(self.staff, url).get_data(as_text=True))
+        calls = []
+
+        def supplier(target, **kwargs):
+            method = target.api_url.rsplit("/", 1)[-1]
+            calls.append(method)
+            if method == "get_services":
+                return fixture.success({"services": [fixture.SERVICE]})
+            return fixture.success({"shipment": {"shipment_id": fixture.SUPPLIER_NUMBER,
+                "service_code": "TMS_DEMO", "client_reference": "incorrect-reference"}})
+
+        with patch("carrier_http.post", side_effect=supplier):
+            self.assertEqual(self.action(order_id, "create", confirm="yes", verify_after_create="yes").status_code, 302)
+            self.assertEqual(self.action(order_id, "create", confirm="yes", verify_after_create="yes").status_code, 400)
+        self.assertEqual(calls, ["get_services", "create", "get_info"])
+        self.assertEqual(db.session.get(TmsSupplierOrder, order_id).supplier_number, fixture.SUPPLIER_NUMBER)
+        event = tms_carriers.latest_event(order_id, "reconcile")
+        self.assertEqual(event.details["source"], "waybill_get_info")
+        self.assertFalse(event.details["reference_matches"])
+
+    def test_electronic_waybill_timeout_only_queries_exact_reference(self):
+        import carrier_http
+        order_id = self.prepared()
+        calls = []
+        reference = []
+
+        def supplier(target, *, json, headers):
+            method = target.api_url.rsplit("/", 1)[-1]
+            calls.append(method)
+            if method == "get_services":
+                return fixture.success({"services": [fixture.SERVICE]})
+            if method == "create":
+                reference.append(json["shipment"]["client_reference"])
+                raise carrier_http.CarrierRequestError("synthetic timeout")
+            self.assertEqual(json["shipment"]["client_reference"], reference[0])
+            return fixture.success({"list": []})
+
+        with patch("carrier_http.post", side_effect=supplier):
+            self.assertEqual(self.action(order_id, "create", confirm="yes", verify_after_create="yes").status_code, 302)
+            self.assertEqual(self.action(order_id, "create", confirm="yes", verify_after_create="yes").status_code, 400)
+        self.assertEqual(calls, ["get_services", "create", "list"])
+        self.assertEqual(db.session.get(TmsSupplierOrder, order_id).state, "not_found")
+
+    def test_electronic_waybill_surfaces_supplier_rejection_without_query_or_retry(self):
+        from types import SimpleNamespace
+        order_id = self.prepared()
+        calls = []
+
+        def supplier(target, **kwargs):
+            method = target.api_url.rsplit("/", 1)[-1]
+            calls.append(method)
+            if method == "get_services":
+                return fixture.success({"services": [fixture.SERVICE]})
+            return SimpleNamespace(status_code=200, json=lambda: {"status": 0, "info": "Missing required field: mobile"})
+
+        with patch("carrier_http.post", side_effect=supplier):
+            self.assertEqual(self.action(order_id, "create", confirm="yes", verify_after_create="yes").status_code, 302)
+            body = self.get(self.staff, f"/tms/admin/orders/{order_id}").get_data(as_text=True)
+            self.assertIn("供应商拒绝创建", body)
+            self.assertIn("响应指出缺少", body)
+            self.assertEqual(self.action(order_id, "create", confirm="yes", verify_after_create="yes").status_code, 400)
+        self.assertEqual(calls, ["get_services", "create"])
+
     def test_pending_business_draft_is_reviewed_and_granted_in_one_confirmation(self):
         self.enterContext(patch.dict(app.config, TMS_NEXTSLS_CREATE_MODE="environment",
                                     TMS_NEXTSLS_CREATE_ENABLED=False))

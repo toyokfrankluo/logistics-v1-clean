@@ -934,8 +934,7 @@ def staff_detail(order, **context):
                 preparation["blockers"].append(f"渠道自动刷新失败：{refresh_error}")
             supplier = {
                 "link": link, "snapshot": snapshot, "cost": cost, "supplier_number": shipment.shipment_id,
-                "lab_query": (tms_carriers.latest_event(order.id, "reconcile")
-                              if "nextsls_lab_case" in order.invoice and link else None),
+                "waybill_query": (tms_carriers.latest_event(order.id, "reconcile") if link else None),
                 "last_attempt": (tms_carriers.latest_event(order.id, "attempt")
                                  if link and link.state in {"sending", "uncertain", "not_found", "linked"} else None),
                 "agent_name": agent.name if agent else "—",
@@ -989,6 +988,53 @@ def review(order_id):
     return staff_detail(reviewable_order(order_id))
 
 
+def waybill_query_result(order, *, record=False):
+    number, channel_matches, reference_matches = tms_carriers.query_linked_shipment(order)
+    lab = "nextsls_lab_case" in order.invoice
+    if record or lab:
+        link = db.session.get(TmsSupplierOrder, order.id)
+        tms_carriers.audit(link, "reconcile", current_user.id, {
+            "source": "lab_get_info" if lab else "waybill_get_info", "supplier_number": number,
+            "channel_matches": channel_matches, "reference_matches": reference_matches})
+        db.session.commit()
+    message = f"供应商已查到运单 {number}。"
+    if not channel_matches:
+        message += "供应商未返回渠道。"
+    if not reference_matches:
+        message += "供应商客户参考号未与星睿记录匹配，请人工核对。"
+    if channel_matches and reference_matches:
+        message += "渠道和客户参考号均匹配。"
+    return message, "success" if channel_matches and reference_matches else "warning"
+
+
+def finish_electronic_waybill(order, state):
+    """Use only read operations after the one permitted create."""
+    if state != "linked":
+        attempt = tms_carriers.latest_event(order.id, "attempt")
+        details = attempt.details if attempt else {}
+        if details.get("supplier_rejected"):
+            return f'供应商拒绝创建：{details.get("reason") or "未返回可展示的原因"}。未再次发送。', "warning"
+        try:
+            if tms_carriers.reconcile_order(order, current_user.id) != "linked":
+                return "创建结果待确认：按唯一参考号暂未查到，订单保持锁定，未再次发送。", "warning"
+        except nextsls.ProtocolError as error:
+            db.session.rollback()
+            return f"创建结果待确认，未再次发送。只读对账：{error}", "warning"
+        except SQLAlchemyError:
+            db.session.rollback()
+            return "创建结果待确认，只读对账未完成；未再次发送。", "warning"
+    message = "已保存供应商运单号。"
+    try:
+        query_message, category = waybill_query_result(order, record=True)
+        return message + query_message, category
+    except nextsls.ProtocolError as error:
+        db.session.rollback()
+        return f"{message}查询尚未核验：{error}", "warning"
+    except SQLAlchemyError:
+        db.session.rollback()
+        return message + "查询记录未能保存，稍后可从订单页查询。", "warning"
+
+
 @staff.post("/orders/<int:order_id>/supplier")
 def supplier_action(order_id):
     order = reviewable_order(order_id)
@@ -1004,25 +1050,15 @@ def supplier_action(order_id):
             if request.form.get("revision", type=int) != order.revision:
                 raise nextsls.ProtocolError("订单已经更新，请重新核对本票下单资料。")
             state = tms_carriers.send_order(order, current_user.id)
-            message = ("已保存供应商运单号。" if state == "linked"
-                       else "未取得代理运单号。请先对账，系统不会自动重试。")
-            if state != "linked":
-                category = "warning"
+            if request.form.get("verify_after_create") == "yes":
+                message, category = finish_electronic_waybill(order, state)
+            else:
+                message = ("已保存供应商运单号。" if state == "linked"
+                           else "未取得代理运单号。请先对账，系统不会自动重试。")
+                if state != "linked":
+                    category = "warning"
         elif action == "query":
-            number, channel_matches, reference_matches = tms_carriers.query_linked_shipment(order)
-            if "nextsls_lab_case" in order.invoice:
-                link = db.session.get(TmsSupplierOrder, order.id)
-                tms_carriers.audit(link, "reconcile", current_user.id, {
-                    "source": "lab_get_info", "supplier_number": number,
-                    "channel_matches": channel_matches, "reference_matches": reference_matches})
-                db.session.commit()
-            message = f"供应商已查到运单 {number}。"
-            if not channel_matches:
-                message += "供应商未返回渠道。"
-            if not reference_matches:
-                message += "供应商客户参考号未与星睿记录匹配，请人工核对。"
-            if not channel_matches or not reference_matches:
-                category = "warning"
+            message, category = waybill_query_result(order)
         elif action in {"grant_create", "revoke_create"}:
             message = change_create_grant(order, revoke=action == "revoke_create")
         elif action == "channel":
