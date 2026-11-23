@@ -1,4 +1,4 @@
-"""Administrator-only NextSLS integration center. Never sends shipment/create itself."""
+"""Administrator-only NextSLS integration center using the shared order and send flow."""
 from datetime import datetime, timezone
 from hashlib import sha256
 from types import SimpleNamespace
@@ -6,8 +6,10 @@ from uuid import uuid4
 
 from flask import abort, current_app, redirect, render_template, request, url_for
 from flask_login import current_user
+from itsdangerous import BadData, URLSafeTimedSerializer
+from werkzeug.datastructures import MultiDict
 from sqlalchemy import inspect, or_, select, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import SQLAlchemyError
 
 import nextsls
 import tms_carriers as carriers
@@ -72,6 +74,71 @@ def checked_account(agent_id):
     return agent, profile
 
 
+def preview_signer():
+    return URLSafeTimedSerializer(current_app.secret_key, salt="nextsls-lab-one-click-v1")
+
+
+def final_create(ticket):
+    from tms_portal import finish_electronic_waybill, history, save_pricing, update_order
+    try:
+        actor, order_id, revision, digest = preview_signer().loads(ticket, max_age=600)
+    except (BadData, ValueError):
+        raise nextsls.ProtocolError("预检已失效，请重新预检。") from None
+    if actor != current_user.id:
+        abort(403)
+    if request.form.get("confirm") != "yes":
+        raise nextsls.ProtocolError("请确认本票费用、供应商处理条件及一次建单。")
+    order = db.session.get(TmsOrder, order_id, with_for_update=True, populate_existing=True)
+    case = order.invoice.get("nextsls_lab_case") if order else None
+    if not case or case.get("one_click") is not True or case.get("staged_by") != actor:
+        abort(404)
+    if order.invoice.get("order_archive") or "acceptance_source" in order.invoice:
+        raise nextsls.ProtocolError("已归档订单或历史验收副本不能提交。")
+    if order.status != "pending" or order.revision != revision:
+        return {"id": order.id, "message": "此预检已处理或订单已变更；未再次发送。", "category": "warning"}
+    if not control.enabled():
+        raise nextsls.ProtocolError("站点真实创建许可关闭或紧急停止已开启；未发送。")
+    agent, profile = checked_account(order.agent_id)
+    policy = db.session.get(TmsNextslsTestPolicy, case["policy_id"], populate_existing=True)
+    if (not applicable(policy, profile, agent, order.agent_service)
+            or case["binding"] != account_binding(profile, agent, order.agent_service)):
+        raise nextsls.ProtocolError("原联调依据已失效、被撤销或账号配置已改变；未发送。")
+    rules = carriers.channel_rules(profile, order.agent_service)
+    if rules is None or nextsls.rules_digest(rules) != digest:
+        raise nextsls.ProtocolError("渠道规则已更新或缓存已失效；请重新预检，未发送。")
+    reviewed_case = dict(case, fees_confirmed=True)
+    order.invoice = dict(order.invoice, nextsls_lab_case=reviewed_case)
+    # This isolated account is not a customer. Zero internal sales terms do not represent vendor charges.
+    form = MultiDict({"agent_id": str(agent.id), "agent_service": order.agent_service,
+                      "supplier_binding": f"{agent.id}:{profile.base_url}",
+                      "destination_confirmed":"yes", "confirmed":"yes", "unit":"shipment",
+                      "rate":"0", "surcharge":"0", "operation":"0", "high_value":"0",
+                      "currency":"CNY", "other_mode":"none", "review_note":"API 联调，无客户应收"})
+    save_pricing(order, "approve", form)
+    db.session.flush()
+    db.session.refresh(order)
+    prep = carriers.supplier_preparation(order, profile, agent)
+    if prep["blockers"]:
+        raise nextsls.ProtocolError("；".join(prep["blockers"]))
+    invoice = carriers.make_create_grant(order, profile, actor, preparation=prep,
+        unknown_confirmed=request.form.get("unknown_confirmed") == "yes",
+        unknown_basis=request.form.get("unknown_basis", ""))
+    update_order(order, {"invoice": invoice})
+    history(order, "supplier_grant")
+    db.session.commit()
+    try:
+        state = carriers.send_order(order, actor, require_grant=True)
+        message, category = finish_electronic_waybill(order, state)
+    except (nextsls.ProtocolError, SQLAlchemyError) as error:
+        db.session.rollback()
+        message = str(error) if isinstance(error, nextsls.ProtocolError) else "创建结果未确认；请核对记录，不要重新提交。"
+        category = "warning"
+    link = db.session.get(TmsSupplierOrder, order_id, populate_existing=True)
+    return {"id": order_id, "message": message, "category": category,
+            "number": link.supplier_number if link else None}
+
+
+
 def register_routes(staff):
     @staff.route(PATH, methods=["GET", "POST"])
     def nextsls_lab():
@@ -80,9 +147,12 @@ def register_routes(staff):
         if not inspect(db.engine).has_table(TmsNextslsTestPolicy.__tablename__):
             abort(503, "联调中心数据库尚未就绪。")
         output, error, selected, catalogue = None, None, None, {}
+        result = None
         action = request.form.get("action") if request.method == "POST" else None
         try:
-            if action == "policy":
+            if action == "create_one":
+                result = final_create(request.form.get("ticket", ""))
+            elif action == "policy":
                 if request.form.get("no_pickup") != "yes" or request.form.get("evidence_confirm") != "yes":
                     raise nextsls.ProtocolError("请明确核对测试范围与不揽收、不实际承运条件。")
                 evidence = nextsls.supplied_text(request.form.get("evidence"), 500)
@@ -127,10 +197,10 @@ def register_routes(staff):
                     policy.revoked_by = current_user.id
                     db.session.commit()
                 return redirect(url_for("tms_staff.nextsls_lab"))
-            if action in {"refresh", "preview", "stage"}:
+            if action in {"refresh", "preview", "stage", "preview_one"}:
                 selected = request.form.get("agent_id", type=int)
                 agent, profile = checked_account(selected)
-                if action == "refresh" or not carriers.fresh_channel_cache(profile):
+                if action in {"refresh", "preview_one"} or not carriers.fresh_channel_cache(profile):
                     carriers.refresh_channel_catalogue(profile, agent)
                     db.session.commit()
                 catalogue = carriers.channel_catalogue(profile)
@@ -161,9 +231,30 @@ def register_routes(staff):
                         "rows":len(invoice["declarations"]), "pictures":len(pictures), "packing_bytes":len(packing),
                         "blockers":prep["blockers"], "unknown":prep.get("unknown_rules",[]),
                         "packing_required":prep.get("packing_required"), "photo_fields":prep.get("required_photo_fields")}
-                    if action == "stage":
+                    if action == "preview_one":
+                        from tms_portal import reviewed_invoice
                         policy = db.session.get(TmsNextslsTestPolicy, request.form.get("policy_id"))
-                        if not applicable(policy, profile, agent, code) or request.form.get("fees_confirm") != "yes":
+                        if not policy and not request.form.get("policy_id"):
+                            candidates = db.session.scalars(select(TmsNextslsTestPolicy).where(
+                                TmsNextslsTestPolicy.revoked_by.is_(None), TmsNextslsTestPolicy.expires_at > now()))
+                            matches = [p for p in candidates if applicable(p, profile, agent, code)]
+                            if len(matches) == 1:
+                                policy = matches[0]
+                        allowed = applicable(policy, profile, agent, code)
+                        if allowed:
+                            output["blockers"] = [b for b in output["blockers"] if b != carriers.WORKBOOK_SAMPLE_BLOCKER]
+                            output["evidence"] = policy.evidence
+                            output["fees"] = policy.fees
+                            output["expires"] = datetime.fromtimestamp(policy.expires_at, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                        output["address"] = invoice["address"]
+                        output["declarations"] = invoice["declarations"]
+                        try:
+                            reviewed_invoice(invoice, MultiDict({"destination_confirmed": "yes"}))
+                        except ValueError as reason:
+                            output["blockers"].append(str(reason))
+                    if action == "stage" or (action == "preview_one" and not output["blockers"]):
+                        policy = db.session.get(TmsNextslsTestPolicy, request.form.get("policy_id"))
+                        if not applicable(policy, profile, agent, code) or (action == "stage" and request.form.get("fees_confirm") != "yes"):
                             raise nextsls.ProtocolError("此账号和渠道没有适用的联调依据，或未确认费用；未保存测试单。")
                         if db.engine.dialect.name == "postgresql":
                             db.session.execute(text("SELECT pg_advisory_xact_lock(651360349)"))
@@ -174,9 +265,28 @@ def register_routes(staff):
                             db.session.flush()
                         if db.session.scalar(select(TmsAccount.id).where(TmsAccount.customer_id == customer.id).limit(1)):
                             raise nextsls.ProtocolError("联调客户不得关联客户登录账号。")
-                        invoice["nextsls_lab_case"] = {"policy_id":policy.id, "file_sha256":digest,
-                            "binding":account_binding(profile,agent,code), "fees_confirmed":True,
-                            "staged_by":current_user.id}
+                        case = {"policy_id":policy.id, "file_sha256":digest,
+                                "binding":account_binding(profile,agent,code), "fees_confirmed":action == "stage",
+                                "staged_by":current_user.id}
+                        invoice["nextsls_lab_case"] = case
+                        if action == "preview_one":
+                            # Keep the original bytes server-side; re-preview of the same unsubmitted case is safe.
+                            prior = db.session.scalar(select(TmsOrder).where(
+                                TmsOrder.customer_id == customer.id, TmsOrder.file_sha256 == digest).with_for_update())
+                            if prior:
+                                prior_case = prior.invoice.get("nextsls_lab_case", {})
+                                if (not prior_case.get("one_click") or prior.status != "pending"
+                                        or prior_case.get("staged_by") != current_user.id or prior.invoice.get("order_archive")
+                                        or db.session.get(TmsSupplierOrder, prior.id) is not None):
+                                    raise nextsls.ProtocolError("此测试文件已有记录；不能另建或重新发送。")
+                                from tms_portal import update_order
+                                case["one_click"] = True
+                                update_order(prior, {"agent_id": agent.id, "agent_service": code, "invoice": invoice})
+                                db.session.commit()
+                                output["ticket"] = preview_signer().dumps(
+                                    [current_user.id, prior.id, prior.revision, nextsls.rules_digest(carriers.channel_rules(profile, code))])
+                                return render_lab(output=output, selected=selected, catalogue=catalogue)
+                            case["one_click"] = True
                         order = TmsOrder(customer_id=customer.id, number_key=invoice["customer_number"].upper(), file_sha256=digest,
                             invoice=invoice, workbook=raw, status="pending", agent_id=agent.id, agent_service=code)
                         db.session.add(order)
@@ -184,15 +294,21 @@ def register_routes(staff):
                         from tms_portal import history
                         history(order, "lab_stage")
                         db.session.commit()
-                        return redirect(url_for("tms_staff.review", order_id=order.id))
-            elif action is not None:
+                        if action == "stage":
+                            return redirect(url_for("tms_staff.review", order_id=order.id))
+                        output["ticket"] = preview_signer().dumps(
+                            [current_user.id, order.id, order.revision, nextsls.rules_digest(carriers.channel_rules(profile, code))])
+            elif action not in {None, "create_one"}:
                 abort(400)
         except (nextsls.ProtocolError, InvoiceError, ValueError) as exc:
             db.session.rollback()
             error = str(exc)
-        except IntegrityError:
+        except SQLAlchemyError:
             db.session.rollback()
             error = "测试文件已登记或数据发生变化；请查看已有联调记录。"
+        return render_lab(output=output, error=error, selected=selected, catalogue=catalogue, result=result)
+
+    def render_lab(*, output=None, error=None, selected=None, catalogue=None, result=None):
         account_rows = db.session.execute(select(CarrierAgent.id, CarrierAgent.name, TmsAgentApi.base_url,
                 TmsAgentApi.enabled, TmsAgentApi.verified, CarrierAgent.app_token).join(TmsAgentApi)
                 .where(TmsAgentApi.provider == "nextsls", CarrierAgent.is_active.is_(True))
@@ -222,7 +338,7 @@ def register_routes(staff):
                 .where(TmsOrder.invoice["nextsls_lab_case"]["policy_id"].as_string().is_not(None))
                 .order_by(TmsOrder.id.desc()).limit(30)).all()
         return render_template("tms/nextsls_lab.html", staff=True, error=error, output=output, accounts=accounts,
-                               selected=selected, catalogue=catalogue, policies=policies, cases=cases,
+                               selected=selected, catalogue=catalogue or {}, policies=policies, cases=cases, result=result,
                                active=active,
                                expiry={p.id: datetime.fromtimestamp(p.expires_at, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
                                        for p in policies}, enabled=control.enabled())

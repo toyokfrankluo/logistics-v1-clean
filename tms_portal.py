@@ -1383,6 +1383,8 @@ def supplier_files_check(order_id):
 def decide(order_id):
     order = reviewable_order(order_id)
     decision = request.form.get("decision")
+    if decision in {"approve", "draft"} and order.invoice.get("nextsls_lab_case", {}).get("one_click"):
+        abort(409, "此测试单由联调中心确认和审核。")
     if decision not in {"approve", "reject", "draft", "adjust", "settle"}:
         abort(400)
     required_status = "approved" if decision in {"adjust", "settle"} else "pending"

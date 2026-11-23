@@ -127,3 +127,43 @@ class LabTests(unittest.TestCase):
         page = self.get(self.staff, f"/tms/admin/orders/{oid}").get_data(as_text=True)
         self.assertIn("联调创建回执：HTTP 200", page)
         self.assertNotIn("must-not-store-in-receipt", page)
+
+    def test_one_page_preview_and_final_create_once(self):
+        import re
+        self.staff_login()
+        self.profile()
+        self.assertEqual(self.record_policy(f"{self.agent.id}:TMS_DEMO").status_code, 302)
+        policy = TmsNextslsTestPolicy.query.one()
+        calls, references = [], []
+
+        def supplier(target, *, json, headers):
+            op = target.api_url.rsplit("/", 1)[-1]
+            calls.append(op)
+            if op == "get_services":
+                return fixture.success({"services": [fixture.SERVICE]})
+            if op == "create":
+                references.append(json["shipment"]["client_reference"])
+            return fixture.success({"shipment": {"shipment_id": fixture.SUPPLIER_NUMBER,
+                "service_code": "TMS_DEMO", "client_reference": references[0]}})
+
+        with patch.dict(app.config, TMS_NEXTSLS_CREATE_MODE="environment",
+                        TMS_NEXTSLS_CREATE_ENABLED=True, TMS_NEXTSLS_READ_ENABLED=True):
+            with patch("carrier_http.post", side_effect=supplier):
+                preview = self.send(action="preview_one", agent_id=self.agent.id, code="TMS_DEMO",
+                                    policy_id=policy.id, workbook=self.sample()).get_data(as_text=True)
+                found = re.search(r'name="ticket" value="([^"]+)"', preview)
+                self.assertTrue(found, "Preflight did not show final confirmation")
+                self.assertEqual(TmsOrder.query.one().status, "pending")
+                self.assertEqual(calls, ["get_services"])
+                with patch.dict(app.config, TMS_NEXTSLS_CREATE_EMERGENCY_STOP=True):
+                    stopped = self.send(action="create_one", ticket=found[1], confirm="yes")
+                    self.assertIn("紧急停止", stopped.get_data(as_text=True))
+                    self.assertEqual(TmsOrder.query.one().status, "pending")
+                    self.assertEqual(calls, ["get_services"])
+                result = self.send(action="create_one", ticket=found[1], confirm="yes").get_data(as_text=True)
+                self.assertIn(fixture.SUPPLIER_NUMBER, result)
+                self.assertIn("渠道和客户参考号均匹配", result)
+                duplicate = self.send(action="create_one", ticket=found[1], confirm="yes")
+                self.assertIn("未再次发送", duplicate.get_data(as_text=True))
+        self.assertEqual(calls, ["get_services", "get_services", "create", "get_info"])
+        self.assertTrue(references[0].startswith("XR-LAB-"))
