@@ -106,6 +106,7 @@ class LabTests(unittest.TestCase):
                 return fixture.success({"services": [fixture.SERVICE]})
             if method == "create":
                 reference.append(json["shipment"]["client_reference"])
+                self.assertTrue(reference[0].startswith("XR-LAB-"))
             return fixture.success({"shipment": {"shipment_id": fixture.SUPPLIER_NUMBER,
                 "service_code": "TMS_DEMO", "client_reference": reference[0],
                 "private_field": "must-not-store-in-receipt"}})

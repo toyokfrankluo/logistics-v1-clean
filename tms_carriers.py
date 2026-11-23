@@ -537,8 +537,9 @@ def operation_context(order, capability):
 def ensure_link(order):
     link = db.session.get(TmsSupplierOrder, order.id)
     if link is None:
+        prefix = "XR-LAB-" if "nextsls_lab_case" in order.invoice else "XR-"
         link = TmsSupplierOrder(order_id=order.id, agent_id=order.agent_id,
-                                client_reference="XR-" + uuid4().hex, state="new")
+                                client_reference=prefix + uuid4().hex, state="new")
         db.session.add(link)
         try:
             db.session.flush()
