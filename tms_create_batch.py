@@ -194,7 +194,10 @@ def register_routes(staff):
                     agent = db.session.get(CarrierAgent, order.agent_id)
                     grant = carriers.current_create_grant(order, profile,
                         carriers.sample_create_approval(order, profile, agent))
-                    if not grant or grant.get("fees_and_pickup_confirmed") is not True:
+                    if (not grant or grant.get("fees_and_pickup_confirmed") is not True
+                            or grant.get("rules_digest") != digest):
+                        if order.invoice.get("workbook_test_sample"):
+                            raise nextsls.ProtocolError("请按供应商测试许可重新审核并授权本票。")
                         invoice = carriers.make_create_grant(order, profile, actor,
                             preparation={"sample_approval": None}, batch_id=batch_id,
                             unknown_confirmed=request.form.get("unknown_confirmed") == "yes",

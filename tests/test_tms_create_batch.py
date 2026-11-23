@@ -95,6 +95,25 @@ class BatchTests(unittest.TestCase):
         for action in ("approve", "supplier_grant"):
             self.assertEqual(TmsAudit.query.filter_by(order_id=order_id, action=action).count(), 1)
 
+    def test_batch_does_not_send_when_a_known_rule_changes_after_confirmation(self):
+        order_id = self.prepared(grant=False)
+        batch = self.confirm(self.preview()).location.split("?")[0]
+        changed = {**fixture.SERVICE, "city_required": 0}
+        calls = []
+
+        def supplier(target, **kwargs):
+            calls.append(target.api_url.rsplit("/", 1)[-1])
+            if target.api_url.endswith("/get_services"):
+                return fixture.success({"services": [changed]})
+            return fixture.success({"shipment": {"shipment_id": fixture.SUPPLIER_NUMBER}})
+
+        with patch("carrier_http.post", side_effect=supplier):
+            result = self.post(self.staff, f"{batch}/items/{order_id}", {"action": "run"}, "/login")
+        self.assertEqual(calls, ["get_services"])
+        self.assertEqual(result.json, {"state": "blocked"})
+        self.assertIn("渠道规则已变化", TmsCreateBatchItem.query.one().detail)
+        self.assertIsNone(db.session.get(TmsSupplierOrder, order_id))
+
     def test_preview_rechecks_changed_revision_and_ignores_historical_copy(self):
         order_id = self.prepared()
         html = self.preview()

@@ -470,12 +470,13 @@ def make_create_grant(order, profile, actor_id, *, preparation, unknown_confirme
         "revision": order.revision + 1, "agent_id": order.agent_id, "service": order.agent_service,
         "origin": profile.base_url, "actor_id": actor_id, "fees_and_pickup_confirmed": True,
         "expires_at": int((now + timedelta(minutes=30)).timestamp()),
+        "rules_digest": nextsls.rules_digest(rules) if rules is not None else None,
     }
     if approval := preparation["sample_approval"]:
         grant["sample_approval"] = approval
     if unknown:
         grant.update(unknown_rules_confirmed=True, review_basis=nextsls.supplied_text(unknown_basis, 500),
-                     unknown_rules=unknown, rules_digest=nextsls.rules_digest(rules))
+                     unknown_rules=unknown)
     if batch_id:
         grant["batch_id"] = batch_id
     invoice = dict(order.invoice)
@@ -610,14 +611,14 @@ def send_order(order, actor_id, *, transport=None, photo_publisher=None, packing
         raise nextsls.ProtocolError(WORKBOOK_SAMPLE_BLOCKER)
     if grant_required and not current_create_grant(order, profile, approval):
         raise nextsls.ProtocolError(CREATE_GRANT_REQUIRED)
-    link = link or ensure_link(order)
-
     rules = nextsls.preparation_rules(service)
+    grant = current_create_grant(order, profile, approval)
+    if grant and grant.get("rules_digest") != nextsls.rules_digest(rules):
+        raise nextsls.ProtocolError("渠道规则已变化，请刷新代理渠道清单并重新预检和授权。")
     if rules.get("unknown_rules"):
-        grant = current_create_grant(order, profile, approval)
-        if (not grant or not grant.get("unknown_rules_confirmed") or not grant.get("review_basis")
-                or grant.get("rules_digest") != nextsls.rules_digest(rules)):
+        if not grant or not grant.get("unknown_rules_confirmed") or not grant.get("review_basis"):
             raise nextsls.ProtocolError("渠道规则未知或已变化，请管理员核对真实资料并明确授权本票首次提交。")
+    link = link or ensure_link(order)
     store, encoders = images.image_delivery(order, profile, rules)
     packing_store = images.media_store(order, profile) if rules["packing_list_required"] != 0 else None
     packing_host = current_app.config.get("TMS_NEXTSLS_PACKING_ATTACHMENT_HOST", "")
